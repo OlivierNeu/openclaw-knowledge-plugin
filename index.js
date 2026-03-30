@@ -175,16 +175,15 @@ export default {
     let cooldownUntil = 0;
 
     // -----------------------------------------------------------------
-    // Hook: before_prompt_build
-    // Injects knowledge into the SYSTEM PROMPT (not the user message).
-    // This prevents mem0 autoCapture from memorizing our search results,
-    // since autoCapture only collects user/assistant messages, not the
-    // system prompt.
-    //
-    // Uses appendSystemContext instead of prependContext to avoid
-    // contaminating the conversation history.
+    // Hook: before_prompt_build (requires OpenClaw >= v2026.3.7)
+    // Injects knowledge into the SYSTEM PROMPT via appendSystemContext.
+    // This prevents mem0 autoCapture from memorizing search results.
     // -----------------------------------------------------------------
     api.on("before_prompt_build", async (event) => {
+      api.logger.info(
+        `openclaw-knowledge: before_prompt_build fired`
+      );
+
       if (!enabled) return;
 
       // Cooldown after repeated failures
@@ -195,9 +194,7 @@ export default {
         api.logger.info("openclaw-knowledge: resuming after cooldown");
       }
 
-      // Extract user query from the event
-      // before_prompt_build may use event.prompt or event.userMessage
-      const query = event.prompt ?? event.userMessage ?? "";
+      const query = event.prompt ?? "";
       if (!query || query.trim().length < 3) return;
 
       try {

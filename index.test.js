@@ -331,10 +331,10 @@ describe("register", () => {
 
     assert.equal(warnings.length, 1);
     assert.ok(warnings[0].includes("GEMINI_API_KEY not configured"));
-    assert.equal(handlers["before_prompt_build"], undefined);
+    assert.equal(handlers["before_agent_start"], undefined);
   });
 
-  it("registers before_prompt_build hook when configured", () => {
+  it("registers before_agent_start hook when configured", () => {
     const handlers = {};
     const api = {
       pluginConfig: {
@@ -354,7 +354,7 @@ describe("register", () => {
     };
 
     plugin.register(api);
-    assert.equal(typeof handlers["before_prompt_build"], "function");
+    assert.equal(typeof handlers["before_agent_start"], "function");
   });
 
   it("skips short queries (less than 3 chars)", async () => {
@@ -382,13 +382,13 @@ describe("register", () => {
 
     plugin.register(api);
 
-    const result = await handlers["before_prompt_build"]({ prompt: "ab" });
+    const result = await handlers["before_agent_start"]({ prompt: "ab" });
     assert.equal(result, undefined);
 
     mock.restoreAll();
   });
 
-  it("returns appendSystemContext on successful search", async () => {
+  it("returns prependContext on successful search", async () => {
     const handlers = {};
     const api = {
       pluginConfig: {
@@ -431,65 +431,18 @@ describe("register", () => {
 
     plugin.register(api);
 
-    const result = await handlers["before_prompt_build"]({
+    const result = await handlers["before_agent_start"]({
       prompt: "what is the answer?",
     });
 
-    assert.ok(result.appendSystemContext.includes("<relevant-documents>"));
-    assert.ok(result.appendSystemContext.includes("doc.pdf"));
+    assert.ok(result.prependContext.includes("<relevant-memories>"));
+    assert.ok(result.prependContext.includes("Knowledge Base Results"));
+    assert.ok(result.prependContext.includes("doc.pdf"));
     assert.equal(callCount, 2); // 1 embed + 1 search
 
     mock.restoreAll();
   });
 
-  it("falls back to event.userMessage when event.prompt is missing", async () => {
-    const handlers = {};
-    const api = {
-      pluginConfig: {
-        geminiApiKey: "test-key",
-        qdrantUrl: "http://localhost:6333",
-        collections: ["col"],
-      },
-      logger: {
-        warn: () => {},
-        info: () => {},
-        debug: () => {},
-        error: () => {},
-      },
-      on: (event, handler) => {
-        handlers[event] = handler;
-      },
-    };
-
-    mock.method(globalThis, "fetch", async (url) => {
-      if (url.includes("gemini")) {
-        return {
-          ok: true,
-          json: async () => ({ embedding: { values: [0.1] } }),
-        };
-      }
-      return {
-        ok: true,
-        json: async () => ({
-          result: {
-            points: [
-              { score: 0.8, payload: { file_name: "test.pdf", text: "data" } },
-            ],
-          },
-        }),
-      };
-    });
-
-    plugin.register(api);
-
-    const result = await handlers["before_prompt_build"]({
-      userMessage: "find my document",
-    });
-
-    assert.ok(result.appendSystemContext.includes("<relevant-documents>"));
-
-    mock.restoreAll();
-  });
 
   it("does nothing when disabled", async () => {
     const handlers = {};
@@ -513,7 +466,7 @@ describe("register", () => {
 
     plugin.register(api);
 
-    const result = await handlers["before_prompt_build"]({
+    const result = await handlers["before_agent_start"]({
       prompt: "hello world query",
     });
     assert.equal(result, undefined);
