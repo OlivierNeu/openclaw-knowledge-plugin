@@ -1,0 +1,17 @@
+{
+  "name": "openclaw-knowledge",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Multi-collection Qdrant knowledge search for OpenClaw — automatic RAG injection via before_agent_start hook",
+  "license": "MIT",
+  "main": "./index.js",
+  "scripts": {
+    "test": "node --test index.test.js"
+  },
+  "openclaw": {
+    "extensions": ["./index.js"]
+  },
+  "peerDependencies": {
+    "openclaw": ">=2026.2.0"
+  }
+}
