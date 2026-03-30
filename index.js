@@ -180,8 +180,9 @@ export default {
     // This prevents mem0 autoCapture from memorizing search results.
     // -----------------------------------------------------------------
     api.on("before_prompt_build", async (event) => {
+      const eventKeys = Object.keys(event ?? {});
       api.logger.info(
-        `openclaw-knowledge: before_prompt_build fired`
+        `openclaw-knowledge: hook fired — keys: [${eventKeys.join(", ")}], prompt=${typeof event?.prompt}, userMessage=${typeof event?.userMessage}, message=${typeof event?.message}, input=${typeof event?.input}`
       );
 
       if (!enabled) return;
@@ -194,7 +195,7 @@ export default {
         api.logger.info("openclaw-knowledge: resuming after cooldown");
       }
 
-      const query = event.prompt ?? "";
+      const query = event.prompt ?? event.userMessage ?? event.message ?? event.input ?? event.text ?? "";
       if (!query || query.trim().length < 3) return;
 
       try {
