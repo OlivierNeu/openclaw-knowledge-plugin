@@ -177,13 +177,15 @@ export default {
     let cooldownUntil = 0;
 
     // -----------------------------------------------------------------
-    // Hook: before_agent_start
-    // Injects knowledge results via prependContext wrapped in
-    // <relevant-memories> tags. mem0 autoCapture strips these tags
-    // before memorizing (PR #4065), preventing knowledge results
-    // from being stored as conversational facts.
+    // Hook: before_prompt_build (requires OpenClaw >= v2026.3.7)
+    // Injects knowledge into the SYSTEM PROMPT via appendSystemContext.
+    // Invisible in PinchChat/Control UI — only the LLM sees it.
+    // Same pattern as LangChain/LlamaIndex RAG: context in system msg.
+    //
+    // Note: event.prompt is the system prompt being built, NOT the user
+    // message. The user message is extracted from event.messages.
     // -----------------------------------------------------------------
-    api.on("before_agent_start", async (event) => {
+    api.on("before_prompt_build", async (event) => {
       if (!enabled) return;
 
       // Cooldown after repeated failures
@@ -193,7 +195,22 @@ export default {
         api.logger.info("openclaw-knowledge: resuming after cooldown");
       }
 
-      const query = event.prompt ?? "";
+      // Extract user message from event.messages (last user message)
+      // event.prompt = system prompt being built, NOT the user question
+      let query = "";
+      if (Array.isArray(event.messages) && event.messages.length > 0) {
+        for (let i = event.messages.length - 1; i >= 0; i--) {
+          const msg = event.messages[i];
+          const role = msg.role ?? msg.sender ?? "";
+          if (role === "user" || role === "human") {
+            query = typeof msg.content === "string"
+              ? msg.content
+              : msg.text ?? "";
+            break;
+          }
+        }
+      }
+
       if (!query || query.trim().length < 3) return;
 
       try {
@@ -225,12 +242,13 @@ export default {
         consecutiveErrors = 0;
 
         return {
-          prependContext: [
-            "<relevant-memories>",
-            "[Knowledge Base — personal documents]",
+          appendSystemContext: [
+            "",
+            "## Relevant Knowledge Base Documents",
+            "Use this information to answer the user's question accurately.",
+            "Always cite the source document name when using this information.",
             "",
             formatted,
-            "</relevant-memories>",
           ].join("\n"),
         };
       } catch (err) {
