@@ -32,6 +32,11 @@ jobs:
         id: version
         run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
 
+      - name: Stamp version from tag into package files
+        run: |
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          sed -i 's/"version": *"[^"]*"/"version": "'"$VERSION"'"/' package.json openclaw.plugin.json
+
       - name: Extract release notes from CHANGELOG.md
         id: changelog
         run: |
