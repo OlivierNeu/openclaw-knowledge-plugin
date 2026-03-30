@@ -43,9 +43,11 @@ jobs:
           VERSION="${{ steps.version.outputs.VERSION }}"
           # Extract the section for this version (between ## [x.y.z] headers)
           awk '/^## \['"$VERSION"'\]/{found=1; next} /^## \[/{if(found) exit} found{print}' CHANGELOG.md > release_notes.md
-          # Fallback if no entry found
-          if [ ! -s release_notes.md ]; then
-            echo "Release v$VERSION" > release_notes.md
+          # Flag whether we found changelog content
+          if [ -s release_notes.md ]; then
+            echo "FOUND=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "FOUND=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Create artifact
@@ -55,8 +57,16 @@ jobs:
           cd dist
           tar -czf openclaw-knowledge-${{ steps.version.outputs.VERSION }}.tar.gz openclaw-knowledge/
 
-      - name: Create GitHub Release
+      - name: Create GitHub Release (with changelog)
+        if: steps.changelog.outputs.FOUND == 'true'
         uses: softprops/action-gh-release@v2
         with:
           files: dist/openclaw-knowledge-${{ steps.version.outputs.VERSION }}.tar.gz
           body_path: release_notes.md
+
+      - name: Create GitHub Release (auto-generated notes)
+        if: steps.changelog.outputs.FOUND == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/openclaw-knowledge-${{ steps.version.outputs.VERSION }}.tar.gz
+          generate_release_notes: true
