@@ -8,27 +8,39 @@ This plugin hooks into OpenClaw's `before_agent_start` lifecycle event to **auto
 
 This is **deterministic** — unlike skills, the search runs on every message, not when the LLM decides to use it.
 
-## How it works
+## System architecture
 
-```
-User sends message
-    |
-    v
-[before_agent_start hook]
-    |
-    +--> Embed query via Gemini Embedding 2 Preview (text mode)
-    |
-    +--> Search N Qdrant collections in parallel
-    |
-    +--> Sort results by similarity score
-    |
-    +--> Inject <relevant-documents> block into prompt
-    |
-    v
-Agent responds with document context
-```
+The plugin sits between the OpenClaw gateway and two external services: the Gemini Embedding API for vectorizing queries and Qdrant for similarity search. Documents are ingested separately by an n8n ETL pipeline that polls Google Drive, embeds content via Gemini multimodal, and stores vectors in Qdrant.
+
+![System architecture](schemas/system-architecture.png)
 
 The query embedding uses the same model (`gemini-embedding-2-preview`, 3072 dimensions) as the document ingestion pipeline, ensuring cross-modal compatibility: a text query finds documents embedded as multimodal content (PDFs, images, audio, video).
+
+## How it works
+
+Every time a user sends a message, the `before_agent_start` hook fires and runs through a series of guards and processing steps. The flowchart below shows the complete decision path, including the error handling and cooldown mechanism.
+
+![Plugin lifecycle flowchart](schemas/plugin-lifecycle-flowchart.png)
+
+**Key safeguards:**
+- The plugin **never blocks the agent** — all errors are caught silently.
+- After **3 consecutive failures**, the plugin enters a **5-minute cooldown** to avoid log spam and unnecessary API calls.
+- Queries shorter than 3 characters are skipped to avoid meaningless searches.
+
+## Runtime sequence
+
+The following diagram shows the precise interaction between all components for a single user message. Note how the Qdrant collections are searched **in parallel** to minimize latency.
+
+![Runtime sequence diagram](schemas/runtime-sequence.png)
+
+**Step-by-step breakdown:**
+1. The user sends a message (e.g. "What was discussed in yesterday's meeting?").
+2. The gateway fires the `before_agent_start` event with the user's prompt.
+3. The plugin calls Gemini to embed the query into a 3072-dimension vector.
+4. The vector is sent to all configured Qdrant collections simultaneously.
+5. Results from all collections are merged and sorted by similarity score (best first).
+6. The top results are formatted (respecting the `maxInjectChars` limit) and wrapped in a `<relevant-documents>` block.
+7. This block is injected into the agent's prompt via `prependContext`, so the LLM can cite and use the documents in its response.
 
 ## Features
 
@@ -129,24 +141,10 @@ Expected payload fields per point:
 
 ## Architecture
 
-This plugin is part of a larger knowledge pipeline:
+This plugin is part of a larger knowledge pipeline (see [system architecture diagram](#system-architecture) above for the full picture):
 
-```
-Google Drive (documents)
-    |
-    | n8n ETL (polling every 30 min)
-    |
-    v
-Gemini Embedding 2 Preview (multimodal)  +  Gemini LLM (text extraction)
-    |                                          |
-    v                                          v
-Qdrant vector (3072 dims)                  Qdrant payload (text field)
-    |
-    | openclaw-knowledge plugin (this repo)
-    |
-    v
-OpenClaw agent context (<relevant-documents>)
-```
+1. **Ingestion (background):** n8n polls Google Drive every 30 min → Gemini embeds documents (multimodal, 3072 dims) → vectors + extracted text stored in Qdrant.
+2. **Query (real-time):** User message → plugin embeds query (text mode, same model) → parallel Qdrant search → results injected into agent context.
 
 ## Relationship with mem0
 
@@ -157,10 +155,82 @@ This plugin **complements** mem0, it does not replace it:
 | Purpose | Conversational memory | Document knowledge (RAG) |
 | Collection | `memories` | `knowledge_*` (multiple) |
 | Source | Facts extracted from chats | Documents from Google Drive |
+| Embedding | Text (facts extracted by LLM) | Multimodal (raw PDF/image/video binary) |
 | Trigger | `autoRecall` (automatic) | `before_agent_start` (automatic) |
+| Injection | `<relevant-memories>` block | `<relevant-documents>` block |
 | Slot | `memory` (exclusive) | None (coexists freely) |
+| Governance | User can store/forget/query facts | Driven by indexed folder content |
 
-Both run automatically on every message. The agent receives both `<relevant-memories>` (from mem0) and `<relevant-documents>` (from this plugin) in its context.
+Both hooks fire automatically on every message. The agent receives **both** context blocks in its system prompt, giving it access to conversational memory AND document knowledge simultaneously.
+
+### How the combined prompt looks
+
+```
+<relevant-memories>
+- Olivier's father is Jean-Pierre Neu (from past conversation)
+- Preferred document format: formal, structured, premium quality
+</relevant-memories>
+
+<relevant-documents>
+[knowledge_olivier] Acte_naissance_Jean-Pierre.pdf (score: 0.92)
+Content: Acte de naissance. Nom: Neu, Prenom: Jean-Pierre, Ne le 15 mars 1955...
+</relevant-documents>
+
+User: Quelle est la date de naissance de mon pere?
+```
+
+The LLM can then cross-reference both sources to give an accurate, cited answer.
+
+### Context assembly diagram
+
+The following diagram shows how both plugins work together during a single user message, from the initial question through parallel search in both memory and documents, to the final assembled prompt:
+
+![Dual-plugin context assembly](schemas/dual-plugin-context-assembly.png)
+
+### Why two separate plugins instead of one?
+
+| Concern | Answer |
+|---------|--------|
+| Why not merge into one plugin? | mem0 uses its own LLM pipeline to extract facts — fundamentally different from document vector search. Merging would couple two independent concerns. |
+| Why not extend mem0 to search multiple collections? | mem0 OSS doesn't support multi-collection search or metadata filtering. These are Platform-only features (paid). |
+| Can they conflict? | No — mem0 uses the `memory` slot, this plugin has no slot. Both `prependContext` blocks are concatenated by the gateway. |
+| What if both return the same information? | The LLM handles deduplication naturally. Redundant context reinforces confidence in the answer. |
+
+## Use cases
+
+### Use case 1: Finding information in personal documents
+
+**User**: "Quelle est la date de naissance de mon pere?"
+
+1. **mem0 autoRecall** searches `memories` → finds fact: "Olivier's father is Jean-Pierre Neu"
+2. **openclaw-knowledge** searches `knowledge_olivier` → finds indexed PDF: birth certificate scan with full details
+3. **Agent** combines both: "D'apres l'acte de naissance dans vos documents, votre pere Jean-Pierre Neu est ne le 15 mars 1955."
+
+Without the knowledge plugin, the agent could only answer if the user had previously told it the date in a conversation. With the plugin, it finds the actual document.
+
+### Use case 2: Reusing work materials (Jerome's workflow)
+
+**User**: "Prepare-moi une trame de proposition commerciale pour Dupont, en reprenant le format de l'offre Martin"
+
+1. **mem0** recalls: "Jerome uses formal, premium-quality document style. Standard daily rate is 1500 EUR."
+2. **openclaw-knowledge** finds: the Martin proposal document with structure, vocabulary, and pricing
+3. **Agent** produces a first draft using Martin's format, Jerome's vocabulary, and the memorized pricing
+
+### Use case 3: Finding information in video/audio segments
+
+**User**: "Dans quelle reunion on a parle du projet pilote?"
+
+1. **openclaw-knowledge** finds: video segment `reunion-mars-2026.mp4` at 02:00-03:20 with transcription "On a decide de lancer le projet pilote en avril"
+2. **Agent**: "Dans la reunion de mars 2026, a 2 minutes, vous avez discute du lancement du projet pilote pour avril."
+
+### Use case 4: Cross-collection business search
+
+**User**: "Quels documents on a sur le client Dupont?"
+
+With collections `["knowledge_jerome", "knowledge_business"]`:
+1. **openclaw-knowledge** searches both collections in parallel
+2. Finds: proposal in `knowledge_jerome`, signed contract in `knowledge_business`
+3. **Agent** lists all matching documents with their sources
 
 ## Multi-tenant
 
