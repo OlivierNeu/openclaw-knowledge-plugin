@@ -32,6 +32,17 @@ jobs:
         id: version
         run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
 
+      - name: Extract release notes from CHANGELOG.md
+        id: changelog
+        run: |
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          # Extract the section for this version (between ## [x.y.z] headers)
+          awk '/^## \['"$VERSION"'\]/{found=1; next} /^## \[/{if(found) exit} found{print}' CHANGELOG.md > release_notes.md
+          # Fallback if no entry found
+          if [ ! -s release_notes.md ]; then
+            echo "Release v$VERSION" > release_notes.md
+          fi
+
       - name: Create artifact
         run: |
           mkdir -p dist/openclaw-knowledge
@@ -43,4 +54,4 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: dist/openclaw-knowledge-${{ steps.version.outputs.VERSION }}.tar.gz
-          generate_release_notes: true
+          body_path: release_notes.md
