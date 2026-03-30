@@ -331,10 +331,10 @@ describe("register", () => {
 
     assert.equal(warnings.length, 1);
     assert.ok(warnings[0].includes("GEMINI_API_KEY not configured"));
-    assert.equal(handlers["before_prompt_build"], undefined);
+    assert.equal(handlers["before_agent_start"], undefined);
   });
 
-  it("registers before_prompt_build hook when configured", () => {
+  it("registers before_agent_start hook when configured", () => {
     const handlers = {};
     const api = {
       pluginConfig: {
@@ -354,7 +354,7 @@ describe("register", () => {
     };
 
     plugin.register(api);
-    assert.equal(typeof handlers["before_prompt_build"], "function");
+    assert.equal(typeof handlers["before_agent_start"], "function");
   });
 
   it("skips short queries (less than 3 chars)", async () => {
@@ -382,13 +382,13 @@ describe("register", () => {
 
     plugin.register(api);
 
-    const result = await handlers["before_prompt_build"]({ prompt: "ab" });
+    const result = await handlers["before_agent_start"]({ prompt: "ab" });
     assert.equal(result, undefined);
 
     mock.restoreAll();
   });
 
-  it("returns appendSystemContext on successful search", async () => {
+  it("returns prependContext wrapped in relevant-memories on successful search", async () => {
     const handlers = {};
     const api = {
       pluginConfig: {
@@ -431,12 +431,13 @@ describe("register", () => {
 
     plugin.register(api);
 
-    const result = await handlers["before_prompt_build"]({
+    const result = await handlers["before_agent_start"]({
       prompt: "what is the answer?",
     });
 
-    assert.ok(result.appendSystemContext.includes("<relevant-documents>"));
-    assert.ok(result.appendSystemContext.includes("doc.pdf"));
+    assert.ok(result.prependContext.includes("<relevant-memories>"));
+    assert.ok(result.prependContext.includes("Knowledge Base"));
+    assert.ok(result.prependContext.includes("doc.pdf"));
     assert.equal(callCount, 2); // 1 embed + 1 search
 
     mock.restoreAll();
@@ -465,7 +466,7 @@ describe("register", () => {
 
     plugin.register(api);
 
-    const result = await handlers["before_prompt_build"]({
+    const result = await handlers["before_agent_start"]({
       prompt: "hello world query",
     });
     assert.equal(result, undefined);

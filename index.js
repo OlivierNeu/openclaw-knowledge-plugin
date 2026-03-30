@@ -1,7 +1,9 @@
 // openclaw-knowledge — Multi-collection Qdrant RAG plugin for OpenClaw
 //
-// Hooks into before_agent_start to automatically search knowledge collections
-// and inject relevant documents into the agent's context.
+// Hooks into before_agent_start to search knowledge collections and inject
+// relevant documents into the agent's context via prependContext.
+// Results are wrapped in <relevant-memories> tags so mem0 autoCapture
+// strips them before memorizing (avoids polluting conversational memory).
 // Uses Gemini Embedding 2 Preview (native embedContent endpoint) for query
 // embedding — same model/space as the multimodal document embeddings.
 //
@@ -175,32 +177,28 @@ export default {
     let cooldownUntil = 0;
 
     // -----------------------------------------------------------------
-    // Hook: before_prompt_build (requires OpenClaw >= v2026.3.7)
-    // Injects knowledge into the SYSTEM PROMPT via appendSystemContext.
-    // This prevents mem0 autoCapture from memorizing search results.
+    // Hook: before_agent_start
+    // Injects knowledge results via prependContext wrapped in
+    // <relevant-memories> tags. mem0 autoCapture strips these tags
+    // before memorizing (PR #4065), preventing knowledge results
+    // from being stored as conversational facts.
     // -----------------------------------------------------------------
-    api.on("before_prompt_build", async (event) => {
+    api.on("before_agent_start", async (event) => {
       if (!enabled) return;
 
       // Cooldown after repeated failures
       if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
         if (Date.now() < cooldownUntil) return;
-        // Reset after cooldown period
         consecutiveErrors = 0;
         api.logger.info("openclaw-knowledge: resuming after cooldown");
       }
 
       const query = event.prompt ?? "";
-      api.logger.info(
-        `openclaw-knowledge: query length=${query.length}, first 50 chars="${query.slice(0, 50)}"`
-      );
       if (!query || query.trim().length < 3) return;
 
       try {
-        // Step 1: Embed the user's question (text mode)
         const vector = await embedQuery(query, geminiApiKey);
 
-        // Step 2: Search all collections in parallel
         const searches = collections.map((col) =>
           searchCollection(
             col,
@@ -212,11 +210,8 @@ export default {
           )
         );
         const allResults = (await Promise.all(searches)).flat();
-
-        // Step 3: Sort by score descending (best matches first)
         allResults.sort((a, b) => b.score - a.score);
 
-        // Step 4: Format and inject into system prompt
         const formatted = formatResults(allResults, maxInjectChars);
         if (!formatted) {
           consecutiveErrors = 0;
@@ -230,27 +225,24 @@ export default {
         consecutiveErrors = 0;
 
         return {
-          appendSystemContext: [
-            "<relevant-documents>",
-            "The following documents were found in the user's personal knowledge base.",
-            "Use this information to answer the user's question accurately.",
-            "Always cite the source document name when using this information.",
+          prependContext: [
+            "<relevant-memories>",
+            "[Knowledge Base — personal documents]",
             "",
             formatted,
-            "</relevant-documents>",
+            "</relevant-memories>",
           ].join("\n"),
         };
       } catch (err) {
         consecutiveErrors++;
         if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
-          cooldownUntil = Date.now() + 5 * 60 * 1000; // 5 min cooldown
+          cooldownUntil = Date.now() + 5 * 60 * 1000;
           api.logger.error(
             `openclaw-knowledge: ${consecutiveErrors} consecutive errors — cooling down 5 min: ${err.message}`
           );
         } else {
           api.logger.error(`openclaw-knowledge: ${err.message}`);
         }
-        // Fail silently — never block the agent
       }
     });
   },
