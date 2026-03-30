@@ -175,11 +175,16 @@ export default {
     let cooldownUntil = 0;
 
     // -----------------------------------------------------------------
-    // Hook: before_agent_start
-    // Runs deterministically before every agent turn.
-    // Same mechanism as mem0 autoRecall.
+    // Hook: before_prompt_build
+    // Injects knowledge into the SYSTEM PROMPT (not the user message).
+    // This prevents mem0 autoCapture from memorizing our search results,
+    // since autoCapture only collects user/assistant messages, not the
+    // system prompt.
+    //
+    // Uses appendSystemContext instead of prependContext to avoid
+    // contaminating the conversation history.
     // -----------------------------------------------------------------
-    api.on("before_agent_start", async (event) => {
+    api.on("before_prompt_build", async (event) => {
       if (!enabled) return;
 
       // Cooldown after repeated failures
@@ -190,7 +195,9 @@ export default {
         api.logger.info("openclaw-knowledge: resuming after cooldown");
       }
 
-      const query = event.prompt;
+      // Extract user query from the event
+      // before_prompt_build may use event.prompt or event.userMessage
+      const query = event.prompt ?? event.userMessage ?? "";
       if (!query || query.trim().length < 3) return;
 
       try {
@@ -213,21 +220,21 @@ export default {
         // Step 3: Sort by score descending (best matches first)
         allResults.sort((a, b) => b.score - a.score);
 
-        // Step 4: Format and inject into prompt
+        // Step 4: Format and inject into system prompt
         const formatted = formatResults(allResults, maxInjectChars);
         if (!formatted) {
           consecutiveErrors = 0;
           return;
         }
 
-        api.logger.debug(
-          `openclaw-knowledge: injecting ${allResults.length} result(s)`
+        api.logger.info(
+          `openclaw-knowledge: injecting ${allResults.length} result(s) (top score: ${allResults[0]?.score?.toFixed(2) ?? "n/a"})`
         );
 
         consecutiveErrors = 0;
 
         return {
-          prependContext: [
+          appendSystemContext: [
             "<relevant-documents>",
             "The following documents were found in the user's personal knowledge base.",
             "Use this information to answer the user's question accurately.",

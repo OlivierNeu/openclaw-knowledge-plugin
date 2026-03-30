@@ -55,11 +55,27 @@ The following diagram shows the precise interaction between all components for a
 
 ## Installation
 
-### Copy to OpenClaw extensions
+### Option 1: From GitHub Release (recommended)
+
+Download the latest tarball from [GitHub Releases](https://github.com/OlivierNeu/openclaw-knowledge-plugin/releases), then extract it into the OpenClaw extensions directory:
 
 ```bash
-sudo cp -r openclaw-knowledge-plugin \
-  /path/to/.openclaw/extensions/openclaw-knowledge
+# Download the release artifact
+wget https://github.com/OlivierNeu/openclaw-knowledge-plugin/releases/download/v1.0.0/openclaw-knowledge-1.0.0.tar.gz
+
+# Extract into OpenClaw extensions
+tar -xzf openclaw-knowledge-1.0.0.tar.gz -C /path/to/.openclaw/extensions/
+
+# Verify
+ls /path/to/.openclaw/extensions/openclaw-knowledge/
+# → index.js  LICENSE  openclaw.plugin.json  package.json
+```
+
+### Option 2: From source (development)
+
+```bash
+git clone https://github.com/OlivierNeu/openclaw-knowledge-plugin.git
+cp -r openclaw-knowledge-plugin /path/to/.openclaw/extensions/openclaw-knowledge
 ```
 
 ### Configure via CLI
@@ -79,6 +95,16 @@ openclaw config set plugins.entries.openclaw-knowledge.config.collections '["kno
 ### Restart
 
 ```bash
+openclaw gateway restart
+```
+
+### Updating
+
+To update to a new version, download the new tarball and extract it over the existing files:
+
+```bash
+wget https://github.com/OlivierNeu/openclaw-knowledge-plugin/releases/download/vX.Y.Z/openclaw-knowledge-X.Y.Z.tar.gz
+tar -xzf openclaw-knowledge-X.Y.Z.tar.gz -C /path/to/.openclaw/extensions/
 openclaw gateway restart
 ```
 
