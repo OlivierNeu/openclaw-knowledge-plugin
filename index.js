@@ -151,7 +151,7 @@ export default {
     const geminiApiKey = resolveEnv(cfg.geminiApiKey ?? "");
     const qdrantUrl = resolveEnv(cfg.qdrantUrl ?? "http://qdrant:6333");
     const qdrantApiKey = resolveEnv(cfg.qdrantApiKey ?? "");
-    const collections = cfg.collections ?? ["knowledge_olivier"];
+    const collections = cfg.collections ?? ["knowledge_default"];
     const topK = cfg.topK ?? 5;
     const scoreThreshold = cfg.scoreThreshold ?? 0.3;
     const maxInjectChars = cfg.maxInjectChars ?? 4000;

@@ -56,7 +56,7 @@
     },
     "collections": {
       "label": "Collections to search",
-      "help": "List of Qdrant collection names (e.g. knowledge_olivier, knowledge_business)"
+      "help": "List of Qdrant collection names (e.g. knowledge_alice, knowledge_shared)"
     },
     "enabled": {
       "label": "Auto-inject knowledge",

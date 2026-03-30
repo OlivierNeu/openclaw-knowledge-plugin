@@ -73,7 +73,7 @@ openclaw config set plugins.entries.openclaw-knowledge.enabled true
 openclaw config set plugins.entries.openclaw-knowledge.config.geminiApiKey '${GEMINI_API_KEY}'
 openclaw config set plugins.entries.openclaw-knowledge.config.qdrantUrl "http://qdrant:6333"
 openclaw config set plugins.entries.openclaw-knowledge.config.qdrantApiKey '${QDRANT_API_KEY}'
-openclaw config set plugins.entries.openclaw-knowledge.config.collections '["knowledge_olivier"]'
+openclaw config set plugins.entries.openclaw-knowledge.config.collections '["knowledge_alice"]'
 ```
 
 ### Restart
@@ -94,7 +94,7 @@ Add to `openclaw.json` under `plugins.entries`:
       "geminiApiKey": "${GEMINI_API_KEY}",
       "qdrantUrl": "http://qdrant:6333",
       "qdrantApiKey": "${QDRANT_API_KEY}",
-      "collections": ["knowledge_olivier", "knowledge_business"],
+      "collections": ["knowledge_alice", "knowledge_shared"],
       "topK": 5,
       "scoreThreshold": 0.3,
       "maxInjectChars": 4000,
@@ -111,7 +111,7 @@ Add to `openclaw.json` under `plugins.entries`:
 | `geminiApiKey` | string | **required** | Gemini API key (supports `${ENV_VAR}` syntax) |
 | `qdrantUrl` | string | `http://qdrant:6333` | Qdrant server URL |
 | `qdrantApiKey` | string | — | Qdrant API key (supports `${ENV_VAR}` syntax) |
-| `collections` | string[] | `["knowledge_olivier"]` | Qdrant collections to search |
+| `collections` | string[] | `["knowledge_alice"]` | Qdrant collections to search |
 | `topK` | number | `5` | Max results per collection |
 | `scoreThreshold` | number | `0.3` | Min similarity score (0-1) |
 | `maxInjectChars` | number | `4000` | Max characters injected into prompt |
@@ -167,16 +167,16 @@ Both hooks fire automatically on every message. The agent receives **both** cont
 
 ```
 <relevant-memories>
-- Olivier's father is Jean-Pierre Neu (from past conversation)
-- Preferred document format: formal, structured, premium quality
+- User's preferred document style: formal, structured, premium quality
+- Standard consulting daily rate is 1500 EUR
 </relevant-memories>
 
 <relevant-documents>
-[knowledge_olivier] Acte_naissance_Jean-Pierre.pdf (score: 0.92)
-Content: Acte de naissance. Nom: Neu, Prenom: Jean-Pierre, Ne le 15 mars 1955...
+[knowledge_alice] Contrat_Acme_Corp.pdf (score: 0.92)
+Content: Service agreement between Alice Consulting and Acme Corp. Duration: 6 months...
 </relevant-documents>
 
-User: Quelle est la date de naissance de mon pere?
+User: What were the terms of the Acme contract?
 ```
 
 The LLM can then cross-reference both sources to give an accurate, cited answer.
@@ -200,36 +200,36 @@ The following diagram shows how both plugins work together during a single user 
 
 ### Use case 1: Finding information in personal documents
 
-**User**: "Quelle est la date de naissance de mon pere?"
+**User**: "What were the terms of the Acme contract?"
 
-1. **mem0 autoRecall** searches `memories` → finds fact: "Olivier's father is Jean-Pierre Neu"
-2. **openclaw-knowledge** searches `knowledge_olivier` → finds indexed PDF: birth certificate scan with full details
-3. **Agent** combines both: "D'apres l'acte de naissance dans vos documents, votre pere Jean-Pierre Neu est ne le 15 mars 1955."
+1. **mem0 autoRecall** searches `memories` → finds fact: "Acme Corp is a key client, 6-month engagement"
+2. **openclaw-knowledge** searches `knowledge_alice` → finds indexed PDF: signed service agreement with full terms
+3. **Agent** combines both: "According to the Acme Corp contract in your documents, the engagement is 6 months with a daily rate of 1500 EUR."
 
-Without the knowledge plugin, the agent could only answer if the user had previously told it the date in a conversation. With the plugin, it finds the actual document.
+Without the knowledge plugin, the agent could only answer if the user had previously mentioned the terms in a conversation. With the plugin, it finds the actual document.
 
-### Use case 2: Reusing work materials (Jerome's workflow)
+### Use case 2: Reusing work materials
 
-**User**: "Prepare-moi une trame de proposition commerciale pour Dupont, en reprenant le format de l'offre Martin"
+**User**: "Draft a proposal for ClientB using the same format as the ClientA proposal"
 
-1. **mem0** recalls: "Jerome uses formal, premium-quality document style. Standard daily rate is 1500 EUR."
-2. **openclaw-knowledge** finds: the Martin proposal document with structure, vocabulary, and pricing
-3. **Agent** produces a first draft using Martin's format, Jerome's vocabulary, and the memorized pricing
+1. **mem0** recalls: "User prefers formal, premium-quality document style. Standard daily rate is 1500 EUR."
+2. **openclaw-knowledge** finds: the ClientA proposal document with structure, vocabulary, and pricing
+3. **Agent** produces a first draft using ClientA's format, the user's vocabulary, and the memorized pricing
 
 ### Use case 3: Finding information in video/audio segments
 
-**User**: "Dans quelle reunion on a parle du projet pilote?"
+**User**: "In which meeting did we discuss the pilot project?"
 
-1. **openclaw-knowledge** finds: video segment `reunion-mars-2026.mp4` at 02:00-03:20 with transcription "On a decide de lancer le projet pilote en avril"
-2. **Agent**: "Dans la reunion de mars 2026, a 2 minutes, vous avez discute du lancement du projet pilote pour avril."
+1. **openclaw-knowledge** finds: video segment `team-meeting-march.mp4` at 02:00-03:20 with transcription "We decided to launch the pilot project in April"
+2. **Agent**: "In the March team meeting, at the 2-minute mark, you discussed launching the pilot project for April."
 
-### Use case 4: Cross-collection business search
+### Use case 4: Cross-collection search
 
-**User**: "Quels documents on a sur le client Dupont?"
+**User**: "What documents do we have on ClientB?"
 
-With collections `["knowledge_jerome", "knowledge_business"]`:
+With collections `["knowledge_alice", "knowledge_shared"]`:
 1. **openclaw-knowledge** searches both collections in parallel
-2. Finds: proposal in `knowledge_jerome`, signed contract in `knowledge_business`
+2. Finds: proposal draft in `knowledge_alice`, signed contract in `knowledge_shared`
 3. **Agent** lists all matching documents with their sources
 
 ## Multi-tenant
@@ -237,14 +237,14 @@ With collections `["knowledge_jerome", "knowledge_business"]`:
 Each OpenClaw instance configures its own collection list:
 
 ```json
-// Olivier's instance
-"collections": ["knowledge_olivier", "knowledge_business"]
+// Alice's instance
+"collections": ["knowledge_alice", "knowledge_shared"]
 
-// Jerome's instance
-"collections": ["knowledge_jerome", "knowledge_business"]
+// Bob's instance
+"collections": ["knowledge_bob", "knowledge_shared"]
 
-// Fabien's instance
-"collections": ["knowledge_fabien", "knowledge_business"]
+// Carol's instance
+"collections": ["knowledge_carol", "knowledge_shared"]
 ```
 
 ## License
