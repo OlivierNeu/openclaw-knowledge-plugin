@@ -1,8 +1,8 @@
 {
   "id": "openclaw-knowledge",
-  "name": "Qdrant Knowledge Base",
-  "description": "Query multiple Qdrant collections and inject relevant documents into agent context before each turn",
-  "version": "1.0.0",
+  "name": "pgvector Knowledge Base",
+  "description": "Query PostgreSQL pgvector collections and inject relevant documents into agent context before each turn",
+  "version": "2.0.0",
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
@@ -11,18 +11,14 @@
         "type": "string",
         "description": "Gemini API key for embedding queries"
       },
-      "qdrantUrl": {
+      "postgresUrl": {
         "type": "string",
-        "description": "Qdrant server URL"
-      },
-      "qdrantApiKey": {
-        "type": "string",
-        "description": "Qdrant API key"
+        "description": "PostgreSQL connection string for the knowledge database"
       },
       "collections": {
         "type": "array",
         "items": { "type": "string" },
-        "description": "Qdrant collections to search"
+        "description": "Collection names to search in the knowledge_vectors table"
       },
       "topK": {
         "type": "number",
@@ -41,7 +37,7 @@
         "description": "Enable/disable knowledge injection (default: true)"
       }
     },
-    "required": ["geminiApiKey", "qdrantUrl", "collections"]
+    "required": ["geminiApiKey", "postgresUrl", "collections"]
   },
   "uiHints": {
     "geminiApiKey": {
@@ -49,14 +45,14 @@
       "sensitive": true,
       "help": "Use ${GEMINI_API_KEY} for env var substitution"
     },
-    "qdrantApiKey": {
-      "label": "Qdrant API Key",
+    "postgresUrl": {
+      "label": "PostgreSQL URL",
       "sensitive": true,
-      "help": "Use ${QDRANT_API_KEY} for env var substitution"
+      "help": "e.g. postgresql://openclaw:${POSTGRES_PASSWORD}@postgresql:5432/knowledge"
     },
     "collections": {
       "label": "Collections to search",
-      "help": "List of Qdrant collection names (e.g. knowledge_alice, knowledge_shared)"
+      "help": "Collection names in the knowledge_vectors table (e.g. knowledge_olivier)"
     },
     "enabled": {
       "label": "Auto-inject knowledge",

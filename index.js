@@ -1,13 +1,14 @@
-// openclaw-knowledge — Multi-collection Qdrant RAG plugin for OpenClaw
+// openclaw-knowledge — Multi-collection pgvector RAG plugin for OpenClaw
 //
-// Hooks into before_agent_start to search knowledge collections and inject
-// relevant documents into the agent's context via prependContext.
-// Results are wrapped in <relevant-memories> tags so mem0 autoCapture
-// strips them before memorizing (avoids polluting conversational memory).
+// Hooks into before_prompt_build to search knowledge collections stored in
+// PostgreSQL (pgvector) and inject relevant documents into the agent's
+// system prompt via appendSystemContext.
 // Uses Gemini Embedding 2 Preview (native embedContent endpoint) for query
 // embedding — same model/space as the multimodal document embeddings.
 //
-// Zero dependencies — uses Node.js native fetch.
+// Depends on: pg (node-postgres)
+
+import pg from "pg";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -54,49 +55,53 @@ async function embedQuery(text, geminiApiKey) {
 }
 
 /**
- * Search a single Qdrant collection using a pre-computed vector.
- * Returns an array of results with score + payload fields.
- * Fails silently if the collection doesn't exist.
+ * Search a collection in PostgreSQL pgvector using cosine similarity.
+ * Uses halfvec(3072) cast for HNSW index compatibility (pgvector HNSW
+ * limit is 2000 dims for vector type, halfvec supports up to 4000).
+ * Score filtering is done in JS after the query to allow the HNSW
+ * index to handle the ORDER BY + LIMIT efficiently.
  */
 async function searchCollection(
+  pool,
   collection,
   vector,
   topK,
-  scoreThreshold,
-  qdrantUrl,
-  qdrantApiKey
+  scoreThreshold
 ) {
-  const url = `${qdrantUrl}/collections/${collection}/points/query`;
-  const headers = { "Content-Type": "application/json" };
-  if (qdrantApiKey) headers["api-key"] = qdrantApiKey;
+  const vectorStr = `[${vector.join(",")}]`;
 
-  let resp;
   try {
-    resp = await fetch(url, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({
-        query: vector,
-        limit: topK,
-        score_threshold: scoreThreshold,
-        with_payload: true,
-      }),
-    });
+    const result = await pool.query(
+      `SELECT file_name, mime_type, text, file_id, source, owner,
+              chunk_index, total_chunks, timestamp_start, timestamp_end,
+              embedded_at,
+              1 - (embedding::halfvec(3072) <=> $1::halfvec(3072)) AS score
+       FROM knowledge_vectors
+       WHERE collection = $2
+       ORDER BY embedding::halfvec(3072) <=> $1::halfvec(3072)
+       LIMIT $3`,
+      [vectorStr, collection, topK]
+    );
+
+    return result.rows
+      .filter((row) => parseFloat(row.score) >= scoreThreshold)
+      .map((row) => ({
+        collection,
+        score: parseFloat(row.score),
+        file_name: row.file_name,
+        mime_type: row.mime_type,
+        text: row.text,
+        file_id: row.file_id,
+        source: row.source,
+        owner: row.owner,
+        chunk_index: row.chunk_index,
+        total_chunks: row.total_chunks,
+        timestamp_start: row.timestamp_start,
+        timestamp_end: row.timestamp_end,
+      }));
   } catch {
-    // Network error (Qdrant down, DNS failure, etc.)
     return [];
   }
-
-  if (!resp.ok) return [];
-
-  const data = await resp.json();
-  const points = data.result?.points ?? [];
-
-  return points.map((p) => ({
-    collection,
-    score: p.score,
-    ...p.payload,
-  }));
 }
 
 /**
@@ -143,16 +148,17 @@ export { resolveEnv, embedQuery, searchCollection, formatResults };
 
 export default {
   id: "openclaw-knowledge",
-  name: "Qdrant Knowledge Base",
-  description: "Multi-collection Qdrant RAG for OpenClaw",
+  name: "pgvector Knowledge Base",
+  description: "Multi-collection pgvector RAG for OpenClaw",
 
   register(api) {
     const cfg = api.pluginConfig ?? {};
 
     // Resolve config with env var substitution
     const geminiApiKey = resolveEnv(cfg.geminiApiKey ?? "");
-    const qdrantUrl = resolveEnv(cfg.qdrantUrl ?? "http://qdrant:6333");
-    const qdrantApiKey = resolveEnv(cfg.qdrantApiKey ?? "");
+    const postgresUrl = resolveEnv(
+      cfg.postgresUrl ?? "postgresql://openclaw:@postgresql:5432/knowledge"
+    );
     const collections = cfg.collections ?? ["knowledge_default"];
     const topK = cfg.topK ?? 5;
     const scoreThreshold = cfg.scoreThreshold ?? 0.3;
@@ -166,6 +172,17 @@ export default {
       );
       return;
     }
+
+    // Initialize PostgreSQL connection pool
+    const pool = new pg.Pool({
+      connectionString: postgresUrl,
+      max: 3,
+      idleTimeoutMillis: 30000,
+    });
+
+    pool.on("error", (err) => {
+      api.logger.error(`openclaw-knowledge: pool error — ${err.message}`);
+    });
 
     api.logger.info(
       `openclaw-knowledge: ready — searching ${collections.length} collection(s): ${collections.join(", ")}`
@@ -217,14 +234,7 @@ export default {
         const vector = await embedQuery(query, geminiApiKey);
 
         const searches = collections.map((col) =>
-          searchCollection(
-            col,
-            vector,
-            topK,
-            scoreThreshold,
-            qdrantUrl,
-            qdrantApiKey
-          )
+          searchCollection(pool, col, vector, topK, scoreThreshold)
         );
         const allResults = (await Promise.all(searches)).flat();
         allResults.sort((a, b) => b.score - a.score);

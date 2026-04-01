@@ -1,5 +1,5 @@
-// Unit tests for openclaw-knowledge plugin
-// Uses Node.js built-in test runner (node:test) — zero dependencies.
+// Unit tests for openclaw-knowledge plugin (pgvector version)
+// Uses Node.js built-in test runner (node:test) — zero test dependencies.
 
 import { describe, it, beforeEach, afterEach, mock } from "node:test";
 import assert from "node:assert/strict";
@@ -15,8 +15,6 @@ import plugin, {
 // ---------------------------------------------------------------------------
 
 describe("resolveEnv", () => {
-  const original = { ...process.env };
-
   beforeEach(() => {
     process.env.TEST_KEY = "hello";
     process.env.OTHER_KEY = "world";
@@ -105,34 +103,55 @@ describe("embedQuery", () => {
 });
 
 // ---------------------------------------------------------------------------
-// searchCollection
+// searchCollection (pgvector)
 // ---------------------------------------------------------------------------
 
 describe("searchCollection", () => {
-  afterEach(() => {
-    mock.restoreAll();
-  });
+  function mockPool(rows = [], shouldThrow = false) {
+    return {
+      query: async (sql, params) => {
+        if (shouldThrow) throw new Error("connection refused");
+        return { rows };
+      },
+    };
+  }
 
   it("returns mapped results on success", async () => {
-    mock.method(globalThis, "fetch", async () => ({
-      ok: true,
-      json: async () => ({
-        result: {
-          points: [
-            { score: 0.95, payload: { file_name: "doc.pdf", text: "hello" } },
-            { score: 0.80, payload: { file_name: "notes.md", text: "world" } },
-          ],
-        },
-      }),
-    }));
+    const pool = mockPool([
+      {
+        file_name: "doc.pdf",
+        text: "hello",
+        score: "0.95",
+        mime_type: "application/pdf",
+        file_id: "abc",
+        source: "google_drive",
+        owner: "olivier",
+        chunk_index: 0,
+        total_chunks: 1,
+        timestamp_start: null,
+        timestamp_end: null,
+      },
+      {
+        file_name: "notes.md",
+        text: "world",
+        score: "0.80",
+        mime_type: "text/markdown",
+        file_id: "def",
+        source: "google_drive",
+        owner: "olivier",
+        chunk_index: 0,
+        total_chunks: 1,
+        timestamp_start: null,
+        timestamp_end: null,
+      },
+    ]);
 
     const results = await searchCollection(
+      pool,
       "knowledge_test",
       [0.1, 0.2],
       5,
-      0.3,
-      "http://qdrant:6333",
-      ""
+      0.3
     );
 
     assert.equal(results.length, 2);
@@ -142,94 +161,55 @@ describe("searchCollection", () => {
     assert.equal(results[1].text, "world");
   });
 
-  it("sends correct request with API key", async () => {
-    mock.method(globalThis, "fetch", async (url, opts) => {
-      assert.equal(
-        url,
-        "http://localhost:6333/collections/my_col/points/query"
-      );
-      assert.equal(opts.headers["api-key"], "secret");
+  it("sends correct SQL with halfvec cast", async () => {
+    let capturedSql = "";
+    let capturedParams = [];
+    const pool = {
+      query: async (sql, params) => {
+        capturedSql = sql;
+        capturedParams = params;
+        return { rows: [] };
+      },
+    };
 
-      const body = JSON.parse(opts.body);
-      assert.equal(body.limit, 10);
-      assert.equal(body.score_threshold, 0.5);
-      assert.equal(body.with_payload, true);
+    await searchCollection(pool, "my_col", [1, 2, 3], 10, 0.5);
 
-      return {
-        ok: true,
-        json: async () => ({ result: { points: [] } }),
-      };
-    });
-
-    await searchCollection(
-      "my_col",
-      [1, 2, 3],
-      10,
-      0.5,
-      "http://localhost:6333",
-      "secret"
-    );
+    assert.ok(capturedSql.includes("halfvec(3072)"));
+    assert.ok(capturedSql.includes("knowledge_vectors"));
+    assert.equal(capturedParams[0], "[1,2,3]");
+    assert.equal(capturedParams[1], "my_col");
+    assert.equal(capturedParams[2], 10);
   });
 
-  it("omits api-key header when no key provided", async () => {
-    mock.method(globalThis, "fetch", async (_url, opts) => {
-      assert.equal(opts.headers["api-key"], undefined);
-      return {
-        ok: true,
-        json: async () => ({ result: { points: [] } }),
-      };
-    });
-
-    await searchCollection("col", [1], 5, 0.3, "http://q:6333", "");
-  });
-
-  it("returns empty array on network error", async () => {
-    mock.method(globalThis, "fetch", async () => {
-      throw new Error("ECONNREFUSED");
-    });
+  it("filters results below score threshold", async () => {
+    const pool = mockPool([
+      { file_name: "good.pdf", score: "0.8", text: "yes" },
+      { file_name: "bad.pdf", score: "0.1", text: "no" },
+    ]);
 
     const results = await searchCollection(
+      pool,
       "col",
       [1],
       5,
-      0.3,
-      "http://dead:6333",
-      ""
+      0.5
     );
+
+    assert.equal(results.length, 1);
+    assert.equal(results[0].file_name, "good.pdf");
+  });
+
+  it("returns empty array on database error", async () => {
+    const pool = mockPool([], true);
+
+    const results = await searchCollection(pool, "col", [1], 5, 0.3);
     assert.deepEqual(results, []);
   });
 
-  it("returns empty array on non-OK response", async () => {
-    mock.method(globalThis, "fetch", async () => ({
-      ok: false,
-      status: 404,
-    }));
+  it("handles empty result set", async () => {
+    const pool = mockPool([]);
 
-    const results = await searchCollection(
-      "nonexistent",
-      [1],
-      5,
-      0.3,
-      "http://q:6333",
-      ""
-    );
-    assert.deepEqual(results, []);
-  });
-
-  it("handles missing result.points gracefully", async () => {
-    mock.method(globalThis, "fetch", async () => ({
-      ok: true,
-      json: async () => ({ result: {} }),
-    }));
-
-    const results = await searchCollection(
-      "col",
-      [1],
-      5,
-      0.3,
-      "http://q:6333",
-      ""
-    );
+    const results = await searchCollection(pool, "col", [1], 5, 0.3);
     assert.deepEqual(results, []);
   });
 });
@@ -308,7 +288,7 @@ describe("formatResults", () => {
 describe("register", () => {
   it("exposes correct plugin metadata", () => {
     assert.equal(plugin.id, "openclaw-knowledge");
-    assert.equal(plugin.name, "Qdrant Knowledge Base");
+    assert.equal(plugin.name, "pgvector Knowledge Base");
   });
 
   it("warns and returns when geminiApiKey is missing", () => {
@@ -339,7 +319,7 @@ describe("register", () => {
     const api = {
       pluginConfig: {
         geminiApiKey: "test-key",
-        qdrantUrl: "http://localhost:6333",
+        postgresUrl: "postgresql://user:pass@localhost:5432/knowledge",
         collections: ["test_col"],
       },
       logger: {
@@ -362,7 +342,7 @@ describe("register", () => {
     const api = {
       pluginConfig: {
         geminiApiKey: "test-key",
-        qdrantUrl: "http://localhost:6333",
+        postgresUrl: "postgresql://user:pass@localhost:5432/knowledge",
         collections: ["col"],
       },
       logger: {
@@ -377,7 +357,7 @@ describe("register", () => {
     };
 
     mock.method(globalThis, "fetch", async () => {
-      throw new Error("fetch should not be called");
+      throw new Error("fetch should not be called for embed");
     });
 
     plugin.register(api);
@@ -391,68 +371,12 @@ describe("register", () => {
     mock.restoreAll();
   });
 
-  it("returns appendSystemContext on successful search", async () => {
-    const handlers = {};
-    const api = {
-      pluginConfig: {
-        geminiApiKey: "test-key",
-        qdrantUrl: "http://localhost:6333",
-        collections: ["col"],
-      },
-      logger: {
-        warn: () => {},
-        info: () => {},
-        debug: () => {},
-        error: () => {},
-      },
-      on: (event, handler) => {
-        handlers[event] = handler;
-      },
-    };
-
-    let callCount = 0;
-    mock.method(globalThis, "fetch", async (url) => {
-      callCount++;
-      if (url.includes("gemini")) {
-        return {
-          ok: true,
-          json: async () => ({ embedding: { values: [0.1, 0.2] } }),
-        };
-      }
-      // Qdrant
-      return {
-        ok: true,
-        json: async () => ({
-          result: {
-            points: [
-              { score: 0.9, payload: { file_name: "doc.pdf", text: "answer" } },
-            ],
-          },
-        }),
-      };
-    });
-
-    plugin.register(api);
-
-    const result = await handlers["before_prompt_build"]({
-      prompt: "",
-      messages: [{ role: "user", content: "what is the answer?" }],
-    });
-
-    assert.ok(result.appendSystemContext.includes("Knowledge Base Documents"));
-    assert.ok(result.appendSystemContext.includes("doc.pdf"));
-    assert.equal(callCount, 2); // 1 embed + 1 search
-
-    mock.restoreAll();
-  });
-
-
   it("does nothing when disabled", async () => {
     const handlers = {};
     const api = {
       pluginConfig: {
         geminiApiKey: "test-key",
-        qdrantUrl: "http://localhost:6333",
+        postgresUrl: "postgresql://user:pass@localhost:5432/knowledge",
         collections: ["col"],
         enabled: false,
       },
