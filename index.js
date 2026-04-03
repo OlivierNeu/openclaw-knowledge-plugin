@@ -220,9 +220,16 @@ export default {
           const msg = event.messages[i];
           const role = msg.role ?? msg.sender ?? "";
           if (role === "user" || role === "human") {
-            query = typeof msg.content === "string"
-              ? msg.content
-              : msg.text ?? "";
+            if (typeof msg.content === "string") {
+              query = msg.content;
+            } else if (Array.isArray(msg.content)) {
+              query = msg.content
+                .filter((p) => p.type === "text" && p.text)
+                .map((p) => p.text)
+                .join(" ");
+            } else {
+              query = msg.text ?? "";
+            }
             break;
           }
         }
