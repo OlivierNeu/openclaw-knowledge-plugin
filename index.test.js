@@ -399,4 +399,146 @@ describe("register", () => {
     });
     assert.equal(result, undefined);
   });
+
+  it("extracts query from array content format (OpenClaw multi-part)", async () => {
+    const handlers = {};
+    const api = {
+      pluginConfig: {
+        geminiApiKey: "test-key",
+        postgresUrl: "postgresql://user:pass@localhost:5432/knowledge",
+        collections: ["col"],
+      },
+      logger: {
+        warn: () => {},
+        info: () => {},
+        debug: () => {},
+        error: () => {},
+      },
+      on: (event, handler) => {
+        handlers[event] = handler;
+      },
+    };
+
+    let callCount = 0;
+    mock.method(globalThis, "fetch", async (url) => {
+      callCount++;
+      return {
+        ok: true,
+        json: async () => ({ embedding: { values: [0.1, 0.2] } }),
+      };
+    });
+
+    plugin.register(api);
+
+    const result = await handlers["before_prompt_build"]({
+      prompt: "",
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "what is in my scanned documents?" },
+          ],
+        },
+      ],
+    });
+
+    // Gemini embedding should have been called (query was extracted)
+    assert.ok(callCount >= 1, "fetch should be called for embedding");
+
+    mock.restoreAll();
+  });
+
+  it("handles mixed content array with non-text parts", async () => {
+    const handlers = {};
+    const api = {
+      pluginConfig: {
+        geminiApiKey: "test-key",
+        postgresUrl: "postgresql://user:pass@localhost:5432/knowledge",
+        collections: ["col"],
+      },
+      logger: {
+        warn: () => {},
+        info: () => {},
+        debug: () => {},
+        error: () => {},
+      },
+      on: (event, handler) => {
+        handlers[event] = handler;
+      },
+    };
+
+    mock.method(globalThis, "fetch", async () => {
+      throw new Error("fetch should not be called for empty text");
+    });
+
+    plugin.register(api);
+
+    // Content array with only non-text parts -> query should be empty
+    const result = await handlers["before_prompt_build"]({
+      prompt: "",
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "image", data: "base64..." },
+          ],
+        },
+      ],
+    });
+
+    assert.equal(result, undefined);
+    mock.restoreAll();
+  });
+
+  it("skips system messages in array content", async () => {
+    const handlers = {};
+    const api = {
+      pluginConfig: {
+        geminiApiKey: "test-key",
+        postgresUrl: "postgresql://user:pass@localhost:5432/knowledge",
+        collections: ["col"],
+      },
+      logger: {
+        warn: () => {},
+        info: () => {},
+        debug: () => {},
+        error: () => {},
+      },
+      on: (event, handler) => {
+        handlers[event] = handler;
+      },
+    };
+
+    let callCount = 0;
+    mock.method(globalThis, "fetch", async () => {
+      callCount++;
+      return {
+        ok: true,
+        json: async () => ({ embedding: { values: [0.1] } }),
+      };
+    });
+
+    plugin.register(api);
+
+    // Last message is assistant, user message is second-to-last (array format)
+    const result = await handlers["before_prompt_build"]({
+      prompt: "",
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "System: WhatsApp connected.\n\nFind my documents" },
+          ],
+        },
+        {
+          role: "assistant",
+          content: "I'll look for your documents.",
+        },
+      ],
+    });
+
+    // Should have called embedding with the user's message
+    assert.ok(callCount >= 1);
+    mock.restoreAll();
+  });
 });
