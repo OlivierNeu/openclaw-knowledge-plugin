@@ -1,4 +1,4 @@
-// Unit tests for openclaw-knowledge plugin (pgvector version)
+// Unit tests for openclaw-knowledge plugin (pgvector + LightRAG)
 // Uses Node.js built-in test runner (node:test) — zero test dependencies.
 
 import { describe, it, beforeEach, afterEach, mock } from "node:test";
@@ -8,6 +8,8 @@ import plugin, {
   embedQuery,
   searchCollection,
   formatResults,
+  queryLightRAG,
+  truncateLightRAG,
 } from "./index.js";
 
 // ---------------------------------------------------------------------------
@@ -187,13 +189,7 @@ describe("searchCollection", () => {
       { file_name: "bad.pdf", score: "0.1", text: "no" },
     ]);
 
-    const results = await searchCollection(
-      pool,
-      "col",
-      [1],
-      5,
-      0.5
-    );
+    const results = await searchCollection(pool, "col", [1], 5, 0.5);
 
     assert.equal(results.length, 1);
     assert.equal(results[0].file_name, "good.pdf");
@@ -225,7 +221,12 @@ describe("formatResults", () => {
 
   it("formats basic result with score and file name", () => {
     const results = [
-      { collection: "knowledge", score: 0.95, file_name: "doc.pdf", text: "hello" },
+      {
+        collection: "knowledge",
+        score: 0.95,
+        file_name: "doc.pdf",
+        text: "hello",
+      },
     ];
     const output = formatResults(results, 4000);
 
@@ -282,16 +283,183 @@ describe("formatResults", () => {
 });
 
 // ---------------------------------------------------------------------------
-// register (integration)
+// queryLightRAG
+// ---------------------------------------------------------------------------
+
+describe("queryLightRAG", () => {
+  afterEach(() => {
+    mock.restoreAll();
+  });
+
+  it("sends correct request to LightRAG API", async () => {
+    mock.method(globalThis, "fetch", async (url, opts) => {
+      assert.equal(url, "http://lightrag:9621/query");
+      assert.equal(opts.method, "POST");
+      assert.equal(opts.headers["Content-Type"], "application/json");
+      assert.equal(opts.headers["Authorization"], "Bearer my-api-key");
+
+      const body = JSON.parse(opts.body);
+      assert.equal(body.query, "find my contracts");
+      assert.equal(body.mode, "hybrid");
+      assert.equal(body.only_need_context, true);
+      assert.equal(body.stream, false);
+
+      return {
+        ok: true,
+        json: async () => ({ response: "Contract A signed on 2025-01-01." }),
+      };
+    });
+
+    const result = await queryLightRAG(
+      "http://lightrag:9621",
+      "my-api-key",
+      "find my contracts",
+      "hybrid"
+    );
+    assert.equal(result, "Contract A signed on 2025-01-01.");
+  });
+
+  it("handles string response format", async () => {
+    mock.method(globalThis, "fetch", async () => ({
+      ok: true,
+      json: async () => "Direct string context from LightRAG",
+    }));
+
+    const result = await queryLightRAG(
+      "http://lightrag:9621",
+      "",
+      "query",
+      "naive"
+    );
+    assert.equal(result, "Direct string context from LightRAG");
+  });
+
+  it("handles response with context field", async () => {
+    mock.method(globalThis, "fetch", async () => ({
+      ok: true,
+      json: async () => ({ context: "Context field data" }),
+    }));
+
+    const result = await queryLightRAG(
+      "http://lightrag:9621",
+      "",
+      "query",
+      "local"
+    );
+    assert.equal(result, "Context field data");
+  });
+
+  it("returns empty string for unexpected response shape", async () => {
+    mock.method(globalThis, "fetch", async () => ({
+      ok: true,
+      json: async () => ({ other: "data" }),
+    }));
+
+    const result = await queryLightRAG(
+      "http://lightrag:9621",
+      "",
+      "query",
+      "global"
+    );
+    assert.equal(result, "");
+  });
+
+  it("omits Authorization header when no API key", async () => {
+    mock.method(globalThis, "fetch", async (url, opts) => {
+      assert.equal(opts.headers["Authorization"], undefined);
+      return { ok: true, json: async () => ({ response: "ok" }) };
+    });
+
+    await queryLightRAG("http://lightrag:9621", "", "query", "hybrid");
+  });
+
+  it("uses provided query mode", async () => {
+    mock.method(globalThis, "fetch", async (url, opts) => {
+      const body = JSON.parse(opts.body);
+      assert.equal(body.mode, "global");
+      return { ok: true, json: async () => ({ response: "" }) };
+    });
+
+    await queryLightRAG("http://lightrag:9621", "", "query", "global");
+  });
+
+  it("defaults to hybrid mode when none specified", async () => {
+    mock.method(globalThis, "fetch", async (url, opts) => {
+      const body = JSON.parse(opts.body);
+      assert.equal(body.mode, "hybrid");
+      return { ok: true, json: async () => ({ response: "" }) };
+    });
+
+    await queryLightRAG("http://lightrag:9621", "", "query");
+  });
+
+  it("throws on non-OK response", async () => {
+    mock.method(globalThis, "fetch", async () => ({
+      ok: false,
+      status: 500,
+      text: async () => "Internal Server Error",
+    }));
+
+    await assert.rejects(
+      () => queryLightRAG("http://lightrag:9621", "", "q", "hybrid"),
+      { message: /LightRAG query failed \(500\)/ }
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// truncateLightRAG
+// ---------------------------------------------------------------------------
+
+describe("truncateLightRAG", () => {
+  it("returns null/empty values unchanged", () => {
+    assert.equal(truncateLightRAG(null, 100), null);
+    assert.equal(truncateLightRAG("", 100), "");
+  });
+
+  it("returns short text unchanged", () => {
+    assert.equal(truncateLightRAG("short text.", 1000), "short text.");
+  });
+
+  it("truncates at last period when possible", () => {
+    const text = "First sentence. Second sentence. Third sentence is very long.";
+    const result = truncateLightRAG(text, 35);
+    assert.equal(result, "First sentence. Second sentence.");
+  });
+
+  it("truncates at maxChars when no good period found", () => {
+    const text = "A".repeat(200);
+    const result = truncateLightRAG(text, 100);
+    assert.equal(result.length, 100);
+  });
+
+  it("does not cut at period too early in the text", () => {
+    // Period at position 5 in a 100-char max — too early (< 50%)
+    const text = "Hi. " + "A".repeat(200);
+    const result = truncateLightRAG(text, 100);
+    // Should fall back to raw truncation since period is at pos 2 (< 50 = 50%)
+    assert.equal(result.length, 100);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// register — plugin metadata
 // ---------------------------------------------------------------------------
 
 describe("register", () => {
   it("exposes correct plugin metadata", () => {
     assert.equal(plugin.id, "openclaw-knowledge");
-    assert.equal(plugin.name, "pgvector Knowledge Base");
+    assert.equal(plugin.name, "Knowledge Base");
+    assert.equal(typeof plugin.description, "string");
+    assert.ok(plugin.description.includes("pgvector"));
+    assert.ok(plugin.description.includes("LightRAG"));
   });
 
-  it("warns and returns when geminiApiKey is missing", () => {
+  // -----------------------------------------------------------------------
+  // Initialization
+  // -----------------------------------------------------------------------
+
+  it("warns and returns when neither pgvector nor lightrag configured", () => {
     const warnings = [];
     const handlers = {};
     const api = {
@@ -310,11 +478,12 @@ describe("register", () => {
     plugin.register(api);
 
     assert.equal(warnings.length, 1);
-    assert.ok(warnings[0].includes("GEMINI_API_KEY not configured"));
+    assert.ok(warnings[0].includes("neither pgvector nor LightRAG configured"));
     assert.equal(handlers["before_prompt_build"], undefined);
   });
 
-  it("registers before_prompt_build hook when configured", () => {
+  it("registers hook with pgvector only", () => {
+    const infos = [];
     const handlers = {};
     const api = {
       pluginConfig: {
@@ -324,7 +493,7 @@ describe("register", () => {
       },
       logger: {
         warn: () => {},
-        info: () => {},
+        info: (msg) => infos.push(msg),
         debug: () => {},
         error: () => {},
       },
@@ -335,15 +504,126 @@ describe("register", () => {
 
     plugin.register(api);
     assert.equal(typeof handlers["before_prompt_build"], "function");
+    assert.ok(infos.some((m) => m.includes("pgvector")));
+    assert.ok(!infos.some((m) => m.includes("LightRAG")));
   });
 
-  it("skips short queries (less than 3 chars)", async () => {
+  it("registers hook with lightrag only", () => {
+    const infos = [];
+    const handlers = {};
+    const api = {
+      pluginConfig: {
+        lightragUrl: "http://lightrag:9621",
+        lightragApiKey: "lr-key",
+      },
+      logger: {
+        warn: () => {},
+        info: (msg) => infos.push(msg),
+        debug: () => {},
+        error: () => {},
+      },
+      on: (event, handler) => {
+        handlers[event] = handler;
+      },
+    };
+
+    plugin.register(api);
+    assert.equal(typeof handlers["before_prompt_build"], "function");
+    assert.ok(infos.some((m) => m.includes("LightRAG")));
+    assert.ok(!infos.some((m) => m.includes("pgvector")));
+  });
+
+  it("registers hook with both sources", () => {
+    const infos = [];
     const handlers = {};
     const api = {
       pluginConfig: {
         geminiApiKey: "test-key",
         postgresUrl: "postgresql://user:pass@localhost:5432/knowledge",
         collections: ["col"],
+        lightragUrl: "http://lightrag:9621",
+      },
+      logger: {
+        warn: () => {},
+        info: (msg) => infos.push(msg),
+        debug: () => {},
+        error: () => {},
+      },
+      on: (event, handler) => {
+        handlers[event] = handler;
+      },
+    };
+
+    plugin.register(api);
+    assert.equal(typeof handlers["before_prompt_build"], "function");
+    const readyMsg = infos.find((m) => m.includes("ready"));
+    assert.ok(readyMsg.includes("pgvector"));
+    assert.ok(readyMsg.includes("LightRAG"));
+  });
+
+  it("disables pgvector when pgvectorEnabled is false", () => {
+    const infos = [];
+    const handlers = {};
+    const api = {
+      pluginConfig: {
+        geminiApiKey: "test-key",
+        postgresUrl: "postgresql://localhost/knowledge",
+        pgvectorEnabled: false,
+        lightragUrl: "http://lightrag:9621",
+      },
+      logger: {
+        warn: () => {},
+        info: (msg) => infos.push(msg),
+        debug: () => {},
+        error: () => {},
+      },
+      on: (event, handler) => {
+        handlers[event] = handler;
+      },
+    };
+
+    plugin.register(api);
+    const readyMsg = infos.find((m) => m.includes("ready"));
+    assert.ok(!readyMsg.includes("pgvector"));
+    assert.ok(readyMsg.includes("LightRAG"));
+  });
+
+  it("disables lightrag when lightragEnabled is false", () => {
+    const infos = [];
+    const handlers = {};
+    const api = {
+      pluginConfig: {
+        geminiApiKey: "test-key",
+        postgresUrl: "postgresql://localhost/knowledge",
+        lightragUrl: "http://lightrag:9621",
+        lightragEnabled: false,
+      },
+      logger: {
+        warn: () => {},
+        info: (msg) => infos.push(msg),
+        debug: () => {},
+        error: () => {},
+      },
+      on: (event, handler) => {
+        handlers[event] = handler;
+      },
+    };
+
+    plugin.register(api);
+    const readyMsg = infos.find((m) => m.includes("ready"));
+    assert.ok(readyMsg.includes("pgvector"));
+    assert.ok(!readyMsg.includes("LightRAG"));
+  });
+
+  // -----------------------------------------------------------------------
+  // Hook: query extraction
+  // -----------------------------------------------------------------------
+
+  it("skips short queries (less than 3 chars)", async () => {
+    const handlers = {};
+    const api = {
+      pluginConfig: {
+        lightragUrl: "http://lightrag:9621",
       },
       logger: {
         warn: () => {},
@@ -357,7 +637,7 @@ describe("register", () => {
     };
 
     mock.method(globalThis, "fetch", async () => {
-      throw new Error("fetch should not be called for embed");
+      throw new Error("fetch should not be called");
     });
 
     plugin.register(api);
@@ -367,7 +647,37 @@ describe("register", () => {
       messages: [{ role: "user", content: "ab" }],
     });
     assert.equal(result, undefined);
+    mock.restoreAll();
+  });
 
+  it("skips empty messages array", async () => {
+    const handlers = {};
+    const api = {
+      pluginConfig: {
+        lightragUrl: "http://lightrag:9621",
+      },
+      logger: {
+        warn: () => {},
+        info: () => {},
+        debug: () => {},
+        error: () => {},
+      },
+      on: (event, handler) => {
+        handlers[event] = handler;
+      },
+    };
+
+    mock.method(globalThis, "fetch", async () => {
+      throw new Error("fetch should not be called");
+    });
+
+    plugin.register(api);
+
+    const result = await handlers["before_prompt_build"]({
+      prompt: "",
+      messages: [],
+    });
+    assert.equal(result, undefined);
     mock.restoreAll();
   });
 
@@ -375,9 +685,7 @@ describe("register", () => {
     const handlers = {};
     const api = {
       pluginConfig: {
-        geminiApiKey: "test-key",
-        postgresUrl: "postgresql://user:pass@localhost:5432/knowledge",
-        collections: ["col"],
+        lightragUrl: "http://lightrag:9621",
         enabled: false,
       },
       logger: {
@@ -400,13 +708,11 @@ describe("register", () => {
     assert.equal(result, undefined);
   });
 
-  it("extracts query from array content format (OpenClaw multi-part)", async () => {
+  it("extracts query from string content", async () => {
     const handlers = {};
     const api = {
       pluginConfig: {
-        geminiApiKey: "test-key",
-        postgresUrl: "postgresql://user:pass@localhost:5432/knowledge",
-        collections: ["col"],
+        lightragUrl: "http://lightrag:9621",
       },
       logger: {
         warn: () => {},
@@ -419,18 +725,55 @@ describe("register", () => {
       },
     };
 
-    let callCount = 0;
-    mock.method(globalThis, "fetch", async (url) => {
-      callCount++;
+    let capturedQuery = "";
+    mock.method(globalThis, "fetch", async (url, opts) => {
+      const body = JSON.parse(opts.body);
+      capturedQuery = body.query;
       return {
         ok: true,
-        json: async () => ({ embedding: { values: [0.1, 0.2] } }),
+        json: async () => ({ response: "context" }),
       };
     });
 
     plugin.register(api);
+    await handlers["before_prompt_build"]({
+      prompt: "",
+      messages: [{ role: "user", content: "find my contracts" }],
+    });
 
-    const result = await handlers["before_prompt_build"]({
+    assert.equal(capturedQuery, "find my contracts");
+    mock.restoreAll();
+  });
+
+  it("extracts query from array content format (OpenClaw multi-part)", async () => {
+    const handlers = {};
+    const api = {
+      pluginConfig: {
+        lightragUrl: "http://lightrag:9621",
+      },
+      logger: {
+        warn: () => {},
+        info: () => {},
+        debug: () => {},
+        error: () => {},
+      },
+      on: (event, handler) => {
+        handlers[event] = handler;
+      },
+    };
+
+    let capturedQuery = "";
+    mock.method(globalThis, "fetch", async (url, opts) => {
+      const body = JSON.parse(opts.body);
+      capturedQuery = body.query;
+      return {
+        ok: true,
+        json: async () => ({ response: "context" }),
+      };
+    });
+
+    plugin.register(api);
+    await handlers["before_prompt_build"]({
       prompt: "",
       messages: [
         {
@@ -442,9 +785,7 @@ describe("register", () => {
       ],
     });
 
-    // Gemini embedding should have been called (query was extracted)
-    assert.ok(callCount >= 1, "fetch should be called for embedding");
-
+    assert.equal(capturedQuery, "what is in my scanned documents?");
     mock.restoreAll();
   });
 
@@ -452,9 +793,7 @@ describe("register", () => {
     const handlers = {};
     const api = {
       pluginConfig: {
-        geminiApiKey: "test-key",
-        postgresUrl: "postgresql://user:pass@localhost:5432/knowledge",
-        collections: ["col"],
+        lightragUrl: "http://lightrag:9621",
       },
       logger: {
         warn: () => {},
@@ -473,15 +812,12 @@ describe("register", () => {
 
     plugin.register(api);
 
-    // Content array with only non-text parts -> query should be empty
     const result = await handlers["before_prompt_build"]({
       prompt: "",
       messages: [
         {
           role: "user",
-          content: [
-            { type: "image", data: "base64..." },
-          ],
+          content: [{ type: "image", data: "base64..." }],
         },
       ],
     });
@@ -490,13 +826,11 @@ describe("register", () => {
     mock.restoreAll();
   });
 
-  it("skips system messages in array content", async () => {
+  it("picks last user message, skipping assistant messages", async () => {
     const handlers = {};
     const api = {
       pluginConfig: {
-        geminiApiKey: "test-key",
-        postgresUrl: "postgresql://user:pass@localhost:5432/knowledge",
-        collections: ["col"],
+        lightragUrl: "http://lightrag:9621",
       },
       logger: {
         warn: () => {},
@@ -509,36 +843,271 @@ describe("register", () => {
       },
     };
 
-    let callCount = 0;
-    mock.method(globalThis, "fetch", async () => {
-      callCount++;
+    let capturedQuery = "";
+    mock.method(globalThis, "fetch", async (url, opts) => {
+      const body = JSON.parse(opts.body);
+      capturedQuery = body.query;
+      return { ok: true, json: async () => ({ response: "ctx" }) };
+    });
+
+    plugin.register(api);
+    await handlers["before_prompt_build"]({
+      prompt: "",
+      messages: [
+        { role: "user", content: "first question" },
+        { role: "assistant", content: "first answer" },
+        { role: "user", content: "second question" },
+        { role: "assistant", content: "second answer" },
+      ],
+    });
+
+    assert.equal(capturedQuery, "second question");
+    mock.restoreAll();
+  });
+
+  // -----------------------------------------------------------------------
+  // Hook: LightRAG-only execution
+  // -----------------------------------------------------------------------
+
+  it("injects LightRAG context into appendSystemContext", async () => {
+    const handlers = {};
+    const api = {
+      pluginConfig: {
+        lightragUrl: "http://lightrag:9621",
+        lightragApiKey: "lr-key",
+      },
+      logger: {
+        warn: () => {},
+        info: () => {},
+        debug: () => {},
+        error: () => {},
+      },
+      on: (event, handler) => {
+        handlers[event] = handler;
+      },
+    };
+
+    mock.method(globalThis, "fetch", async () => ({
+      ok: true,
+      json: async () => ({
+        response: "Entity: ACME Corp. Relation: signed contract with Olivier.",
+      }),
+    }));
+
+    plugin.register(api);
+    const result = await handlers["before_prompt_build"]({
+      prompt: "",
+      messages: [{ role: "user", content: "tell me about ACME" }],
+    });
+
+    assert.ok(result.appendSystemContext.includes("Knowledge Graph Context (LightRAG)"));
+    assert.ok(result.appendSystemContext.includes("ACME Corp"));
+    assert.ok(result.appendSystemContext.includes("Relevant Knowledge Base"));
+    mock.restoreAll();
+  });
+
+  it("returns undefined when LightRAG returns empty context", async () => {
+    const handlers = {};
+    const api = {
+      pluginConfig: {
+        lightragUrl: "http://lightrag:9621",
+      },
+      logger: {
+        warn: () => {},
+        info: () => {},
+        debug: () => {},
+        error: () => {},
+      },
+      on: (event, handler) => {
+        handlers[event] = handler;
+      },
+    };
+
+    mock.method(globalThis, "fetch", async () => ({
+      ok: true,
+      json: async () => ({ response: "" }),
+    }));
+
+    plugin.register(api);
+    const result = await handlers["before_prompt_build"]({
+      prompt: "",
+      messages: [{ role: "user", content: "something obscure" }],
+    });
+
+    assert.equal(result, undefined);
+    mock.restoreAll();
+  });
+
+  it("truncates LightRAG context to lightragMaxChars", async () => {
+    const handlers = {};
+    const api = {
+      pluginConfig: {
+        lightragUrl: "http://lightrag:9621",
+        lightragMaxChars: 50,
+      },
+      logger: {
+        warn: () => {},
+        info: () => {},
+        debug: () => {},
+        error: () => {},
+      },
+      on: (event, handler) => {
+        handlers[event] = handler;
+      },
+    };
+
+    mock.method(globalThis, "fetch", async () => ({
+      ok: true,
+      json: async () => ({ response: "A".repeat(200) }),
+    }));
+
+    plugin.register(api);
+    const result = await handlers["before_prompt_build"]({
+      prompt: "",
+      messages: [{ role: "user", content: "long context query" }],
+    });
+
+    assert.ok(result.appendSystemContext.length < 300);
+    mock.restoreAll();
+  });
+
+  // -----------------------------------------------------------------------
+  // Hook: graceful degradation
+  // -----------------------------------------------------------------------
+
+  it("continues with LightRAG when pgvector fails", async () => {
+    const handlers = {};
+    const errors = [];
+    const api = {
+      pluginConfig: {
+        geminiApiKey: "test-key",
+        postgresUrl: "postgresql://localhost/knowledge",
+        lightragUrl: "http://lightrag:9621",
+      },
+      logger: {
+        warn: () => {},
+        info: () => {},
+        debug: () => {},
+        error: (msg) => errors.push(msg),
+      },
+      on: (event, handler) => {
+        handlers[event] = handler;
+      },
+    };
+
+    let fetchCallCount = 0;
+    mock.method(globalThis, "fetch", async (url) => {
+      fetchCallCount++;
+      if (url.includes("generativelanguage")) {
+        // Gemini embedding fails
+        return { ok: false, status: 500, text: async () => "embed error" };
+      }
+      // LightRAG succeeds
       return {
         ok: true,
-        json: async () => ({ embedding: { values: [0.1] } }),
+        json: async () => ({ response: "LightRAG context here" }),
       };
     });
 
     plugin.register(api);
-
-    // Last message is assistant, user message is second-to-last (array format)
     const result = await handlers["before_prompt_build"]({
       prompt: "",
-      messages: [
-        {
-          role: "user",
-          content: [
-            { type: "text", text: "System: WhatsApp connected.\n\nFind my documents" },
-          ],
-        },
-        {
-          role: "assistant",
-          content: "I'll look for your documents.",
-        },
-      ],
+      messages: [{ role: "user", content: "find my documents" }],
     });
 
-    // Should have called embedding with the user's message
-    assert.ok(callCount >= 1);
+    assert.ok(result.appendSystemContext.includes("LightRAG context here"));
+    assert.ok(errors.some((e) => e.includes("source failed")));
+    mock.restoreAll();
+  });
+
+  it("continues with pgvector when LightRAG fails", async () => {
+    const handlers = {};
+    const errors = [];
+    const api = {
+      pluginConfig: {
+        geminiApiKey: "test-key",
+        postgresUrl: "postgresql://localhost/knowledge",
+        collections: ["col"],
+        lightragUrl: "http://lightrag:9621",
+      },
+      logger: {
+        warn: () => {},
+        info: () => {},
+        debug: () => {},
+        error: (msg) => errors.push(msg),
+      },
+      on: (event, handler) => {
+        handlers[event] = handler;
+      },
+    };
+
+    mock.method(globalThis, "fetch", async (url) => {
+      if (url.includes("generativelanguage")) {
+        return {
+          ok: true,
+          json: async () => ({ embedding: { values: [0.1, 0.2] } }),
+        };
+      }
+      // LightRAG fails
+      return { ok: false, status: 503, text: async () => "service down" };
+    });
+
+    plugin.register(api);
+    // pgvector pool.query will fail (no real DB), but the point is the
+    // LightRAG error is logged and doesn't crash the plugin
+    const result = await handlers["before_prompt_build"]({
+      prompt: "",
+      messages: [{ role: "user", content: "find my documents" }],
+    });
+
+    assert.ok(errors.some((e) => e.includes("source failed")));
+    mock.restoreAll();
+  });
+
+  // -----------------------------------------------------------------------
+  // Hook: cooldown behavior
+  // -----------------------------------------------------------------------
+
+  it("enters cooldown after MAX_CONSECUTIVE_ERRORS", async () => {
+    const handlers = {};
+    const errors = [];
+    const api = {
+      pluginConfig: {
+        lightragUrl: "http://lightrag:9621",
+      },
+      logger: {
+        warn: () => {},
+        info: () => {},
+        debug: () => {},
+        error: (msg) => errors.push(msg),
+      },
+      on: (event, handler) => {
+        handlers[event] = handler;
+      },
+    };
+
+    mock.method(globalThis, "fetch", async () => {
+      throw new Error("network down");
+    });
+
+    plugin.register(api);
+    const event = {
+      prompt: "",
+      messages: [{ role: "user", content: "test query here" }],
+    };
+
+    // Trigger 3 consecutive errors (MAX_CONSECUTIVE_ERRORS)
+    await handlers["before_prompt_build"](event);
+    await handlers["before_prompt_build"](event);
+    await handlers["before_prompt_build"](event);
+
+    assert.ok(errors.some((e) => e.includes("cooling down")));
+
+    // 4th call should be silently skipped (cooldown active)
+    const errorCountBefore = errors.length;
+    await handlers["before_prompt_build"](event);
+    assert.equal(errors.length, errorCountBefore);
+
     mock.restoreAll();
   });
 });

@@ -340,9 +340,11 @@ export default {
 
         // Assemble context from both sources
         const sections = [];
+        let failedSources = 0;
 
         for (const result of results) {
           if (result.status === "rejected") {
+            failedSources++;
             api.logger.error(
               `openclaw-knowledge: source failed — ${result.reason?.message ?? result.reason}`
             );
@@ -378,12 +380,21 @@ export default {
           }
         }
 
-        if (sections.length === 0) {
-          consecutiveErrors = 0;
+        // Track consecutive failures (all sources failed)
+        if (failedSources > 0 && failedSources === tasks.length) {
+          consecutiveErrors++;
+          if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+            cooldownUntil = Date.now() + 5 * 60 * 1000;
+            api.logger.error(
+              `openclaw-knowledge: ${consecutiveErrors} consecutive errors — cooling down 5 min`
+            );
+          }
           return;
         }
 
         consecutiveErrors = 0;
+
+        if (sections.length === 0) return;
 
         return {
           appendSystemContext: [
