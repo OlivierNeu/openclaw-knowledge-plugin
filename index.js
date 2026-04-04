@@ -369,12 +369,12 @@ export default {
             const context =
               typeof data === "string" ? data.trim() : "";
             if (context.length > 0) {
+              const truncated = truncateLightRAG(context, lightragMaxChars);
               sections.push(
-                "### Knowledge Graph Context (LightRAG)\n" +
-                  truncateLightRAG(context, lightragMaxChars)
+                "### Knowledge Graph Context (LightRAG)\n" + truncated
               );
               api.logger.info(
-                `openclaw-knowledge: LightRAG — ${context.length} chars`
+                `openclaw-knowledge: LightRAG — ${truncated.length}/${context.length} chars (truncated from ${context.length})`
               );
             }
           }
