@@ -296,7 +296,7 @@ describe("queryLightRAG", () => {
       assert.equal(url, "http://lightrag:9621/query");
       assert.equal(opts.method, "POST");
       assert.equal(opts.headers["Content-Type"], "application/json");
-      assert.equal(opts.headers["Authorization"], "Bearer my-api-key");
+      assert.equal(opts.headers["X-API-Key"], "my-api-key");
 
       const body = JSON.parse(opts.body);
       assert.equal(body.query, "find my contracts");
@@ -366,7 +366,7 @@ describe("queryLightRAG", () => {
 
   it("omits Authorization header when no API key", async () => {
     mock.method(globalThis, "fetch", async (url, opts) => {
-      assert.equal(opts.headers["Authorization"], undefined);
+      assert.equal(opts.headers["X-API-Key"], undefined);
       return { ok: true, json: async () => ({ response: "ok" }) };
     });
 

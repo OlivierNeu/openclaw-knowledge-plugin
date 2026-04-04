@@ -146,7 +146,7 @@ function formatResults(results, maxChars) {
  */
 async function queryLightRAG(url, apiKey, query, mode) {
   const headers = { "Content-Type": "application/json" };
-  if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
+  if (apiKey) headers["X-API-Key"] = apiKey;
 
   const resp = await fetch(`${url}/query`, {
     method: "POST",
