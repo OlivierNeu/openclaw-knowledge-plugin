@@ -1,11 +1,11 @@
-// openclaw-knowledge — Multi-collection pgvector RAG plugin for OpenClaw
+// openclaw-knowledge — Multi-source knowledge plugin for OpenClaw
 //
-// Hooks into before_prompt_build to search knowledge collections stored in
-// PostgreSQL (pgvector) and inject relevant documents into the agent's
-// system prompt via appendSystemContext.
-// Uses Gemini Embedding 2 Preview (native embedContent endpoint) for query
-// embedding — same model/space as the multimodal document embeddings.
+// Queries two knowledge sources in parallel and injects relevant context
+// into the agent's system prompt via appendSystemContext:
+//   1. PostgreSQL pgvector — semantic vector search on document embeddings
+//   2. LightRAG — knowledge graph with entity/relation multi-hop search
 //
+// Hook: before_prompt_build (requires OpenClaw >= v2026.3.7)
 // Depends on: pg (node-postgres)
 
 import pg from "pg";
@@ -105,7 +105,7 @@ async function searchCollection(
 }
 
 /**
- * Format search results for injection into the agent's prompt.
+ * Format pgvector search results for injection into the agent's prompt.
  * Respects maxChars limit to avoid bloating the context window.
  * Includes: file name, score, timestamps (for video/audio), and text content.
  */
@@ -136,11 +136,67 @@ function formatResults(results, maxChars) {
   return output;
 }
 
+/**
+ * Query LightRAG knowledge graph for relevant context.
+ * Uses only_need_context=true to retrieve raw context without LLM processing.
+ * LightRAG returns entities, relationships, and source chunks assembled as text.
+ *
+ * Modes: naive (simple vector), local (entity neighborhood), global (community
+ * summaries), hybrid (local + global — best for most queries).
+ */
+async function queryLightRAG(url, apiKey, query, mode) {
+  const headers = { "Content-Type": "application/json" };
+  if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
+
+  const resp = await fetch(`${url}/query`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      query,
+      mode: mode || "hybrid",
+      only_need_context: true,
+      stream: false,
+    }),
+  });
+
+  if (!resp.ok) {
+    const body = await resp.text();
+    throw new Error(
+      `LightRAG query failed (${resp.status}): ${body.slice(0, 200)}`
+    );
+  }
+
+  const data = await resp.json();
+
+  // LightRAG with only_need_context returns the assembled context
+  if (typeof data === "string") return data;
+  return data.response ?? data.context ?? "";
+}
+
+/**
+ * Truncate LightRAG context to maxChars without cutting mid-sentence.
+ */
+function truncateLightRAG(text, maxChars) {
+  if (!text || text.length <= maxChars) return text;
+  const truncated = text.slice(0, maxChars);
+  const lastPeriod = truncated.lastIndexOf(".");
+  return lastPeriod > maxChars * 0.5
+    ? truncated.slice(0, lastPeriod + 1)
+    : truncated;
+}
+
 // ---------------------------------------------------------------------------
 // Exported helpers (for testing)
 // ---------------------------------------------------------------------------
 
-export { resolveEnv, embedQuery, searchCollection, formatResults };
+export {
+  resolveEnv,
+  embedQuery,
+  searchCollection,
+  formatResults,
+  queryLightRAG,
+  truncateLightRAG,
+};
 
 // ---------------------------------------------------------------------------
 // Plugin entry point
@@ -148,13 +204,14 @@ export { resolveEnv, embedQuery, searchCollection, formatResults };
 
 export default {
   id: "openclaw-knowledge",
-  name: "pgvector Knowledge Base",
-  description: "Multi-collection pgvector RAG for OpenClaw",
+  name: "Knowledge Base",
+  description:
+    "Multi-source knowledge search for OpenClaw (pgvector + LightRAG)",
 
   register(api) {
     const cfg = api.pluginConfig ?? {};
 
-    // Resolve config with env var substitution
+    // --- pgvector config ---
     const geminiApiKey = resolveEnv(cfg.geminiApiKey ?? "");
     const postgresUrl = resolveEnv(
       cfg.postgresUrl ?? "postgresql://openclaw:@postgresql:5432/knowledge"
@@ -163,29 +220,43 @@ export default {
     const topK = cfg.topK ?? 5;
     const scoreThreshold = cfg.scoreThreshold ?? 0.3;
     const maxInjectChars = cfg.maxInjectChars ?? 4000;
+    const pgvectorEnabled = cfg.pgvectorEnabled !== false && !!geminiApiKey;
+
+    // --- LightRAG config ---
+    const lightragUrl = resolveEnv(cfg.lightragUrl ?? "");
+    const lightragApiKey = resolveEnv(cfg.lightragApiKey ?? "");
+    const lightragQueryMode = cfg.lightragQueryMode ?? "hybrid";
+    const lightragMaxChars = cfg.lightragMaxChars ?? 4000;
+    const lightragEnabled = cfg.lightragEnabled !== false && !!lightragUrl;
+
+    // Global enabled flag
     const enabled = cfg.enabled !== false;
 
-    // Validate required config
-    if (!geminiApiKey) {
+    if (!pgvectorEnabled && !lightragEnabled) {
       api.logger.warn(
-        "openclaw-knowledge: GEMINI_API_KEY not configured — plugin disabled"
+        "openclaw-knowledge: neither pgvector nor LightRAG configured — plugin disabled"
       );
       return;
     }
 
-    // Initialize PostgreSQL connection pool
-    const pool = new pg.Pool({
-      connectionString: postgresUrl,
-      max: 3,
-      idleTimeoutMillis: 30000,
-    });
+    // Initialize PostgreSQL connection pool (only if pgvector enabled)
+    let pool = null;
+    if (pgvectorEnabled) {
+      pool = new pg.Pool({
+        connectionString: postgresUrl,
+        max: 3,
+        idleTimeoutMillis: 30000,
+      });
+      pool.on("error", (err) => {
+        api.logger.error(`openclaw-knowledge: pool error — ${err.message}`);
+      });
+    }
 
-    pool.on("error", (err) => {
-      api.logger.error(`openclaw-knowledge: pool error — ${err.message}`);
-    });
-
+    const sources = [];
+    if (pgvectorEnabled) sources.push(`pgvector (${collections.join(", ")})`);
+    if (lightragEnabled) sources.push(`LightRAG (${lightragQueryMode})`);
     api.logger.info(
-      `openclaw-knowledge: ready — searching ${collections.length} collection(s): ${collections.join(", ")}`
+      `openclaw-knowledge: ready — sources: ${sources.join(" + ")}`
     );
 
     // Track consecutive errors for cooldown
@@ -194,13 +265,8 @@ export default {
     let cooldownUntil = 0;
 
     // -----------------------------------------------------------------
-    // Hook: before_prompt_build (requires OpenClaw >= v2026.3.7)
-    // Injects knowledge into the SYSTEM PROMPT via appendSystemContext.
-    // Invisible in PinchChat/Control UI — only the LLM sees it.
-    // Same pattern as LangChain/LlamaIndex RAG: context in system msg.
-    //
-    // Note: event.prompt is the system prompt being built, NOT the user
-    // message. The user message is extracted from event.messages.
+    // Hook: before_prompt_build
+    // Queries both sources in parallel and injects combined context.
     // -----------------------------------------------------------------
     api.on("before_prompt_build", async (event) => {
       if (!enabled) return;
@@ -213,7 +279,6 @@ export default {
       }
 
       // Extract user message from event.messages (last user message)
-      // event.prompt = system prompt being built, NOT the user question
       let query = "";
       if (Array.isArray(event.messages) && event.messages.length > 0) {
         for (let i = event.messages.length - 1; i >= 0; i--) {
@@ -238,34 +303,96 @@ export default {
       if (!query || query.trim().length < 3) return;
 
       try {
-        const vector = await embedQuery(query, geminiApiKey);
+        // Run both sources in parallel
+        const tasks = [];
 
-        const searches = collections.map((col) =>
-          searchCollection(pool, col, vector, topK, scoreThreshold)
-        );
-        const allResults = (await Promise.all(searches)).flat();
-        allResults.sort((a, b) => b.score - a.score);
+        // pgvector search
+        if (pgvectorEnabled && pool) {
+          tasks.push(
+            (async () => {
+              const vector = await embedQuery(query, geminiApiKey);
+              const searches = collections.map((col) =>
+                searchCollection(pool, col, vector, topK, scoreThreshold)
+              );
+              const allResults = (await Promise.all(searches)).flat();
+              allResults.sort((a, b) => b.score - a.score);
+              return { source: "pgvector", data: allResults };
+            })()
+          );
+        }
 
-        const formatted = formatResults(allResults, maxInjectChars);
-        if (!formatted) {
+        // LightRAG search
+        if (lightragEnabled) {
+          tasks.push(
+            (async () => {
+              const context = await queryLightRAG(
+                lightragUrl,
+                lightragApiKey,
+                query,
+                lightragQueryMode
+              );
+              return { source: "lightrag", data: context };
+            })()
+          );
+        }
+
+        const results = await Promise.allSettled(tasks);
+
+        // Assemble context from both sources
+        const sections = [];
+
+        for (const result of results) {
+          if (result.status === "rejected") {
+            api.logger.error(
+              `openclaw-knowledge: source failed — ${result.reason?.message ?? result.reason}`
+            );
+            continue;
+          }
+
+          const { source, data } = result.value;
+
+          if (source === "pgvector") {
+            const formatted = formatResults(data, maxInjectChars);
+            if (formatted) {
+              sections.push(
+                "### Document Search Results (pgvector)\n" + formatted
+              );
+              api.logger.info(
+                `openclaw-knowledge: pgvector — ${data.length} result(s) (top: ${data[0]?.score?.toFixed(2) ?? "n/a"})`
+              );
+            }
+          }
+
+          if (source === "lightrag") {
+            const context =
+              typeof data === "string" ? data.trim() : "";
+            if (context.length > 0) {
+              sections.push(
+                "### Knowledge Graph Context (LightRAG)\n" +
+                  truncateLightRAG(context, lightragMaxChars)
+              );
+              api.logger.info(
+                `openclaw-knowledge: LightRAG — ${context.length} chars`
+              );
+            }
+          }
+        }
+
+        if (sections.length === 0) {
           consecutiveErrors = 0;
           return;
         }
-
-        api.logger.info(
-          `openclaw-knowledge: injecting ${allResults.length} result(s) (top score: ${allResults[0]?.score?.toFixed(2) ?? "n/a"})`
-        );
 
         consecutiveErrors = 0;
 
         return {
           appendSystemContext: [
             "",
-            "## Relevant Knowledge Base Documents",
+            "## Relevant Knowledge Base",
             "Use this information to answer the user's question accurately.",
             "Always cite the source document name when using this information.",
             "",
-            formatted,
+            ...sections,
           ].join("\n"),
         };
       } catch (err) {

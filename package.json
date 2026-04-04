@@ -1,8 +1,8 @@
 {
   "name": "openclaw-knowledge",
-  "version": "2.0.0",
+  "version": "3.0.0",
   "type": "module",
-  "description": "Multi-collection pgvector knowledge search for OpenClaw — automatic RAG injection via before_prompt_build hook",
+  "description": "Multi-source knowledge plugin for OpenClaw — pgvector + LightRAG injection via before_prompt_build hook",
   "license": "MIT",
   "main": "./index.js",
   "scripts": {
