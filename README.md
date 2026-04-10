@@ -6,7 +6,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![OpenClaw](https://img.shields.io/badge/OpenClaw-%E2%89%A5v2026.3.7-blue)](https://github.com/openclaw/openclaw)
-[![Version](https://img.shields.io/badge/version-3.0.4-green)](CHANGELOG.md)
+[![npm version](https://img.shields.io/npm/v/@lacneu/openclaw-knowledge.svg)](https://www.npmjs.com/package/@lacneu/openclaw-knowledge)
 
 ---
 
@@ -103,36 +103,29 @@ The plugin implements several safeguards to ensure it never blocks the agent:
 - LightRAG server (optional — plugin works with pgvector alone)
 - Gemini API key (for query embedding)
 
-### From GitHub Release (recommended)
+### Install via OpenClaw CLI (recommended)
 
-Dependencies (`pg`) are **bundled in the release tarball since v3.0.4** — no
-`npm install` required at deployment time.
-
-```bash
-# Download the latest release
-VERSION=3.0.4
-curl -sfL "https://github.com/OlivierNeu/openclaw-knowledge-plugin/releases/download/v${VERSION}/openclaw-knowledge-${VERSION}.tar.gz" \
-  -o /tmp/openclaw-knowledge.tar.gz
-
-# Extract into OpenClaw extensions
-tar -xzf /tmp/openclaw-knowledge.tar.gz -C /path/to/.openclaw/extensions/
-
-# Verify
-ls /path/to/.openclaw/extensions/openclaw-knowledge/
-# → index.js  LICENSE  node_modules/  openclaw.plugin.json  package.json
-```
-
-### Automated multi-tenant deployment
-
-The `update-knowledge-plugin.sh` script (available in the OpenClaw stack repo)
-fetches the latest release and deploys it to all configured instances:
+The plugin is published on npm as `@lacneu/openclaw-knowledge`. Use the
+official `openclaw plugins` commands — install, update, list, inspect all
+work out of the box:
 
 ```bash
-sudo /path/to/update-knowledge-plugin.sh
+# Install (pulls the latest version from npm)
+openclaw plugins install @lacneu/openclaw-knowledge
+
+# Inspect the installed version and manifest
+openclaw plugins inspect @lacneu/openclaw-knowledge
+
+# Update to the latest published version
+openclaw plugins update @lacneu/openclaw-knowledge
+
+# List everything installed
+openclaw plugins list
 ```
 
-It checks the installed version against the latest GitHub release, downloads
-the tarball once, deploys to all instances, and restarts affected containers.
+OpenClaw tracks the install source under `plugins.installs` in your
+configuration, so subsequent `update` calls know where to fetch new versions
+from.
 
 ### Configuration
 
@@ -396,15 +389,19 @@ npm run clean
 4. GitHub Actions will automatically:
    - Run `npm run typecheck`, `npm test`, `npm run build` on Node.js 24
    - Stamp the version from the tag into `package.json` and `openclaw.plugin.json`
-   - Install full dev dependencies and compile TypeScript (`npm run build`)
-   - Prune to production dependencies (`npm install --omit=dev`)
-   - Create a tarball containing `dist/`, `package.json`, `openclaw.plugin.json`,
-     `LICENSE`, `README.md`, and `node_modules/`
-   - Publish the release with changelog notes extracted from `CHANGELOG.md`
+   - Compile TypeScript (`npm run build`)
+   - **Publish `@olivierneu/openclaw-knowledge` to npm** (public access)
+   - Create a GitHub Release with changelog notes extracted from `CHANGELOG.md`
 
-The release tarball is self-contained: extract it into
-`.openclaw/extensions/openclaw-knowledge/` and the plugin is ready to use.
-`node_modules/` is bundled so no `npm install` is required at deployment time.
+#### Required GitHub secret
+
+The workflow needs an `NPM_TOKEN` secret. Because the npm account has 2FA
+enabled with a security key, the token **must** be an **Automation token**
+(not a regular Publish token), because automation tokens bypass 2FA for CI/CD.
+
+Generate it on npm: *Access Tokens → Generate New Token → Classic Token →
+Automation*, then add it under GitHub repo *Settings → Secrets and variables
+→ Actions* as `NPM_TOKEN`.
 
 ---
 

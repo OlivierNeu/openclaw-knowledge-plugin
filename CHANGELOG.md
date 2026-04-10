@@ -7,7 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.1.0] - 2026-04-10
+
 ### Changed
+- **Distribution migrated to npm as `@lacneu/openclaw-knowledge`.** The plugin
+  is now published to the public npm registry under the `lacneu` organization
+  and installs via the official OpenClaw CLI:
+  ```bash
+  openclaw plugins install @lacneu/openclaw-knowledge
+  openclaw plugins update  @lacneu/openclaw-knowledge
+  ```
+  OpenClaw tracks the install under `plugins.installs`, so `openclaw plugins update`
+  works out of the box — no custom deployment script required.
+- `package.json` renamed to the scoped package `@lacneu/openclaw-knowledge`
+  and now declares `publishConfig.access: "public"`, a narrow `files` allowlist
+  (dist, manifest, README, CHANGELOG, LICENSE), `repository`, `homepage`, `bugs`
+  and `keywords` metadata for discoverability on npmjs.com.
+- GitHub Actions release workflow now runs `npm publish --access public` via
+  **npm Trusted Publishing (OIDC)** — no `NPM_TOKEN` secret needed. The workflow
+  requests an OIDC token from GitHub, exchanges it for a short-lived npm
+  credential scoped to this repo + workflow, and ships a provenance statement
+  with every release (automatic with Trusted Publishing, `--provenance` flag no
+  longer needed). No bundled tarball artifact — the GitHub Release is still
+  created for changelog visibility but carries no files.
 - **Full migration to TypeScript + the official OpenClaw plugin SDK.** The plugin now
   uses `definePluginEntry` from `openclaw/plugin-sdk/plugin-entry` as the canonical
   entry point, replacing the bare `{ id, name, register }` object export.
@@ -128,7 +150,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Release workflow: creates GitHub Release with tarball on tag push.
 - Architecture, lifecycle, and sequence diagrams in `schemas/`.
 
-[Unreleased]: https://github.com/OlivierNeu/openclaw-knowledge-plugin/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/OlivierNeu/openclaw-knowledge-plugin/compare/v3.1.0...HEAD
+[3.1.0]: https://github.com/OlivierNeu/openclaw-knowledge-plugin/compare/v1.2.0...v3.1.0
 [1.2.0]: https://github.com/OlivierNeu/openclaw-knowledge-plugin/compare/v1.1.2...v1.2.0
 [1.1.2]: https://github.com/OlivierNeu/openclaw-knowledge-plugin/compare/v1.1.1...v1.1.2
 [1.1.1]: https://github.com/OlivierNeu/openclaw-knowledge-plugin/compare/v1.1.0...v1.1.1

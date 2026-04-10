@@ -34,13 +34,20 @@ jobs:
   release:
     needs: test
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write  # Required for npm Trusted Publishing (OIDC)
     steps:
       - uses: actions/checkout@v4
 
-      - name: Use Node.js 24
+      - name: Use Node.js 24 (with npm registry)
         uses: actions/setup-node@v4
         with:
           node-version: 24
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Upgrade npm CLI to >=11.5.1 (required for Trusted Publishing)
+        run: npm install -g npm@latest
 
       - name: Extract version from tag
         id: version
@@ -55,48 +62,34 @@ jobs:
         id: changelog
         run: |
           VERSION="${{ steps.version.outputs.VERSION }}"
-          # Extract the section for this version (between ## [x.y.z] headers)
           awk '/^## \['"$VERSION"'\]/{found=1; next} /^## \[/{if(found) exit} found{print}' CHANGELOG.md > release_notes.md
-          # Flag whether we found changelog content
           if [ -s release_notes.md ]; then
             echo "FOUND=true" >> "$GITHUB_OUTPUT"
           else
             echo "FOUND=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Install full dependencies (dev + prod) for build
+      - name: Install dependencies
         run: npm ci || npm install
 
       - name: Compile TypeScript
         run: npm run build
 
-      - name: Prune to production dependencies (bundled in release)
-        run: |
-          rm -rf node_modules
-          npm install --omit=dev
-
-      - name: Create artifact
-        run: |
-          mkdir -p dist-release/openclaw-knowledge
-          # Compiled JS + type declarations (from `npm run build`)
-          cp -r dist dist-release/openclaw-knowledge/dist
-          # Manifest, package metadata, license, readme
-          cp package.json openclaw.plugin.json LICENSE README.md dist-release/openclaw-knowledge/
-          # Production dependencies bundled (pg and friends)
-          cp -r node_modules dist-release/openclaw-knowledge/
-          cd dist-release
-          tar -czf openclaw-knowledge-${{ steps.version.outputs.VERSION }}.tar.gz openclaw-knowledge/
+      - name: Publish to npm (Trusted Publishing via OIDC)
+        # No NODE_AUTH_TOKEN needed — npm CLI requests an OIDC token from
+        # GitHub and exchanges it with npm. Provenance statement is attached
+        # automatically when Trusted Publishing is configured for the package.
+        run: npm publish --access public
 
       - name: Create GitHub Release (with changelog)
         if: steps.changelog.outputs.FOUND == 'true'
         uses: softprops/action-gh-release@v2
         with:
-          files: dist-release/openclaw-knowledge-${{ steps.version.outputs.VERSION }}.tar.gz
           body_path: release_notes.md
+          generate_release_notes: false
 
       - name: Create GitHub Release (auto-generated notes)
         if: steps.changelog.outputs.FOUND == 'false'
         uses: softprops/action-gh-release@v2
         with:
-          files: dist-release/openclaw-knowledge-${{ steps.version.outputs.VERSION }}.tar.gz
           generate_release_notes: true
