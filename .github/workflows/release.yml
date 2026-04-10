@@ -53,10 +53,14 @@ jobs:
             echo "FOUND=false" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Install production dependencies (bundled in release)
+        run: npm install --omit=dev
+
       - name: Create artifact
         run: |
           mkdir -p dist/openclaw-knowledge
           cp package.json openclaw.plugin.json index.js LICENSE dist/openclaw-knowledge/
+          cp -r node_modules dist/openclaw-knowledge/
           cd dist
           tar -czf openclaw-knowledge-${{ steps.version.outputs.VERSION }}.tar.gz openclaw-knowledge/
 

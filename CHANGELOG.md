@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.0.4] - 2026-04-10
+
+### Fixed
+- Release tarball now bundles `node_modules` with the `pg` dependency, eliminating
+  the need for `npm install` at deployment time. Previously, runtime `npm install`
+  would silently fail on Docker installations with tmpfs cache conflicts, leaving
+  the plugin unable to load (`Cannot find module 'pg'`).
+
+### Changed
+- `update-knowledge-plugin.sh` simplified: no longer runs `npm install` on target
+  containers, only verifies that bundled dependencies are present.
+
 ## [1.2.0] - 2026-03-30
 
 ### Changed
