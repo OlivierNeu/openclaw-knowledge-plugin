@@ -31,50 +31,31 @@ const DEFAULT_LIGHTRAG_MODE: LightRAGQueryMode = "hybrid";
 const DEFAULT_LIGHTRAG_MAX_CHARS = 4000;
 
 /**
- * Apply defaults and env substitution to the raw config coming from
- * `api.pluginConfig`. Mirrors the original JS implementation exactly so
- * existing user configs keep behaving the same after the TS migration.
+ * Apply defaults and env substitution to the raw plugin config. A source is
+ * enabled when its credentials are present, unless the user explicitly toggles
+ * `pgvectorEnabled`/`lightragEnabled` off.
  */
 export function resolveConfig(
-  raw: KnowledgePluginConfig | undefined | null,
+  cfg: KnowledgePluginConfig = {},
 ): ResolvedKnowledgeConfig {
-  const cfg: KnowledgePluginConfig = raw ?? {};
-
   const geminiApiKey = resolveEnv(cfg.geminiApiKey ?? "");
   const postgresUrl = resolveEnv(cfg.postgresUrl ?? DEFAULT_POSTGRES_URL);
-  const collections = cfg.collections ?? DEFAULT_COLLECTIONS;
-  const topK = cfg.topK ?? DEFAULT_TOP_K;
-  const scoreThreshold = cfg.scoreThreshold ?? DEFAULT_SCORE_THRESHOLD;
-  const maxInjectChars = cfg.maxInjectChars ?? DEFAULT_MAX_INJECT_CHARS;
-
-  // pgvector is active only when a Gemini key is configured, unless the user
-  // explicitly toggles it off.
-  const pgvectorEnabled = cfg.pgvectorEnabled !== false && Boolean(geminiApiKey);
-
   const lightragUrl = resolveEnv(cfg.lightragUrl ?? "");
   const lightragApiKey = resolveEnv(cfg.lightragApiKey ?? "");
-  const lightragQueryMode = cfg.lightragQueryMode ?? DEFAULT_LIGHTRAG_MODE;
-  const lightragMaxChars = cfg.lightragMaxChars ?? DEFAULT_LIGHTRAG_MAX_CHARS;
-
-  // Same mirrored derivation: LightRAG active when a URL is set unless the
-  // user toggled it off explicitly.
-  const lightragEnabled = cfg.lightragEnabled !== false && Boolean(lightragUrl);
-
-  const enabled = cfg.enabled !== false;
 
   return {
-    enabled,
+    enabled: cfg.enabled !== false,
     geminiApiKey,
     postgresUrl,
-    collections,
-    topK,
-    scoreThreshold,
-    maxInjectChars,
-    pgvectorEnabled,
+    collections: cfg.collections ?? DEFAULT_COLLECTIONS,
+    topK: cfg.topK ?? DEFAULT_TOP_K,
+    scoreThreshold: cfg.scoreThreshold ?? DEFAULT_SCORE_THRESHOLD,
+    maxInjectChars: cfg.maxInjectChars ?? DEFAULT_MAX_INJECT_CHARS,
+    pgvectorEnabled: cfg.pgvectorEnabled !== false && Boolean(geminiApiKey),
     lightragUrl,
     lightragApiKey,
-    lightragQueryMode,
-    lightragMaxChars,
-    lightragEnabled,
+    lightragQueryMode: cfg.lightragQueryMode ?? DEFAULT_LIGHTRAG_MODE,
+    lightragMaxChars: cfg.lightragMaxChars ?? DEFAULT_LIGHTRAG_MAX_CHARS,
+    lightragEnabled: cfg.lightragEnabled !== false && Boolean(lightragUrl),
   };
 }

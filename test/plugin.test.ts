@@ -195,7 +195,6 @@ describe("before_prompt_build — query extraction", () => {
     register(api);
 
     const result = await state.handlers["before_prompt_build"]!({
-      prompt: "",
       messages: [{ role: "user", content: "ab" }],
     });
     assert.equal(result, undefined);
@@ -213,7 +212,6 @@ describe("before_prompt_build — query extraction", () => {
     register(api);
 
     const result = await state.handlers["before_prompt_build"]!({
-      prompt: "",
       messages: [],
     });
     assert.equal(result, undefined);
@@ -228,7 +226,6 @@ describe("before_prompt_build — query extraction", () => {
     register(api);
 
     const result = await state.handlers["before_prompt_build"]!({
-      prompt: "",
       messages: [{ role: "user", content: "hello world query" }],
     });
     assert.equal(result, undefined);
@@ -251,7 +248,6 @@ describe("before_prompt_build — query extraction", () => {
 
     register(api);
     await state.handlers["before_prompt_build"]!({
-      prompt: "",
       messages: [{ role: "user", content: "find my contracts" }],
     });
 
@@ -275,7 +271,6 @@ describe("before_prompt_build — query extraction", () => {
 
     register(api);
     await state.handlers["before_prompt_build"]!({
-      prompt: "",
       messages: [
         {
           role: "user",
@@ -299,11 +294,10 @@ describe("before_prompt_build — query extraction", () => {
     register(api);
 
     const result = await state.handlers["before_prompt_build"]!({
-      prompt: "",
       messages: [
         {
           role: "user",
-          content: [{ type: "image", data: "base64..." }],
+          content: [{ type: "image" }],
         },
       ],
     });
@@ -325,7 +319,6 @@ describe("before_prompt_build — query extraction", () => {
 
     register(api);
     await state.handlers["before_prompt_build"]!({
-      prompt: "",
       messages: [
         { role: "user", content: "first question" },
         { role: "assistant", content: "first answer" },
@@ -361,7 +354,6 @@ describe("before_prompt_build — LightRAG execution", () => {
 
     register(api);
     const result = await state.handlers["before_prompt_build"]!({
-      prompt: "",
       messages: [{ role: "user", content: "tell me about ACME" }],
     });
 
@@ -383,7 +375,6 @@ describe("before_prompt_build — LightRAG execution", () => {
 
     register(api);
     const result = await state.handlers["before_prompt_build"]!({
-      prompt: "",
       messages: [{ role: "user", content: "something obscure" }],
     });
 
@@ -403,7 +394,6 @@ describe("before_prompt_build — LightRAG execution", () => {
 
     register(api);
     const result = await state.handlers["before_prompt_build"]!({
-      prompt: "",
       messages: [{ role: "user", content: "long context query" }],
     });
 
@@ -441,7 +431,6 @@ describe("before_prompt_build — graceful degradation", () => {
 
     register(api);
     const result = await state.handlers["before_prompt_build"]!({
-      prompt: "",
       messages: [{ role: "user", content: "find my documents" }],
     });
 
@@ -474,7 +463,6 @@ describe("before_prompt_build — graceful degradation", () => {
     // pgvector pool.query will fail (no real DB), but the point is the
     // LightRAG error is logged and doesn't crash the plugin.
     await state.handlers["before_prompt_build"]!({
-      prompt: "",
       messages: [{ role: "user", content: "find my documents" }],
     });
 
@@ -500,7 +488,6 @@ describe("before_prompt_build — cooldown", () => {
 
     register(api);
     const event: BeforePromptBuildEvent = {
-      prompt: "",
       messages: [{ role: "user", content: "test query here" }],
     };
 

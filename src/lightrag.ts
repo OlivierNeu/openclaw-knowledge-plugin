@@ -8,8 +8,7 @@
 import type { LightRAGQueryMode } from "./types.js";
 
 interface LightRAGResponsePayload {
-  response?: string;
-  context?: string;
+  response: string;
 }
 
 /**
@@ -28,7 +27,7 @@ export async function queryLightRAG(
   url: string,
   apiKey: string,
   query: string,
-  mode: LightRAGQueryMode | undefined,
+  mode: LightRAGQueryMode = "hybrid",
 ): Promise<string> {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
@@ -40,7 +39,7 @@ export async function queryLightRAG(
     headers,
     body: JSON.stringify({
       query,
-      mode: mode ?? "hybrid",
+      mode,
       only_need_context: true,
       stream: false,
     }),
@@ -53,25 +52,16 @@ export async function queryLightRAG(
     );
   }
 
-  const data = (await resp.json()) as LightRAGResponsePayload | string;
-
-  // LightRAG's response shape varies between versions: older builds return a
-  // plain string, newer ones return `{response: "..."}`, and a few return
-  // `{context: "..."}`. Normalise to a single string here.
-  if (typeof data === "string") return data;
-  return data.response ?? data.context ?? "";
+  const data = (await resp.json()) as LightRAGResponsePayload;
+  return data.response ?? "";
 }
 
 /**
- * Truncate LightRAG context to `maxChars` without cutting mid-sentence when
- * possible. Falls back to a raw character cut if no sentence boundary is
- * found in the second half of the allowed window.
+ * Truncate text to `maxChars` without cutting mid-sentence when possible.
+ * Falls back to a raw character cut if no sentence boundary is found in the
+ * second half of the allowed window.
  */
-export function truncateLightRAG(
-  text: string | null | undefined,
-  maxChars: number,
-): string | null | undefined {
-  if (text == null || text === "") return text;
+export function truncateLightRAG(text: string, maxChars: number): string {
   if (text.length <= maxChars) return text;
 
   const truncated = text.slice(0, maxChars);
@@ -86,12 +76,14 @@ export function truncateLightRAG(
  * it to the configured budget, and return `null` if nothing remains.
  */
 export function formatLightRAGResults(
-  rawContext: unknown,
+  rawContext: string,
   maxChars: number,
 ): { truncated: string; originalLength: number } | null {
-  const context = typeof rawContext === "string" ? rawContext.trim() : "";
+  const context = rawContext.trim();
   if (context.length === 0) return null;
 
-  const truncated = truncateLightRAG(context, maxChars) ?? "";
-  return { truncated, originalLength: context.length };
+  return {
+    truncated: truncateLightRAG(context, maxChars),
+    originalLength: context.length,
+  };
 }

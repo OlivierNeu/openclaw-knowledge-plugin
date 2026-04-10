@@ -97,31 +97,25 @@ export interface PgvectorRow {
   timestamp_start?: string | null;
   timestamp_end?: string | null;
   embedded_at?: string | null;
-  score: string | number;
+  score: string;
 }
 
 /**
  * Shape of the `before_prompt_build` event payload as consumed by this plugin.
- * We only rely on `messages`; everything else is passed through untouched.
+ * We only rely on `messages`; the SDK may add other fields that we ignore.
  */
 export interface BeforePromptBuildEvent {
-  prompt?: string;
   messages?: PromptMessage[];
-  [key: string]: unknown;
 }
 
 export interface PromptMessage {
   role?: string;
-  sender?: string;
   content?: string | PromptContentPart[];
-  text?: string;
-  [key: string]: unknown;
 }
 
 export interface PromptContentPart {
   type?: string;
   text?: string;
-  [key: string]: unknown;
 }
 
 /**

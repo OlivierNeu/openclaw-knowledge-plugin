@@ -40,37 +40,7 @@ describe("queryLightRAG", () => {
     assert.equal(result, "Contract A signed on 2025-01-01.");
   });
 
-  it("handles string response format", async () => {
-    mock.method(globalThis, "fetch", async () => ({
-      ok: true,
-      json: async () => "Direct string context from LightRAG",
-    }) as unknown as Response);
-
-    const result = await queryLightRAG(
-      "http://lightrag:9621",
-      "",
-      "query",
-      "naive",
-    );
-    assert.equal(result, "Direct string context from LightRAG");
-  });
-
-  it("handles response with context field", async () => {
-    mock.method(globalThis, "fetch", async () => ({
-      ok: true,
-      json: async () => ({ context: "Context field data" }),
-    }) as unknown as Response);
-
-    const result = await queryLightRAG(
-      "http://lightrag:9621",
-      "",
-      "query",
-      "local",
-    );
-    assert.equal(result, "Context field data");
-  });
-
-  it("returns empty string for unexpected response shape", async () => {
+  it("returns empty string when response field is missing", async () => {
     mock.method(globalThis, "fetch", async () => ({
       ok: true,
       json: async () => ({ other: "data" }),
@@ -112,7 +82,7 @@ describe("queryLightRAG", () => {
       return { ok: true, json: async () => ({ response: "" }) } as unknown as Response;
     });
 
-    await queryLightRAG("http://lightrag:9621", "", "query", undefined);
+    await queryLightRAG("http://lightrag:9621", "", "query");
   });
 
   it("throws on non-OK response", async () => {
@@ -130,8 +100,7 @@ describe("queryLightRAG", () => {
 });
 
 describe("truncateLightRAG", () => {
-  it("returns null/empty values unchanged", () => {
-    assert.equal(truncateLightRAG(null, 100), null);
+  it("returns empty string unchanged", () => {
     assert.equal(truncateLightRAG("", 100), "");
   });
 
@@ -149,7 +118,7 @@ describe("truncateLightRAG", () => {
   it("truncates at maxChars when no good period found", () => {
     const text = "A".repeat(200);
     const result = truncateLightRAG(text, 100);
-    assert.equal(result!.length, 100);
+    assert.equal(result.length, 100);
   });
 
   it("does not cut at period too early in the text", () => {
@@ -157,6 +126,6 @@ describe("truncateLightRAG", () => {
     const text = "Hi. " + "A".repeat(200);
     const result = truncateLightRAG(text, 100);
     // Should fall back to raw truncation since period is at pos 2 (< 50 = 50%)
-    assert.equal(result!.length, 100);
+    assert.equal(result.length, 100);
   });
 });

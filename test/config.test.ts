@@ -83,8 +83,8 @@ describe("resolveConfig", () => {
     assert.equal(cfg.lightragEnabled, false);
   });
 
-  it("accepts null/undefined config", () => {
-    assert.doesNotThrow(() => resolveConfig(null));
-    assert.doesNotThrow(() => resolveConfig(undefined));
+  it("accepts empty config and no argument", () => {
+    assert.doesNotThrow(() => resolveConfig({}));
+    assert.doesNotThrow(() => resolveConfig());
   });
 });

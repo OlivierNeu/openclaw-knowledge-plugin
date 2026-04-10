@@ -16,13 +16,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `embeddings.ts` (Gemini client), `pgvector.ts` (PostgreSQL search + formatter),
   `lightrag.ts` (LightRAG client + truncation), `types.ts` (shared interfaces).
 - Tests migrated to TypeScript under `test/*.test.ts` using `node:test`.
-  Coverage expanded from 52 to 58 tests (new `resolveConfig` suite).
+  Coverage trimmed to 56 tests after removing legacy-shape test cases.
 - Business logic is **unchanged**: same hook (`before_prompt_build`), same output
   format (`### Document Search Results` + `### Knowledge Graph Context`), same
   parallel execution via `Promise.allSettled`, same cooldown (3 errors → 5 min),
   same Gemini native `embedContent` endpoint, same `halfvec(3072)` SQL cast.
-- Existing plugin configurations (Olivier and Jerome instances) continue to work
-  without any changes — all config keys and defaults are preserved.
+- Current plugin configurations (Olivier and Jerome instances) continue to work
+  without any changes — all config keys and defaults are preserved. The breaking
+  changes below are limited to internal types and legacy input shapes that were
+  defensive cruft, not fields used by active deployments.
 
 ### Added
 - `tsconfig.json` with strict mode (`noImplicitAny`, `noUnusedLocals`,
@@ -36,8 +38,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `dist/` directory rather than raw source.
 - CI workflow runs typecheck, tests, and build on Node.js 22 and 24.
 
-### Removed
+### Removed (BREAKING)
 - `index.js` and `index.test.js` at the repository root (replaced by `src/` and `test/`).
+- Legacy message shapes in `extractQueryFromMessages`: the `sender` field (alias
+  for `role`), the `"human"` role alias, and the `{text: "..."}` fallback form
+  are no longer recognized. Only the canonical `{role, content}` shape is accepted,
+  where `content` is a `string` or an array of `{type, text}` parts.
+- Legacy LightRAG response shapes in `queryLightRAG`: plain string responses and
+  `{context: ...}` payloads are no longer normalized. Only the current
+  `{response: string}` shape is supported (LightRAG 1.4.x+).
+- `PromptMessage.sender`, `PromptMessage.text`, and the `[key: string]: unknown`
+  index signatures on `PromptMessage` and `PromptContentPart` are removed from
+  the exported types. Strict structural typing only.
+- `truncateLightRAG(text: string | null | undefined, ...)` tightened to
+  `truncateLightRAG(text: string, ...)`. Callers must pre-check for non-empty.
+- `resolveConfig(raw: KnowledgePluginConfig | null | undefined)` tightened to
+  `resolveConfig(cfg?: KnowledgePluginConfig)`. Pass `{}` or no argument instead
+  of `null` / `undefined`.
+- `PgvectorRow.score` type tightened from `string | number` to `string` (matches
+  actual `pg` driver behaviour for numeric columns).
 
 ### Previous [Unreleased] entries (now folded into this TS migration)
 - `package.json` now declares `openclaw.compat.pluginApi` and `openclaw.compat.minGatewayVersion`

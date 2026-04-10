@@ -38,25 +38,22 @@ export async function searchCollection(
   try {
     const result = await pool.query(SEARCH_SQL, [vectorStr, collection, topK]);
 
+    // pg returns numeric columns as strings by default, so parse the score.
     return result.rows
-      .map((row: PgvectorRow): PgvectorResult => {
-        const rawScore = row.score;
-        const score = typeof rawScore === "number" ? rawScore : parseFloat(rawScore);
-        return {
-          collection,
-          score,
-          file_name: row.file_name ?? null,
-          mime_type: row.mime_type ?? null,
-          text: row.text ?? null,
-          file_id: row.file_id ?? null,
-          source: row.source ?? null,
-          owner: row.owner ?? null,
-          chunk_index: row.chunk_index ?? null,
-          total_chunks: row.total_chunks ?? null,
-          timestamp_start: row.timestamp_start ?? null,
-          timestamp_end: row.timestamp_end ?? null,
-        };
-      })
+      .map((row: PgvectorRow): PgvectorResult => ({
+        collection,
+        score: parseFloat(row.score),
+        file_name: row.file_name ?? null,
+        mime_type: row.mime_type ?? null,
+        text: row.text ?? null,
+        file_id: row.file_id ?? null,
+        source: row.source ?? null,
+        owner: row.owner ?? null,
+        chunk_index: row.chunk_index ?? null,
+        total_chunks: row.total_chunks ?? null,
+        timestamp_start: row.timestamp_start ?? null,
+        timestamp_end: row.timestamp_end ?? null,
+      }))
       .filter((row) => row.score >= scoreThreshold);
   } catch {
     return [];

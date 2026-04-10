@@ -180,11 +180,8 @@ type SourceResult =
   | { source: "lightrag"; data: string };
 
 /**
- * Extract the most recent user message text from an array of prompt messages.
- * Supports three content shapes OpenClaw may surface:
- *   - plain string
- *   - array of content parts (multi-modal, text-only parts kept)
- *   - legacy `{text: "..."}` form
+ * Extract the most recent user message text. OpenClaw surfaces two content
+ * shapes: a plain string, or an array of typed content parts (multi-modal).
  */
 function extractQueryFromMessages(
   messages: PromptMessage[] | undefined,
@@ -193,21 +190,18 @@ function extractQueryFromMessages(
 
   for (let i = messages.length - 1; i >= 0; i--) {
     const msg = messages[i];
-    if (!msg) continue;
-
-    const role = msg.role ?? msg.sender ?? "";
-    if (role !== "user" && role !== "human") continue;
+    if (!msg || msg.role !== "user") continue;
 
     if (typeof msg.content === "string") {
       return msg.content;
     }
     if (Array.isArray(msg.content)) {
       return msg.content
-        .filter((p) => p && p.type === "text" && typeof p.text === "string")
+        .filter((p) => p.type === "text" && typeof p.text === "string")
         .map((p) => p.text as string)
         .join(" ");
     }
-    return msg.text ?? "";
+    return "";
   }
 
   return "";
