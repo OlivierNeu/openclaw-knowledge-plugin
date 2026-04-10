@@ -9,12 +9,16 @@
     "test": "node --test index.test.js"
   },
   "openclaw": {
-    "extensions": ["./index.js"]
+    "extensions": ["./index.js"],
+    "compat": {
+      "pluginApi": ">=2026.3.7",
+      "minGatewayVersion": "2026.3.7"
+    }
   },
   "dependencies": {
     "pg": "^8.13.0"
   },
   "peerDependencies": {
-    "openclaw": ">=2026.2.0"
+    "openclaw": ">=2026.3.7"
   }
 }

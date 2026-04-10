@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `package.json` now declares `openclaw.compat.pluginApi` and `openclaw.compat.minGatewayVersion`
+  so OpenClaw can validate compatibility before loading the plugin.
+- Full `uiHints` coverage in `openclaw.plugin.json` for every config field (labels, placeholders,
+  `sensitive: true` on secrets, `advanced: true` on tuning knobs).
+- JSON Schema constraints in `configSchema`: `default`, `minimum`/`maximum` on numeric fields,
+  `enum` on `lightragQueryMode`, explicit `default` on `enabled`, `topK`, `scoreThreshold`,
+  `maxInjectChars`, `lightragMaxChars`, `lightragQueryMode` and `collections`.
+
+### Changed
+- Manifest `description` updated to explicitly mention the `before_prompt_build` hook.
+- `peerDependencies.openclaw` bumped to `>=2026.3.7` to match the hook requirement already
+  stated in the README.
+
 ## [3.0.4] - 2026-04-10
 
 ### Fixed

@@ -1,99 +1,149 @@
 {
   "id": "openclaw-knowledge",
   "name": "Knowledge Base",
-  "description": "Multi-source knowledge search (pgvector + LightRAG) — injects relevant documents and knowledge graph context before each turn",
+  "description": "Multi-source knowledge search (pgvector + LightRAG) — injects relevant documents and knowledge graph context before each turn via the before_prompt_build hook",
   "version": "3.0.0",
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
     "properties": {
+      "enabled": {
+        "type": "boolean",
+        "default": true,
+        "description": "Master switch — disables all knowledge injection when false"
+      },
       "geminiApiKey": {
         "type": "string",
-        "description": "Gemini API key for embedding queries (required for pgvector)"
+        "description": "Gemini API key used to embed user queries for pgvector search. Supports ${ENV_VAR} substitution."
       },
       "postgresUrl": {
         "type": "string",
-        "description": "PostgreSQL connection string for the knowledge database"
+        "description": "PostgreSQL connection string for the knowledge database (pgvector). Supports ${ENV_VAR} substitution."
       },
       "collections": {
         "type": "array",
         "items": { "type": "string" },
+        "default": ["knowledge_default"],
         "description": "Collection names to search in the knowledge_vectors table"
       },
       "topK": {
         "type": "number",
-        "description": "Max results per collection (default: 5)"
+        "minimum": 1,
+        "maximum": 100,
+        "default": 5,
+        "description": "Maximum number of results returned per collection"
       },
       "scoreThreshold": {
         "type": "number",
-        "description": "Min similarity score 0-1 (default: 0.3)"
+        "minimum": 0,
+        "maximum": 1,
+        "default": 0.3,
+        "description": "Minimum cosine similarity score (0–1) to include a result"
       },
       "maxInjectChars": {
         "type": "number",
-        "description": "Max characters for pgvector results (default: 4000)"
+        "minimum": 0,
+        "default": 4000,
+        "description": "Character budget for pgvector results injected into the prompt"
       },
       "pgvectorEnabled": {
         "type": "boolean",
-        "description": "Enable/disable pgvector search (default: true if geminiApiKey set)"
+        "description": "Disable pgvector search while keeping LightRAG. Defaults to true when geminiApiKey is set."
       },
       "lightragUrl": {
         "type": "string",
-        "description": "LightRAG API URL (e.g. http://openclaw-lightrag:9621)"
+        "description": "LightRAG server base URL (e.g. http://openclaw-lightrag:9621). Supports ${ENV_VAR} substitution."
       },
       "lightragApiKey": {
         "type": "string",
-        "description": "LightRAG API key for authentication"
+        "description": "LightRAG API key sent as X-API-Key header. Supports ${ENV_VAR} substitution."
       },
       "lightragQueryMode": {
         "type": "string",
-        "description": "LightRAG query mode: naive, local, global, hybrid (default: hybrid)"
+        "enum": ["naive", "local", "global", "hybrid"],
+        "default": "hybrid",
+        "description": "LightRAG query mode: naive (vector), local (entity), global (community), hybrid (recommended)"
       },
       "lightragMaxChars": {
         "type": "number",
-        "description": "Max characters for LightRAG context (default: 4000)"
+        "minimum": 0,
+        "default": 4000,
+        "description": "Character budget for LightRAG context injected into the prompt"
       },
       "lightragEnabled": {
         "type": "boolean",
-        "description": "Enable/disable LightRAG search (default: true if lightragUrl set)"
-      },
-      "enabled": {
-        "type": "boolean",
-        "description": "Enable/disable all knowledge injection (default: true)"
+        "description": "Disable LightRAG search while keeping pgvector. Defaults to true when lightragUrl is set."
       }
     },
     "required": []
   },
   "uiHints": {
-    "geminiApiKey": {
-      "label": "Gemini API Key",
-      "sensitive": true,
-      "help": "Use ${GEMINI_API_KEY} for env var substitution. Required for pgvector search."
-    },
-    "postgresUrl": {
-      "label": "PostgreSQL URL",
-      "sensitive": true,
-      "help": "e.g. postgresql://openclaw:${POSTGRES_PASSWORD}@postgresql:5432/knowledge"
-    },
-    "collections": {
-      "label": "Collections to search",
-      "help": "Collection names in the knowledge_vectors table (e.g. knowledge_olivier)"
-    },
-    "lightragUrl": {
-      "label": "LightRAG URL",
-      "help": "e.g. http://openclaw-lightrag:9621"
-    },
-    "lightragApiKey": {
-      "label": "LightRAG API Key",
-      "sensitive": true,
-      "help": "Use ${LIGHTRAG_API_KEY} for env var substitution"
-    },
-    "lightragQueryMode": {
-      "label": "LightRAG Query Mode",
-      "help": "naive (vector), local (entity), global (community), hybrid (recommended)"
-    },
     "enabled": {
       "label": "Auto-inject knowledge",
       "help": "Automatically search and inject relevant documents before each agent turn"
+    },
+    "geminiApiKey": {
+      "label": "Gemini API Key",
+      "placeholder": "${GEMINI_API_KEY}",
+      "sensitive": true,
+      "help": "Required for pgvector search. Use ${GEMINI_API_KEY} for env var substitution."
+    },
+    "postgresUrl": {
+      "label": "PostgreSQL URL",
+      "placeholder": "postgresql://openclaw:${POSTGRES_PASSWORD}@postgresql:5432/knowledge",
+      "sensitive": true,
+      "help": "Connection string for the knowledge database. Supports ${ENV_VAR} substitution."
+    },
+    "collections": {
+      "label": "Collections to search",
+      "placeholder": "knowledge_default",
+      "help": "Collection names in the knowledge_vectors table (e.g. knowledge_olivier, knowledge_shared)"
+    },
+    "topK": {
+      "label": "Top-K per collection",
+      "advanced": true,
+      "help": "Maximum number of results returned per collection (default: 5)"
+    },
+    "scoreThreshold": {
+      "label": "Score threshold",
+      "advanced": true,
+      "help": "Minimum cosine similarity 0–1 to include a result (default: 0.3)"
+    },
+    "maxInjectChars": {
+      "label": "Max pgvector chars",
+      "advanced": true,
+      "help": "Character budget for pgvector results (default: 4000)"
+    },
+    "pgvectorEnabled": {
+      "label": "Enable pgvector source",
+      "advanced": true,
+      "help": "Disable pgvector while keeping LightRAG. Defaults to true when geminiApiKey is set."
+    },
+    "lightragUrl": {
+      "label": "LightRAG URL",
+      "placeholder": "http://openclaw-lightrag:9621",
+      "help": "LightRAG server base URL"
+    },
+    "lightragApiKey": {
+      "label": "LightRAG API Key",
+      "placeholder": "${LIGHTRAG_API_KEY}",
+      "sensitive": true,
+      "help": "Sent as X-API-Key header. Use ${LIGHTRAG_API_KEY} for env var substitution."
+    },
+    "lightragQueryMode": {
+      "label": "LightRAG Query Mode",
+      "advanced": true,
+      "help": "naive (vector), local (entity), global (community), hybrid (recommended)"
+    },
+    "lightragMaxChars": {
+      "label": "Max LightRAG chars",
+      "advanced": true,
+      "help": "Character budget for LightRAG context (default: 4000)"
+    },
+    "lightragEnabled": {
+      "label": "Enable LightRAG source",
+      "advanced": true,
+      "help": "Disable LightRAG while keeping pgvector. Defaults to true when lightragUrl is set."
     }
   }
 }
