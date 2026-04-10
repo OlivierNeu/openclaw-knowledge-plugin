@@ -342,38 +342,69 @@ conversational memory AND document knowledge simultaneously.
 
 ## Development
 
+This plugin is written in **TypeScript** and builds against the official
+OpenClaw plugin SDK (`openclaw/plugin-sdk/plugin-entry`).
+
+### Project layout
+
+```
+openclaw-knowledge-plugin/
+├── src/                       # TypeScript source
+│   ├── index.ts               # Entry point (definePluginEntry + register)
+│   ├── config.ts              # resolveEnv + default resolution
+│   ├── embeddings.ts          # Gemini embedContent client
+│   ├── pgvector.ts            # PostgreSQL search + result formatter
+│   ├── lightrag.ts            # LightRAG client + truncation
+│   └── types.ts               # Shared interfaces
+├── test/                      # TypeScript test suites (node:test)
+├── dist/                      # Compiled JS + .d.ts (gitignored)
+├── tsconfig.json              # Strict TS config for src
+├── tsconfig.test.json         # Typecheck (src + test)
+├── tsconfig.test-build.json   # Compile tests to dist-test/ for node:test
+├── openclaw.plugin.json       # Plugin manifest (config schema + uiHints)
+└── package.json
+```
+
 ### Build and test
 
 ```bash
-# Install dev dependencies
+# Install dev dependencies (includes the openclaw SDK for types, ~200 MB)
 npm install
 
-# Run tests
+# Strict type check (src + tests)
+npm run typecheck
+
+# Run the full test suite (compiles tests then runs node:test)
 npm test
 
-# Test against a live container
-node --test index.test.js
+# Compile TS → dist/
+npm run build
+
+# Clean build output
+npm run clean
 ```
 
 ### Release process
 
-1. Update `CHANGELOG.md` with the new version
-2. Update `package.json` and `openclaw.plugin.json` version fields
+1. Update `CHANGELOG.md` with the new version (add a `## [x.y.z] - YYYY-MM-DD` section)
+2. Commit the changelog update
 3. Create and push a git tag:
    ```bash
-   git tag v3.0.4
-   git push origin v3.0.4
+   git tag v3.1.0
+   git push origin v3.1.0
    ```
-4. GitHub Actions will:
-   - Run tests
-   - Stamp the version into package files
-   - Run `npm install --omit=dev` to bundle production dependencies
-   - Create a tarball with `index.js`, `package.json`, `openclaw.plugin.json`,
-     `LICENSE`, and `node_modules/`
-   - Publish the release with extracted changelog notes
+4. GitHub Actions will automatically:
+   - Run `npm run typecheck`, `npm test`, `npm run build` on Node.js 24
+   - Stamp the version from the tag into `package.json` and `openclaw.plugin.json`
+   - Install full dev dependencies and compile TypeScript (`npm run build`)
+   - Prune to production dependencies (`npm install --omit=dev`)
+   - Create a tarball containing `dist/`, `package.json`, `openclaw.plugin.json`,
+     `LICENSE`, `README.md`, and `node_modules/`
+   - Publish the release with changelog notes extracted from `CHANGELOG.md`
 
 The release tarball is self-contained: extract it into
 `.openclaw/extensions/openclaw-knowledge/` and the plugin is ready to use.
+`node_modules/` is bundled so no `npm install` is required at deployment time.
 
 ---
 

@@ -7,7 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Full migration to TypeScript + the official OpenClaw plugin SDK.** The plugin now
+  uses `definePluginEntry` from `openclaw/plugin-sdk/plugin-entry` as the canonical
+  entry point, replacing the bare `{ id, name, register }` object export.
+- Source code is split into focused modules under `src/`:
+  `index.ts` (entry + hook wiring), `config.ts` (resolveEnv + defaults),
+  `embeddings.ts` (Gemini client), `pgvector.ts` (PostgreSQL search + formatter),
+  `lightrag.ts` (LightRAG client + truncation), `types.ts` (shared interfaces).
+- Tests migrated to TypeScript under `test/*.test.ts` using `node:test`.
+  Coverage expanded from 52 to 58 tests (new `resolveConfig` suite).
+- Business logic is **unchanged**: same hook (`before_prompt_build`), same output
+  format (`### Document Search Results` + `### Knowledge Graph Context`), same
+  parallel execution via `Promise.allSettled`, same cooldown (3 errors → 5 min),
+  same Gemini native `embedContent` endpoint, same `halfvec(3072)` SQL cast.
+- Existing plugin configurations (Olivier and Jerome instances) continue to work
+  without any changes — all config keys and defaults are preserved.
+
 ### Added
+- `tsconfig.json` with strict mode (`noImplicitAny`, `noUnusedLocals`,
+  `noUnusedParameters`, `noImplicitReturns`, `noFallthroughCasesInSwitch`).
+- `tsconfig.test.json` and `tsconfig.test-build.json` for typecheck and test compilation.
+- `npm run build`, `npm run typecheck`, `npm run clean` scripts.
+- `@types/node`, `@types/pg`, `typescript`, and `openclaw` (for SDK types) as
+  `devDependencies`.
+- Release workflow now runs `npm run typecheck`, `npm run build`, then prunes to
+  production dependencies before bundling. The release tarball ships the compiled
+  `dist/` directory rather than raw source.
+- CI workflow runs typecheck, tests, and build on Node.js 22 and 24.
+
+### Removed
+- `index.js` and `index.test.js` at the repository root (replaced by `src/` and `test/`).
+
+### Previous [Unreleased] entries (now folded into this TS migration)
 - `package.json` now declares `openclaw.compat.pluginApi` and `openclaw.compat.minGatewayVersion`
   so OpenClaw can validate compatibility before loading the plugin.
 - Full `uiHints` coverage in `openclaw.plugin.json` for every config field (labels, placeholders,
@@ -15,8 +47,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - JSON Schema constraints in `configSchema`: `default`, `minimum`/`maximum` on numeric fields,
   `enum` on `lightragQueryMode`, explicit `default` on `enabled`, `topK`, `scoreThreshold`,
   `maxInjectChars`, `lightragMaxChars`, `lightragQueryMode` and `collections`.
-
-### Changed
 - Manifest `description` updated to explicitly mention the `before_prompt_build` hook.
 - `peerDependencies.openclaw` bumped to `>=2026.3.7` to match the hook requirement already
   stated in the README.
