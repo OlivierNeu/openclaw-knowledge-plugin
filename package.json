@@ -1,6 +1,6 @@
 {
   "name": "@lacneu/openclaw-knowledge",
-  "version": "3.1.1",
+  "version": "3.1.2",
   "type": "module",
   "description": "Multi-source knowledge plugin for OpenClaw — pgvector + LightRAG injection via before_prompt_build hook",
   "license": "MIT",

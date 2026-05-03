@@ -29,7 +29,7 @@ Until then, the hook approach is officially supported and works. We
 take this 3.1.1 release to align activation/compat with 2026.5.0
 without disturbing the working RAG path.
 
-## [3.1.1] - 2026-05-03
+## [3.1.2] - 2026-05-03
 
 ### Added — `activation.onStartup: true`
 
@@ -48,9 +48,9 @@ in time for the first turn after restart.
 
 ### Migration
 
-For instance owners on `@lacneu/openclaw-knowledge@3.1.0`:
+For instance owners on `@lacneu/openclaw-knowledge@3.1.0` or `3.1.1`:
 
-1. `openclaw plugins install @lacneu/openclaw-knowledge@3.1.1 --force`
+1. `openclaw plugins install @lacneu/openclaw-knowledge@3.1.2 --force`
 2. Restart the gateway container.
 3. Verify in the boot log:
    `openclaw-knowledge: ready — sources: pgvector + LightRAG`.
