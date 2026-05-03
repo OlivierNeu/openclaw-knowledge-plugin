@@ -7,6 +7,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### TODO — full migration to `kind: "context-engine"` (deferred)
+
+The OpenClaw doctor classifies the current `before_prompt_build`-only
+mode as `INFO — supported compatibility path, but has not migrated
+to explicit capability registration yet`. A proper migration would
+declare `kind: "context-engine"` in the manifest and use
+`api.registerContextEngine("openclaw-knowledge", (ctx) => ({ info,
+ingest, assemble, compact, ...optional }))` instead of the
+`before_prompt_build` hook.
+
+That migration is **deferred** until:
+
+1. A reference plugin with `kind: "context-engine"` becomes
+   available in the OpenClaw upstream `extensions/` folder (none as
+   of 2026-05-03 — only the in-process `legacy` engine exists).
+2. The `concepts/context-engine` page documents a complete migration
+   guide for hook-only plugins.
+
+Until then, the hook approach is officially supported and works. We
+take this 3.1.1 release to align activation/compat with 2026.5.0
+without disturbing the working RAG path.
+
+## [3.1.1] - 2026-05-03
+
+### Added — `activation.onStartup: true`
+
+Per the OpenClaw 2026.5.x manifest spec, plugins should declare an
+explicit activation policy. `onStartup: true` ensures the plugin is
+loaded at gateway boot so the `before_prompt_build` hook is wired
+in time for the first turn after restart.
+
+### Changed — compat aligned to 2026.5.0
+
+- `package.json#openclaw.compat`:
+  `pluginApi: ">=2026.3.7"` → `">=2026.5.0"`,
+  `minGatewayVersion: "2026.3.7"` → `"2026.5.0"`.
+- `peerDependencies.openclaw` and `devDependencies.openclaw`:
+  `">=2026.3.7"` → `">=2026.5.0"`.
+
+### Migration
+
+For instance owners on `@lacneu/openclaw-knowledge@3.1.0`:
+
+1. `openclaw plugins install @lacneu/openclaw-knowledge@3.1.1 --force`
+2. Restart the gateway container.
+3. Verify in the boot log:
+   `openclaw-knowledge: ready — sources: pgvector + LightRAG`.
+4. Verify with `openclaw plugins doctor` — the INFO note about
+   "hook-only" remains (expected; full `kind: "context-engine"`
+   migration is deferred).
+
+### Notes
+
+- No code change in `src/`. No config schema change.
+- 5/5 tests still pass.
+- Operators on OpenClaw < 2026.5.0 must keep
+  `@lacneu/openclaw-knowledge@3.1.0`.
+
 ## [3.1.0] - 2026-04-10
 
 ### Changed

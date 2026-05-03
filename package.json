@@ -1,6 +1,6 @@
 {
   "name": "@lacneu/openclaw-knowledge",
-  "version": "3.1.0",
+  "version": "3.1.1",
   "type": "module",
   "description": "Multi-source knowledge plugin for OpenClaw — pgvector + LightRAG injection via before_prompt_build hook",
   "license": "MIT",
@@ -46,8 +46,8 @@
   "openclaw": {
     "extensions": ["./dist/index.js"],
     "compat": {
-      "pluginApi": ">=2026.3.7",
-      "minGatewayVersion": "2026.3.7"
+      "pluginApi": ">=2026.5.0",
+      "minGatewayVersion": "2026.5.0"
     }
   },
   "dependencies": {
@@ -56,11 +56,11 @@
   "devDependencies": {
     "@types/node": "^22.0.0",
     "@types/pg": "^8.11.0",
-    "openclaw": ">=2026.3.7",
+    "openclaw": ">=2026.5.0",
     "typescript": "^5.6.0"
   },
   "peerDependencies": {
-    "openclaw": ">=2026.3.7"
+    "openclaw": ">=2026.5.0"
   },
   "peerDependenciesMeta": {
     "openclaw": {
