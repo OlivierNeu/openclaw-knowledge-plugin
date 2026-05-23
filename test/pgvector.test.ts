@@ -1,9 +1,13 @@
 // Unit tests for the pgvector search helpers.
 
-import { describe, it } from "node:test";
+import { describe, it, afterEach, mock } from "node:test";
 import assert from "node:assert/strict";
 
-import { searchCollection, formatPgvectorResults } from "../src/pgvector.js";
+import {
+  searchCollection,
+  formatPgvectorResults,
+  rerankPgvectorResults,
+} from "../src/pgvector.js";
 import type { PgPoolLike, PgvectorRow, PgvectorResult } from "../src/types.js";
 
 function mockPool(rows: PgvectorRow[] = [], shouldThrow = false): PgPoolLike {
@@ -237,5 +241,127 @@ describe("formatPgvectorResults", () => {
     const firstIdx = output!.indexOf("first.pdf");
     const secondIdx = output!.indexOf("second.pdf");
     assert.ok(firstIdx < secondIdx);
+  });
+});
+
+describe("rerankPgvectorResults (v3.2.0)", () => {
+  afterEach(() => mock.restoreAll());
+
+  function makeResult(file: string, text: string | null, score: number): PgvectorResult {
+    return {
+      collection: "col",
+      score,
+      file_name: file,
+      text,
+      mime_type: null,
+      file_id: null,
+      source: null,
+      owner: null,
+      chunk_index: null,
+      total_chunks: null,
+      timestamp_start: null,
+      timestamp_end: null,
+    };
+  }
+
+  it("returns [] for empty input without hitting the network", async () => {
+    let fetchCalled = false;
+    mock.method(globalThis, "fetch", async () => {
+      fetchCalled = true;
+      return new Response("{}", { status: 200 });
+    });
+
+    const out = await rerankPgvectorResults([], {
+      apiKey: "k",
+      query: "q",
+    });
+    assert.deepEqual(out, []);
+    assert.equal(fetchCalled, false);
+  });
+
+  it("re-orders results using the reranker's index map", async () => {
+    mock.method(globalThis, "fetch", async () =>
+      new Response(
+        JSON.stringify({
+          results: [
+            { index: 2, relevance_score: 0.95 },
+            { index: 0, relevance_score: 0.60 },
+            { index: 1, relevance_score: 0.20 },
+          ],
+        }),
+        { status: 200 },
+      ),
+    );
+
+    const inputs = [
+      makeResult("A.pdf", "text A", 0.5),
+      makeResult("B.pdf", "text B", 0.6),
+      makeResult("C.pdf", "text C", 0.4),
+    ];
+    const out = await rerankPgvectorResults(inputs, {
+      apiKey: "k",
+      query: "find",
+    });
+
+    assert.equal(out.length, 3);
+    assert.equal(out[0]!.file_name, "C.pdf");
+    assert.equal(out[1]!.file_name, "A.pdf");
+    assert.equal(out[2]!.file_name, "B.pdf");
+    // Original cosine score is preserved (we only re-order, not re-score).
+    assert.equal(out[0]!.score, 0.4);
+  });
+
+  it("filters out rows with null/empty text BEFORE calling the reranker", async () => {
+    let capturedBody: Record<string, unknown> = {};
+    mock.method(globalThis, "fetch", async (_url: unknown, opts?: RequestInit) => {
+      capturedBody = JSON.parse(opts?.body as string);
+      return new Response(
+        JSON.stringify({ results: [{ index: 0, relevance_score: 0.9 }] }),
+        { status: 200 },
+      );
+    });
+
+    const inputs = [
+      makeResult("good.pdf", "real text", 0.5),
+      makeResult("blank.pdf", "", 0.4),
+      makeResult("null.pdf", null, 0.3),
+    ];
+
+    await rerankPgvectorResults(inputs, { apiKey: "k", query: "find" });
+
+    // Only the row with non-empty text should reach Jina.
+    assert.deepEqual(capturedBody["documents"], ["real text"]);
+  });
+
+  it("falls back to cosine order when the reranker returns an empty result set", async () => {
+    mock.method(globalThis, "fetch", async () =>
+      new Response(JSON.stringify({ results: [] }), { status: 200 }),
+    );
+
+    const inputs = [
+      makeResult("A.pdf", "text A", 0.9),
+      makeResult("B.pdf", "text B", 0.5),
+    ];
+    const out = await rerankPgvectorResults(inputs, {
+      apiKey: "k",
+      query: "find",
+      topN: 1,
+    });
+
+    // topN truncates to 1, in original order.
+    assert.equal(out.length, 1);
+    assert.equal(out[0]!.file_name, "A.pdf");
+  });
+
+  it("propagates Jina errors so the caller can update its cooldown", async () => {
+    mock.method(globalThis, "fetch", async () =>
+      new Response("rate limited", { status: 429 }),
+    );
+
+    const inputs = [makeResult("A.pdf", "text", 0.5)];
+    await assert.rejects(
+      () => rerankPgvectorResults(inputs, { apiKey: "k", query: "q" }),
+      (err: unknown) => err instanceof Error && err.message.includes("429"),
+    );
   });
 });

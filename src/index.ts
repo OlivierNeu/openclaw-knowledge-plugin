@@ -3,14 +3,23 @@
 // Queries two knowledge sources in parallel and injects relevant context
 // into the agent's system prompt via `appendSystemContext`:
 //   1. PostgreSQL pgvector — semantic vector search on document embeddings
+//      (optionally re-ordered by a Jina cross-encoder reranker)
 //   2. LightRAG — knowledge graph with entity/relation multi-hop search
 //
-// Hook: before_prompt_build (requires OpenClaw >= v2026.3.7)
+// As of v3.2.0:
+//   - An optional Jina-powered ROUTER decides which source(s) to call
+//     (or to skip retrieval entirely on heartbeats and meta-questions).
+//   - An optional Jina RERANKER re-orders pgvector results by relevance.
+// Both features are opt-in via the `jina.*` config block and preserve
+// pre-3.2.0 behavior when omitted.
+//
+// Hook: before_prompt_build (requires OpenClaw >= v2026.5.0)
 // Depends on: pg (node-postgres)
 //
 // This is the canonical entry point for the plugin. Helpers live in sibling
-// modules (`config.ts`, `embeddings.ts`, `pgvector.ts`, `lightrag.ts`) so the
-// business logic can be unit-tested without instantiating the full SDK.
+// modules (`config.ts`, `embeddings.ts`, `pgvector.ts`, `lightrag.ts`,
+// `jina/*`, `router/*`, `tracing/*`) so the business logic can be
+// unit-tested without instantiating the full SDK.
 
 import pg from "pg";
 
@@ -22,14 +31,23 @@ import type {
 
 import { resolveConfig } from "./config.js";
 import { embedQuery } from "./embeddings.js";
-import { searchCollection, formatPgvectorResults } from "./pgvector.js";
+import {
+  searchCollection,
+  formatPgvectorResults,
+  rerankPgvectorResults,
+} from "./pgvector.js";
 import { queryLightRAG, formatLightRAGResults } from "./lightrag.js";
+import { decideRoute } from "./router/index.js";
+import type { Route, RouterDecision } from "./router/types.js";
+import { JinaError, summarizeJinaError } from "./jina/errors.js";
+import { emitEvent, emitTurnMetadata } from "./tracing/events.js";
 import type {
   BeforePromptBuildEvent,
   BeforePromptBuildResult,
   KnowledgePluginConfig,
   PgPoolLike,
   PgvectorResult,
+  PluginHookAgentContext,
   PromptMessage,
   ResolvedKnowledgeConfig,
 } from "./types.js";
@@ -38,31 +56,57 @@ import type {
 // duplicating imports from every submodule.
 export { resolveEnv, resolveConfig } from "./config.js";
 export { embedQuery } from "./embeddings.js";
-export { searchCollection, formatPgvectorResults } from "./pgvector.js";
+export {
+  searchCollection,
+  formatPgvectorResults,
+  rerankPgvectorResults,
+} from "./pgvector.js";
 export { queryLightRAG, truncateLightRAG, formatLightRAGResults } from "./lightrag.js";
+export { decideRoute } from "./router/index.js";
 export type {
   BeforePromptBuildEvent,
   BeforePromptBuildResult,
+  JinaPluginConfig,
   KnowledgePluginConfig,
   LightRAGQueryMode,
   PgPoolLike,
   PgvectorResult,
+  PgvectorRerankerPluginConfig,
   PgvectorRow,
+  PluginHookAgentContext,
   PromptContentPart,
   PromptMessage,
   ResolvedKnowledgeConfig,
+  RouterPluginConfig,
 } from "./types.js";
 
 // ---------------------------------------------------------------------------
 // Hook handler factory
-//
-// Extracted from `register` so tests can exercise the handler directly
-// without mocking the full plugin API surface.
 // ---------------------------------------------------------------------------
 
 const MAX_CONSECUTIVE_ERRORS = 3;
 const COOLDOWN_MS = 5 * 60 * 1000;
 const MIN_QUERY_LENGTH = 3;
+
+/**
+ * Independent error counters for each Jina-powered subsystem.
+ *
+ * The pre-existing "global" counter remains shared between pgvector and
+ * LightRAG (a database-AND-knowledge-graph outage already cripples the
+ * plugin). Router and reranker each get their own counter so a Jina
+ * outage on the router does NOT trip the reranker's cooldown, and vice
+ * versa — fail-open is the whole point.
+ */
+type CooldownScope = "global" | "router" | "pgvector_reranker";
+
+interface CooldownState {
+  consecutiveErrors: number;
+  cooldownUntil: number;
+}
+
+function newCooldown(): CooldownState {
+  return { consecutiveErrors: 0, cooldownUntil: 0 };
+}
 
 interface HookHandlerDeps {
   config: ResolvedKnowledgeConfig;
@@ -76,40 +120,88 @@ interface HookHandlerDeps {
  */
 export function createBeforePromptBuildHandler(
   deps: HookHandlerDeps,
-): (event: BeforePromptBuildEvent) => Promise<BeforePromptBuildResult | undefined> {
+): (
+  event: BeforePromptBuildEvent,
+  ctx?: PluginHookAgentContext,
+) => Promise<BeforePromptBuildResult | undefined> {
   const { config, pool, logger } = deps;
 
-  // Per-instance state: consecutive failure counter and cooldown deadline.
-  // Closed-over so two registrations of the hook never share state.
-  let consecutiveErrors = 0;
-  let cooldownUntil = 0;
+  // Per-instance cooldown state. Closed-over so two registrations of the
+  // hook never share counters.
+  const cooldowns: Record<CooldownScope, CooldownState> = {
+    global: newCooldown(),
+    router: newCooldown(),
+    pgvector_reranker: newCooldown(),
+  };
 
   return async function beforePromptBuild(
     event: BeforePromptBuildEvent,
+    ctx?: PluginHookAgentContext,
   ): Promise<BeforePromptBuildResult | undefined> {
     if (!config.enabled) return undefined;
 
-    // Cooldown after repeated failures: skip silently until the deadline
-    // passes, then reset the counter and resume normal operation.
-    if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
-      if (Date.now() < cooldownUntil) return undefined;
-      consecutiveErrors = 0;
-      logger.info("openclaw-knowledge: resuming after cooldown");
+    if (isInCooldown(cooldowns.global)) {
+      maybeResetCooldown(cooldowns.global, "global", logger);
+      if (isInCooldown(cooldowns.global)) return undefined;
     }
 
     const query = extractQueryFromMessages(event.messages);
     if (!query || query.trim().length < MIN_QUERY_LENGTH) return undefined;
 
+    emitTurnMetadata(logger, ctx?.runId, query.length);
+
+    // -----------------------------------------------------------------
+    // Router gate — decide which sources (if any) to consult.
+    // -----------------------------------------------------------------
+    const decision = await runRouterWithCooldown(
+      config,
+      ctx,
+      query,
+      cooldowns.router,
+      logger,
+    );
+
+    // Project the abstract router decision onto the sources actually
+    // configured in this deployment. Without this projection, an
+    // exclusive route (e.g. LIGHTRAG_ONLY) on a single-source deployment
+    // (e.g. pgvector only) would produce zero tasks and strip context
+    // the deployment could otherwise have provided.
+    const effectiveRoute = projectRouteOnEnabledSources(
+      decision.route,
+      config.pgvectorEnabled,
+      config.lightragEnabled,
+    );
+
+    emitEvent(logger, {
+      type: "router",
+      route: effectiveRoute,
+      reason: decision.reason,
+      score: decision.score,
+      queryLength: query.length,
+      trigger: ctx?.trigger,
+    });
+
+    if (effectiveRoute === "NONE") return undefined;
+
+    // -----------------------------------------------------------------
+    // Source execution — guided by the route.
+    // -----------------------------------------------------------------
     try {
       const tasks: Promise<SourceResult>[] = [];
 
-      if (config.pgvectorEnabled && pool) {
-        tasks.push(runPgvectorSource(pool, query, config));
+      if (
+        shouldUsePgvector(effectiveRoute) &&
+        config.pgvectorEnabled &&
+        pool
+      ) {
+        tasks.push(runPgvectorSource(pool, query, config, cooldowns.pgvector_reranker, logger));
       }
 
-      if (config.lightragEnabled) {
+      if (shouldUseLightRAG(effectiveRoute) && config.lightragEnabled) {
         tasks.push(runLightRAGSource(query, config));
       }
+
+      if (tasks.length === 0) return undefined;
 
       const settled = await Promise.allSettled(tasks);
 
@@ -134,17 +226,11 @@ export function createBeforePromptBuildHandler(
       // cooldown tracking. A partial failure is fine — the other source's
       // context is better than nothing.
       if (failedSources > 0 && failedSources === tasks.length) {
-        consecutiveErrors++;
-        if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
-          cooldownUntil = Date.now() + COOLDOWN_MS;
-          logger.error(
-            `openclaw-knowledge: ${consecutiveErrors} consecutive errors — cooling down 5 min`,
-          );
-        }
+        registerError(cooldowns.global, "global", logger);
         return undefined;
       }
 
-      consecutiveErrors = 0;
+      cooldowns.global.consecutiveErrors = 0;
 
       if (sections.length === 0) return undefined;
 
@@ -160,24 +246,132 @@ export function createBeforePromptBuildHandler(
       };
     } catch (err) {
       // Catch-all: an unexpected crash must never propagate to the agent.
-      consecutiveErrors++;
       const message = err instanceof Error ? err.message : String(err);
-      if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
-        cooldownUntil = Date.now() + COOLDOWN_MS;
-        logger.error(
-          `openclaw-knowledge: ${consecutiveErrors} consecutive errors — cooling down 5 min: ${message}`,
-        );
-      } else {
-        logger.error(`openclaw-knowledge: ${message}`);
-      }
+      logger.error(`openclaw-knowledge: ${message}`);
+      registerError(cooldowns.global, "global", logger);
       return undefined;
     }
   };
 }
 
-type SourceResult =
-  | { source: "pgvector"; data: PgvectorResult[] }
-  | { source: "lightrag"; data: string };
+// ---------------------------------------------------------------------------
+// Route gating helpers
+// ---------------------------------------------------------------------------
+
+function shouldUsePgvector(route: Route): boolean {
+  return route === "PGVECTOR_ONLY" || route === "ALL";
+}
+
+function shouldUseLightRAG(route: Route): boolean {
+  return route === "LIGHTRAG_ONLY" || route === "ALL";
+}
+
+/**
+ * Project a router decision onto the set of sources that are actually
+ * enabled in this deployment. This prevents "silent empty retrieval"
+ * when, for example, a pgvector-only deployment is told to use
+ * `LIGHTRAG_ONLY` for a multi-hop question — without this projection the
+ * task list would be empty and the agent would lose context that
+ * pgvector could have provided.
+ *
+ * Rules:
+ *   - `NONE` → `NONE` (the router deliberately wants no retrieval).
+ *   - `ALL` → `ALL` (downstream `shouldUseX` already skips disabled sources).
+ *   - `PGVECTOR_ONLY` + pgvector disabled:
+ *       - LightRAG available → `LIGHTRAG_ONLY` (best effort)
+ *       - neither available → `NONE` (caller short-circuits)
+ *   - `LIGHTRAG_ONLY` + LightRAG disabled: symmetric.
+ *
+ * Exported for unit testing.
+ */
+export function projectRouteOnEnabledSources(
+  route: Route,
+  pgvectorEnabled: boolean,
+  lightragEnabled: boolean,
+): Route {
+  if (route === "NONE" || route === "ALL") return route;
+
+  if (route === "PGVECTOR_ONLY") {
+    if (pgvectorEnabled) return "PGVECTOR_ONLY";
+    return lightragEnabled ? "LIGHTRAG_ONLY" : "NONE";
+  }
+
+  // route === "LIGHTRAG_ONLY"
+  if (lightragEnabled) return "LIGHTRAG_ONLY";
+  return pgvectorEnabled ? "PGVECTOR_ONLY" : "NONE";
+}
+
+/**
+ * Run `decideRoute` with isolated cooldown tracking. The router fails open
+ * by contract (returns ALL on any Jina error) — the cooldown here is only
+ * meant to suppress repeated log spam during a sustained outage, not to
+ * stop retrieval.
+ */
+async function runRouterWithCooldown(
+  config: ResolvedKnowledgeConfig,
+  ctx: PluginHookAgentContext | undefined,
+  query: string,
+  cooldown: CooldownState,
+  logger: PluginLogger,
+): Promise<RouterDecision> {
+  // Reset stale cooldown FIRST so we don't keep the classifier circuit
+  // open longer than necessary (the first turn after expiry must be
+  // able to attempt the classifier again).
+  maybeResetCooldown(cooldown, "router", logger);
+
+  // When the classifier circuit is open, we DOWNGRADE the mode to
+  // "heuristic" rather than short-circuiting to `ALL`. The cheap local
+  // rules (heartbeat / cron / memory trigger gating, meta-agent regex,
+  // CLI-trivial guard, keyword fast-paths) MUST still run during a Jina
+  // outage — otherwise a 5-min outage re-enables retrieval for every
+  // heartbeat, which is the exact waste the router is meant to prevent.
+  const classifierCircuitOpen = isInCooldown(cooldown);
+  const effectiveMode: "heuristic" | "jina-classifier" = classifierCircuitOpen
+    ? "heuristic"
+    : config.routerMode;
+
+  try {
+    const d = await decideRoute(
+      {
+        enabled: config.routerEnabled,
+        mode: effectiveMode,
+        jinaApiKey: config.jinaApiKey,
+        classifierId: config.routerClassifierId || undefined,
+      },
+      {
+        query,
+        trigger: ctx?.trigger,
+        isCli: ctx?.messageProvider === "cli",
+      },
+    );
+
+    if (d.reason === "classifier_error") {
+      registerError(cooldown, "router", logger);
+    } else if (!classifierCircuitOpen) {
+      // Only reset the error counter when we actually exercised the
+      // classifier path. While the circuit is open, heuristic-only
+      // successes must NOT prematurely declare the classifier healthy.
+      cooldown.consecutiveErrors = 0;
+    }
+    return d;
+  } catch (err) {
+    // Defense in depth: decideRoute already handles Jina errors internally
+    // but a non-Jina exception (programmer error) lands here. Log only
+    // the error CLASS, never the message — the message could echo
+    // user content for some programmatic errors.
+    logger.error(
+      `openclaw-knowledge: router unexpected error — ${summarizeJinaError(err)}`,
+    );
+    registerError(cooldown, "router", logger);
+    return { route: "ALL", reason: "classifier_error", score: null };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Sources
+// ---------------------------------------------------------------------------
+
+type SourceResult = PgvectorSourceResult | LightRAGSourceResult;
 
 /**
  * Extract the most recent user message text. OpenClaw surfaces two content
@@ -207,31 +401,128 @@ function extractQueryFromMessages(
   return "";
 }
 
+interface PgvectorSourceResult {
+  source: "pgvector";
+  /**
+   * Final ordered results to inject into the prompt. When the reranker
+   * is enabled, this is the post-rerank, post-`topN`-truncation list.
+   * Otherwise it is the raw cosine-ordered list. The number of items
+   * here is what reaches the LLM.
+   */
+  data: PgvectorResult[];
+  /**
+   * Number of candidates returned by the vector cosine pass, BEFORE the
+   * optional reranker. Useful for monitoring recall vs. reranker pruning:
+   * `rawCount` is the recall size, `data.length` is the final size.
+   */
+  rawCount: number;
+  reranked: boolean;
+  durationMs: number;
+}
+
 async function runPgvectorSource(
   pool: PgPoolLike,
   query: string,
   config: ResolvedKnowledgeConfig,
-): Promise<SourceResult> {
+  rerankerCooldown: CooldownState,
+  logger: PluginLogger,
+): Promise<PgvectorSourceResult> {
+  const startedAt = Date.now();
   const vector = await embedQuery(query, config.geminiApiKey);
   const searches = config.collections.map((col) =>
     searchCollection(pool, col, vector, config.topK, config.scoreThreshold),
   );
   const allResults = (await Promise.all(searches)).flat();
   allResults.sort((a, b) => b.score - a.score);
-  return { source: "pgvector", data: allResults };
+  // Capture the recall size BEFORE the reranker runs. This is the
+  // number that monitors "how many candidates did pgvector find?"
+  // post-rerank, `data.length` may be smaller (truncated to topN), so
+  // we must not conflate the two in telemetry.
+  const rawCount = allResults.length;
+
+  // Optional cross-encoder rerank, gated on its own cooldown so a Jina
+  // hiccup doesn't poison the rest of the plugin.
+  //
+  // IMPORTANT: reset the cooldown BEFORE computing `rerankerActive`.
+  // Otherwise the first turn after the 5-min window expires would still
+  // see `consecutiveErrors=3`, skip the rerank, and only reset on the
+  // way out — leaving the operator with a "resuming" log message but a
+  // request that did NOT actually use the reranker.
+  maybeResetCooldown(rerankerCooldown, "pgvector_reranker", logger);
+
+  const rerankerActive =
+    config.pgvectorRerankerEnabled &&
+    Boolean(config.jinaApiKey) &&
+    !isInCooldown(rerankerCooldown);
+
+  if (!rerankerActive) {
+    return {
+      source: "pgvector",
+      data: allResults,
+      rawCount,
+      reranked: false,
+      durationMs: Date.now() - startedAt,
+    };
+  }
+
+  try {
+    const reranked = await rerankPgvectorResults(allResults, {
+      apiKey: config.jinaApiKey,
+      query,
+      model: config.pgvectorRerankerModel,
+      topN: config.pgvectorRerankerTopN,
+    });
+    rerankerCooldown.consecutiveErrors = 0;
+    return {
+      source: "pgvector",
+      data: reranked,
+      rawCount,
+      reranked: true,
+      durationMs: Date.now() - startedAt,
+    };
+  } catch (err) {
+    // Jina rerank failed → log a SANITIZED summary and fall back to
+    // cosine order. We do NOT log `err.message` because Jina error
+    // bodies (truncated to 200 chars in JinaApiError) may echo the
+    // query or document chunks — that would leak PHI / sensitive
+    // content into log files.
+    //
+    // We also intentionally DO NOT propagate the rejection to
+    // Promise.allSettled: pgvector retrieval itself succeeded, the
+    // reranker is bonus.
+    const isJina = err instanceof JinaError;
+    logger.error(
+      `openclaw-knowledge: pgvector reranker failed — ${summarizeJinaError(err)}`,
+    );
+    if (isJina) registerError(rerankerCooldown, "pgvector_reranker", logger);
+    return {
+      source: "pgvector",
+      data: allResults,
+      rawCount,
+      reranked: false,
+      durationMs: Date.now() - startedAt,
+    };
+  }
+}
+
+interface LightRAGSourceResult {
+  source: "lightrag";
+  data: string;
+  durationMs: number;
 }
 
 async function runLightRAGSource(
   query: string,
   config: ResolvedKnowledgeConfig,
-): Promise<SourceResult> {
+): Promise<LightRAGSourceResult> {
+  const startedAt = Date.now();
   const context = await queryLightRAG(
     config.lightragUrl,
     config.lightragApiKey,
     query,
     config.lightragQueryMode,
   );
-  return { source: "lightrag", data: context };
+  return { source: "lightrag", data: context, durationMs: Date.now() - startedAt };
 }
 
 function renderSection(
@@ -243,9 +534,23 @@ function renderSection(
     const formatted = formatPgvectorResults(result.data, config.maxInjectChars);
     if (!formatted) return null;
     const topScore = result.data[0]?.score?.toFixed(2) ?? "n/a";
+    const rerankNote = result.reranked ? " [reranked]" : "";
     logger.info(
-      `openclaw-knowledge: pgvector — ${result.data.length} result(s) (top: ${topScore})`,
+      `openclaw-knowledge: pgvector — ${result.data.length} result(s)${rerankNote} (top: ${topScore})`,
     );
+    emitEvent(logger, {
+      type: "pgvector",
+      collections: config.collections,
+      // `rawCount` is the recall size out of the vector index, captured
+      // BEFORE the reranker truncates to topN. `rerankedCount` is the
+      // final size that reaches the LLM (or `null` when the reranker
+      // is inactive). This split lets operators monitor recall vs.
+      // pruning independently.
+      rawCount: result.rawCount,
+      rerankedCount: result.reranked ? result.data.length : null,
+      topScore: result.data[0]?.score ?? null,
+      durationMs: result.durationMs,
+    });
     return "### Document Search Results (pgvector)\n" + formatted;
   }
 
@@ -255,6 +560,13 @@ function renderSection(
     logger.info(
       `openclaw-knowledge: LightRAG — ${formatted.truncated.length}/${formatted.originalLength} chars (truncated from ${formatted.originalLength})`,
     );
+    emitEvent(logger, {
+      type: "lightrag",
+      mode: config.lightragQueryMode,
+      contextChars: formatted.originalLength,
+      truncatedChars: formatted.truncated.length,
+      durationMs: result.durationMs,
+    });
     return "### Knowledge Graph Context (LightRAG)\n" + formatted.truncated;
   }
 
@@ -262,10 +574,46 @@ function renderSection(
 }
 
 // ---------------------------------------------------------------------------
+// Cooldown utilities
+// ---------------------------------------------------------------------------
+
+function isInCooldown(state: CooldownState): boolean {
+  return state.consecutiveErrors >= MAX_CONSECUTIVE_ERRORS;
+}
+
+function maybeResetCooldown(
+  state: CooldownState,
+  scope: CooldownScope,
+  logger: PluginLogger,
+): void {
+  if (!isInCooldown(state)) return;
+  if (Date.now() < state.cooldownUntil) return;
+  state.consecutiveErrors = 0;
+  state.cooldownUntil = 0;
+  logger.info(`openclaw-knowledge: ${scope} — resuming after cooldown`);
+}
+
+function registerError(
+  state: CooldownState,
+  scope: CooldownScope,
+  logger: PluginLogger,
+): void {
+  state.consecutiveErrors++;
+  if (state.consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+    state.cooldownUntil = Date.now() + COOLDOWN_MS;
+    logger.error(
+      `openclaw-knowledge: ${state.consecutiveErrors} consecutive errors — ${scope} cooling down 5 min`,
+    );
+    emitEvent(logger, {
+      type: "cooldown",
+      scope,
+      consecutiveErrors: state.consecutiveErrors,
+    });
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Plugin registration helper
-//
-// Exposed so tests can exercise the full wiring (including api.on) without
-// going through `definePluginEntry`, which is tied to the SDK runtime.
 // ---------------------------------------------------------------------------
 
 /**
@@ -282,6 +630,20 @@ export function registerKnowledgePlugin(api: OpenClawPluginApi): void {
       "openclaw-knowledge: neither pgvector nor LightRAG configured — plugin disabled",
     );
     return;
+  }
+
+  // Sanity check: when the reranker is on, we want at least ~2× the topN
+  // as raw candidates to give the cross-encoder room to re-order.
+  if (
+    config.pgvectorRerankerEnabled &&
+    config.topK < config.pgvectorRerankerTopN * 2
+  ) {
+    api.logger.warn(
+      `openclaw-knowledge: topK=${config.topK} is small relative to ` +
+        `pgvectorRerankerTopN=${config.pgvectorRerankerTopN}. ` +
+        `Recommended: topK ≥ ${config.pgvectorRerankerTopN * 2} for the ` +
+        `reranker to meaningfully change ordering.`,
+    );
   }
 
   // Only instantiate the pg pool when pgvector is actually in play. Booting
@@ -302,13 +664,21 @@ export function registerKnowledgePlugin(api: OpenClawPluginApi): void {
 
   const sources: string[] = [];
   if (config.pgvectorEnabled) {
-    sources.push(`pgvector (${config.collections.join(", ")})`);
+    const rerankNote = config.pgvectorRerankerEnabled
+      ? ` + reranker(${config.pgvectorRerankerModel})`
+      : "";
+    sources.push(`pgvector (${config.collections.join(", ")})${rerankNote}`);
   }
   if (config.lightragEnabled) {
     sources.push(`LightRAG (${config.lightragQueryMode})`);
   }
+
+  const routerNote = config.routerEnabled
+    ? ` | router=${config.routerMode}${config.routerClassifierId ? "/few-shot" : "/zero-shot"}`
+    : "";
+
   api.logger.info(
-    `openclaw-knowledge: ready — sources: ${sources.join(" + ")}`,
+    `openclaw-knowledge: ready — sources: ${sources.join(" + ")}${routerNote}`,
   );
 
   const handler = createBeforePromptBuildHandler({
@@ -337,7 +707,7 @@ export default definePluginEntry({
   id: "openclaw-knowledge",
   name: "Knowledge Base",
   description:
-    "Multi-source knowledge search for OpenClaw (pgvector + LightRAG)",
+    "Multi-source knowledge search for OpenClaw (pgvector + LightRAG) with optional Jina-powered router & reranker",
   register(api) {
     registerKnowledgePlugin(api);
   },

@@ -3,10 +3,14 @@
 // These helpers are the only place that touches `process.env`, keeping the
 // rest of the plugin easy to test with deterministic values.
 
+import type { RerankerModel } from "./jina/types.js";
 import type {
+  JinaPluginConfig,
   KnowledgePluginConfig,
   LightRAGQueryMode,
+  PgvectorRerankerPluginConfig,
   ResolvedKnowledgeConfig,
+  RouterPluginConfig,
 } from "./types.js";
 
 /**
@@ -30,10 +34,18 @@ const DEFAULT_MAX_INJECT_CHARS = 4000;
 const DEFAULT_LIGHTRAG_MODE: LightRAGQueryMode = "hybrid";
 const DEFAULT_LIGHTRAG_MAX_CHARS = 4000;
 
+const DEFAULT_ROUTER_MODE: "heuristic" | "jina-classifier" = "heuristic";
+const DEFAULT_RERANKER_MODEL: RerankerModel = "jina-reranker-v2-base-multilingual";
+const DEFAULT_RERANKER_TOP_N = 5;
+
 /**
  * Apply defaults and env substitution to the raw plugin config. A source is
  * enabled when its credentials are present, unless the user explicitly toggles
  * `pgvectorEnabled`/`lightragEnabled` off.
+ *
+ * Jina-derived features (router + pgvector reranker) follow the same
+ * "default to off" discipline: nothing activates without an explicit opt-in,
+ * so pre-3.2.0 configs continue to work identically.
  */
 export function resolveConfig(
   cfg: KnowledgePluginConfig = {},
@@ -42,6 +54,12 @@ export function resolveConfig(
   const postgresUrl = resolveEnv(cfg.postgresUrl ?? DEFAULT_POSTGRES_URL);
   const lightragUrl = resolveEnv(cfg.lightragUrl ?? "");
   const lightragApiKey = resolveEnv(cfg.lightragApiKey ?? "");
+
+  const jina = (cfg.jina ?? {}) as JinaPluginConfig;
+  const router = (jina.router ?? {}) as RouterPluginConfig;
+  const reranker = (jina.pgvectorReranker ?? {}) as PgvectorRerankerPluginConfig;
+  const jinaApiKey = resolveEnv(jina.apiKey ?? "");
+  const routerClassifierId = resolveEnv(router.classifierId ?? "");
 
   return {
     enabled: cfg.enabled !== false,
@@ -57,5 +75,22 @@ export function resolveConfig(
     lightragQueryMode: cfg.lightragQueryMode ?? DEFAULT_LIGHTRAG_MODE,
     lightragMaxChars: cfg.lightragMaxChars ?? DEFAULT_LIGHTRAG_MAX_CHARS,
     lightragEnabled: cfg.lightragEnabled !== false && Boolean(lightragUrl),
+
+    // Jina shared key (used by router and/or reranker)
+    jinaApiKey,
+
+    // Router — disabled by default, even with a Jina key present, so
+    // operators must opt in explicitly. "heuristic" mode is the safest
+    // entry point: zero cost, deterministic.
+    routerEnabled: router.enabled === true,
+    routerMode: router.mode ?? DEFAULT_ROUTER_MODE,
+    routerClassifierId,
+
+    // Pgvector reranker — disabled by default. Requires both the toggle
+    // and a Jina key to actually activate at runtime (the handler checks
+    // this combination before calling).
+    pgvectorRerankerEnabled: reranker.enabled === true && Boolean(jinaApiKey),
+    pgvectorRerankerModel: reranker.model ?? DEFAULT_RERANKER_MODEL,
+    pgvectorRerankerTopN: reranker.topN ?? DEFAULT_RERANKER_TOP_N,
   };
 }

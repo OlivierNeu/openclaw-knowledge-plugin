@@ -1,8 +1,8 @@
 {
   "id": "openclaw-knowledge",
   "name": "Knowledge Base",
-  "description": "Multi-source knowledge search (pgvector + LightRAG) — injects relevant documents and knowledge graph context before each turn via the before_prompt_build hook",
-  "version": "3.1.2",
+  "description": "Multi-source knowledge search (pgvector + LightRAG) with optional Jina-powered router & reranker — injects relevant documents and knowledge graph context before each turn via the before_prompt_build hook",
+  "version": "3.2.0",
   "activation": {
     "onStartup": true
   },
@@ -34,7 +34,7 @@
         "minimum": 1,
         "maximum": 100,
         "default": 5,
-        "description": "Maximum number of results returned per collection"
+        "description": "Maximum number of results returned per collection (raw recall stage)"
       },
       "scoreThreshold": {
         "type": "number",
@@ -76,6 +76,63 @@
       "lightragEnabled": {
         "type": "boolean",
         "description": "Disable LightRAG search while keeping pgvector. Defaults to true when lightragUrl is set."
+      },
+      "jina": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Optional Jina-powered enhancements: router (skip irrelevant retrievals) and pgvector reranker (re-order vector results by cross-encoder relevance).",
+        "properties": {
+          "apiKey": {
+            "type": "string",
+            "description": "Jina API key shared by router and reranker. Required when router.mode=jina-classifier or pgvectorReranker.enabled. Supports ${ENV_VAR} substitution."
+          },
+          "router": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "Adaptive routing: classify each user turn and skip retrieval when irrelevant.",
+            "properties": {
+              "enabled": {
+                "type": "boolean",
+                "default": false,
+                "description": "Enable the router. When false (default), every eligible turn calls every configured source — pre-3.2.0 behavior."
+              },
+              "mode": {
+                "type": "string",
+                "enum": ["heuristic", "jina-classifier"],
+                "default": "heuristic",
+                "description": "heuristic: zero-cost regex + trigger rules only (safe start). jina-classifier: same heuristics first, then Jina /v1/classify for ambiguous queries."
+              },
+              "classifierId": {
+                "type": "string",
+                "description": "Optional pre-trained Jina classifier_id (few-shot mode). Train it out-of-band via POST /v1/train then paste the ID here. When omitted, the router uses zero-shot with built-in labels."
+              }
+            }
+          },
+          "pgvectorReranker": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "Re-order pgvector results with a Jina cross-encoder. Boosts precision when topK candidates contain noise.",
+            "properties": {
+              "enabled": {
+                "type": "boolean",
+                "default": false,
+                "description": "Enable cross-encoder rerank on pgvector results. Requires jina.apiKey."
+              },
+              "model": {
+                "type": "string",
+                "default": "jina-reranker-v2-base-multilingual",
+                "description": "Jina reranker model. v2-base-multilingual is recommended for French content (v3 is English-biased)."
+              },
+              "topN": {
+                "type": "number",
+                "minimum": 1,
+                "maximum": 100,
+                "default": 5,
+                "description": "Max number of results returned after rerank. Recommendation: keep topK ≥ topN × 2 so the cross-encoder has room to re-order."
+              }
+            }
+          }
+        }
       }
     },
     "required": []
@@ -105,7 +162,7 @@
     "topK": {
       "label": "Top-K per collection",
       "advanced": true,
-      "help": "Maximum number of results returned per collection (default: 5)"
+      "help": "Maximum number of results returned per collection (default: 5). When the reranker is enabled, recommended ≥ 2× rerank topN."
     },
     "scoreThreshold": {
       "label": "Score threshold",
@@ -147,6 +204,42 @@
       "label": "Enable LightRAG source",
       "advanced": true,
       "help": "Disable LightRAG while keeping pgvector. Defaults to true when lightragUrl is set."
+    },
+    "jina.apiKey": {
+      "label": "Jina API Key",
+      "placeholder": "${JINA_API_KEY}",
+      "sensitive": true,
+      "help": "Shared by router and reranker. Use ${JINA_API_KEY} for env var substitution."
+    },
+    "jina.router.enabled": {
+      "label": "Enable router",
+      "advanced": true,
+      "help": "Adaptive routing that skips retrieval on heartbeats and meta-questions. Default: false (pre-3.2.0 behavior)."
+    },
+    "jina.router.mode": {
+      "label": "Router mode",
+      "advanced": true,
+      "help": "heuristic: zero-cost rules only. jina-classifier: heuristics + Jina /v1/classify fallback."
+    },
+    "jina.router.classifierId": {
+      "label": "Few-shot classifier ID",
+      "advanced": true,
+      "help": "Optional. When set, the router uses your pre-trained classifier instead of zero-shot labels."
+    },
+    "jina.pgvectorReranker.enabled": {
+      "label": "Enable pgvector reranker",
+      "advanced": true,
+      "help": "Cross-encoder re-ordering of pgvector results. Requires Jina API key."
+    },
+    "jina.pgvectorReranker.model": {
+      "label": "Reranker model",
+      "advanced": true,
+      "help": "Default: jina-reranker-v2-base-multilingual (best for French)."
+    },
+    "jina.pgvectorReranker.topN": {
+      "label": "Reranker top-N",
+      "advanced": true,
+      "help": "Max results returned after rerank. Keep topK ≥ topN × 2."
     }
   }
 }

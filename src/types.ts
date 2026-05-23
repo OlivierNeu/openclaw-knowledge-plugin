@@ -3,6 +3,38 @@
 // Kept separate from the entry point so that tests and helper modules can
 // import them without pulling in the full plugin registration code.
 
+import type { RerankerModel } from "./jina/types.js";
+
+// ---------------------------------------------------------------------------
+// Plugin context exposed by the OpenClaw SDK on the before_prompt_build hook
+// ---------------------------------------------------------------------------
+
+/**
+ * Subset of `PluginHookAgentContext` from the OpenClaw plugin SDK that this
+ * plugin actually consumes. Declared locally to keep the test suite free of
+ * SDK runtime imports.
+ *
+ * Fields beyond this subset (workspaceDir, modelProviderId, ...) are
+ * deliberately omitted — the handler does not depend on them.
+ *
+ * @see https://github.com/openclaw/openclaw plugin-sdk types.d.ts
+ */
+export interface PluginHookAgentContext {
+  /** What initiated this agent run. */
+  trigger?: "user" | "heartbeat" | "cron" | "memory" | string;
+  /** Channel-derived sender id. The plugin currently only uses `"cli"`. */
+  messageProvider?: string;
+  channelId?: string;
+  agentId?: string;
+  sessionId?: string;
+  sessionKey?: string;
+  runId?: string;
+}
+
+// ---------------------------------------------------------------------------
+// User-facing configuration (raw shape from plugins.entries.openclaw-knowledge.config)
+// ---------------------------------------------------------------------------
+
 /**
  * Runtime configuration as it appears in `plugins.entries.openclaw-knowledge.config`.
  * All fields are optional — defaults are applied in {@link resolveConfig}.
@@ -25,9 +57,43 @@ export interface KnowledgePluginConfig {
   lightragQueryMode?: LightRAGQueryMode;
   lightragMaxChars?: number;
   lightragEnabled?: boolean;
+
+  // Jina-powered enhancements (router + pgvector reranker). All sub-fields
+  // are optional; omitting `jina` entirely preserves pre-3.2.0 behavior.
+  jina?: JinaPluginConfig;
+}
+
+export interface JinaPluginConfig {
+  /** Jina API key. Required for `router.mode=jina-classifier` or `pgvectorReranker.enabled`. Supports `${ENV_VAR}` substitution. */
+  apiKey?: string;
+  router?: RouterPluginConfig;
+  pgvectorReranker?: PgvectorRerankerPluginConfig;
+}
+
+export interface RouterPluginConfig {
+  enabled?: boolean;
+  mode?: "heuristic" | "jina-classifier";
+  /**
+   * Optional pre-trained Jina classifier_id. When set, the router calls
+   * `/v1/classify` with this ID (few-shot mode). Train it out-of-band via
+   * `POST /v1/train` — the plugin does NOT implement training.
+   */
+  classifierId?: string;
+}
+
+export interface PgvectorRerankerPluginConfig {
+  enabled?: boolean;
+  /** Reranker model. Default: `jina-reranker-v2-base-multilingual` (best FR coverage). */
+  model?: RerankerModel;
+  /** Cap on results returned post-rerank. Default: `5`. */
+  topN?: number;
 }
 
 export type LightRAGQueryMode = "naive" | "local" | "global" | "hybrid";
+
+// ---------------------------------------------------------------------------
+// Resolved configuration (after defaults + env substitution)
+// ---------------------------------------------------------------------------
 
 /**
  * Fully resolved plugin configuration after defaults, env substitution, and
@@ -51,7 +117,24 @@ export interface ResolvedKnowledgeConfig {
   lightragQueryMode: LightRAGQueryMode;
   lightragMaxChars: number;
   lightragEnabled: boolean;
+
+  // Jina shared
+  jinaApiKey: string;
+
+  // Router
+  routerEnabled: boolean;
+  routerMode: "heuristic" | "jina-classifier";
+  routerClassifierId: string;
+
+  // Pgvector reranker
+  pgvectorRerankerEnabled: boolean;
+  pgvectorRerankerModel: RerankerModel;
+  pgvectorRerankerTopN: number;
 }
+
+// ---------------------------------------------------------------------------
+// Pgvector wire shapes
+// ---------------------------------------------------------------------------
 
 /**
  * One search hit from the PostgreSQL `knowledge_vectors` table, after score
@@ -100,9 +183,17 @@ export interface PgvectorRow {
   score: string;
 }
 
+// ---------------------------------------------------------------------------
+// Hook event shape (consumed by the handler factory)
+// ---------------------------------------------------------------------------
+
 /**
  * Shape of the `before_prompt_build` event payload as consumed by this plugin.
  * We only rely on `messages`; the SDK may add other fields that we ignore.
+ *
+ * The full SDK type also exposes `prompt: string` (the raw user text). The
+ * handler keeps using `extractQueryFromMessages` to stay compatible with the
+ * existing tests; `prompt` is left to the SDK without being read here.
  */
 export interface BeforePromptBuildEvent {
   messages?: PromptMessage[];

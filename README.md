@@ -183,6 +183,14 @@ openclaw gateway restart
 | `lightragQueryMode` | string | `"hybrid"` | Query mode: `naive`, `local`, `global`, `hybrid` |
 | `lightragMaxChars` | number | `4000` | Character budget for LightRAG context |
 | `lightragEnabled` | boolean | `true` if `lightragUrl` set | Disable LightRAG while keeping pgvector |
+| **Jina integration (optional, v3.2.0+)** | | | |
+| `jina.apiKey` | string | — | Jina API key shared by router & reranker (supports `${ENV_VAR}`) |
+| `jina.router.enabled` | boolean | `false` | Adaptive routing (skip irrelevant retrievals) |
+| `jina.router.mode` | string | `"heuristic"` | `heuristic` (zero-cost) or `jina-classifier` (heuristic + Jina fallback) |
+| `jina.router.classifierId` | string | — | Optional pre-trained few-shot classifier ID |
+| `jina.pgvectorReranker.enabled` | boolean | `false` | Cross-encoder re-ordering of pgvector results |
+| `jina.pgvectorReranker.model` | string | `"jina-reranker-v2-base-multilingual"` | Reranker model |
+| `jina.pgvectorReranker.topN` | number | `5` | Max results returned after rerank |
 
 ### LightRAG query modes
 
@@ -192,6 +200,129 @@ openclaw gateway restart
 | `local` | Entity neighborhood traversal | Questions about a specific entity |
 | `global` | Community summaries | Broad, overview questions |
 | `hybrid` | Combines local + global | **Recommended for most cases** |
+
+---
+
+## Jina integration (v3.2.0+)
+
+The plugin can optionally call the [Jina AI](https://jina.ai/) cloud API
+to make two improvements:
+
+### Adaptive router — skip retrieval when it can't help
+
+By default the plugin queries every configured source on every turn.
+That's wasteful on heartbeats, cron-driven turns, and meta-questions
+("what is your session id?") that no knowledge base can answer.
+
+Enabling the router introduces a gating step before the sources are
+called:
+
+1. **Zero-cost heuristics first.** Skips on `PluginHookAgentContext.trigger ∈ {heartbeat, cron, memory}`, on
+   meta-agent regex matches, and on CLI test pings from
+   `messageProvider="cli"`. Keyword fast-paths route obvious factual
+   lookups to pgvector and obvious multi-hop questions to LightRAG.
+2. **Jina Classifier fallback** (only in `mode: "jina-classifier"`).
+   When the heuristics are ambiguous, the plugin calls
+   `POST /v1/classify` to pick one of four routes:
+   `NONE`, `PGVECTOR_ONLY`, `LIGHTRAG_ONLY`, or `ALL`. **Few-shot
+   classifiers MUST be trained against these exact canonical names** —
+   any other label is silently rejected and falls back to `ALL`.
+   Supports **zero-shot** (built-in labels, no training required) and
+   **few-shot** (pre-trained classifier_id, ~50 tokens per call vs ~200
+   for zero-shot).
+3. **Fail-open.** Any Jina outage degrades silently to `ALL` — the
+   pre-3.2.0 behavior. Routing never blocks the agent.
+
+Enable in `openclaw.json`:
+
+```json
+"jina": {
+  "apiKey": "${JINA_API_KEY}",
+  "router": {
+    "enabled": true,
+    "mode": "heuristic"
+  }
+}
+```
+
+Then switch to `mode: "jina-classifier"` once you're comfortable.
+
+### Pgvector reranker — re-order vector results by relevance
+
+Vector cosine similarity is great recall but mediocre precision: the
+top-K candidates are often noisy. A cross-encoder reranker re-scores
+each (query, candidate) pair as a pair, which is much more accurate
+than independent embeddings — at the cost of one Jina call per turn.
+
+Enable in `openclaw.json`:
+
+```json
+"jina": {
+  "apiKey": "${JINA_API_KEY}",
+  "pgvectorReranker": {
+    "enabled": true
+  }
+},
+"topK": 20
+```
+
+Recommended `topK ≥ topN × 2` so the reranker has room to re-order.
+The plugin warns at init if the ratio is too tight.
+
+**Model default:** `jina-reranker-v2-base-multilingual` — best for
+French content. v3 is larger (131K context) but English-biased. Switch
+via `jina.pgvectorReranker.model`.
+
+### Observability
+
+Every router decision, source execution, and cooldown transition emits
+a structured event line:
+
+```
+[knowledge.event] {"type":"router","route":"PGVECTOR_ONLY","reason":"heuristic_keyword","score":null,"queryLength":42,"trigger":"user"}
+[knowledge.event] {"type":"pgvector","collections":["knowledge_olivier"],"rawCount":5,"rerankedCount":5,"topScore":0.78,"durationMs":124}
+[knowledge.event] {"type":"cooldown","scope":"router","consecutiveErrors":3}
+```
+
+These lines can be scraped by Opik, LangFuse, or any OTLP collector
+without the plugin depending on a specific tracing SDK.
+
+#### Privacy invariant
+
+The plugin **never** logs any portion of the raw user query, any
+retrieved chunk text, any hash of them, or any other potentially-PII
+payload. When `logger.debug` is enabled, an extra correlation line
+carries the SDK-provided turn identifier only:
+
+```
+[knowledge.event] turn.metadata runId=01HF... qlen=42
+```
+
+`runId` comes from `PluginHookAgentContext.runId` (the OpenClaw SDK's
+non-query-derived turn identifier). `qlen` is just a character count.
+The plugin deliberately does NOT publish any hash of the query — a
+deterministic SHA-256 prefix of a 3–10 character prompt is
+dictionary-recoverable offline, which would defeat the invariant on
+exactly the deployments where it matters most (PHI / regulated
+content).
+
+Operators who need CONTENT correlation across turns (e.g. "this user
+asked the same question twice") must instrument at the SDK layer with
+a keyed HMAC and a deployment-side secret; the plugin will not do it
+for them.
+
+### Cooldown isolation
+
+The pre-existing 3-errors → 5-min cooldown is now split into three
+independent counters:
+
+| Scope | Triggers cooldown |
+|-------|-------------------|
+| `global` | Both pgvector AND LightRAG fail in the same turn |
+| `router` | Repeated Jina classifier errors |
+| `pgvector_reranker` | Repeated Jina rerank errors |
+
+A Jina outage on one path no longer affects the others.
 
 ---
 

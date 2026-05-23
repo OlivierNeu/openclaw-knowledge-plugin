@@ -1,8 +1,8 @@
 {
   "name": "@lacneu/openclaw-knowledge",
-  "version": "3.1.2",
+  "version": "3.2.0",
   "type": "module",
-  "description": "Multi-source knowledge plugin for OpenClaw — pgvector + LightRAG injection via before_prompt_build hook",
+  "description": "Multi-source knowledge plugin for OpenClaw — pgvector + LightRAG injection with optional Jina-powered router & reranker, via before_prompt_build hook",
   "license": "MIT",
   "author": "Olivier Neu",
   "homepage": "https://github.com/OlivierNeu/openclaw-knowledge-plugin#readme",
@@ -40,7 +40,7 @@
     "build:test": "tsc -p tsconfig.test-build.json",
     "clean": "rm -rf dist dist-test",
     "typecheck": "tsc -p tsconfig.test.json",
-    "test": "npm run build:test && node --test dist-test/test/*.test.js",
+    "test": "npm run build:test && node --test $(find dist-test/test -name '*.test.js' -print)",
     "prepublishOnly": "npm run clean && npm run build"
   },
   "openclaw": {

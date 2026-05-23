@@ -7,6 +7,268 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.2.0] - 2026-05-23
+
+### Added — Jina-powered router (`jina.router.*`)
+
+The plugin can now skip retrieval entirely when the user turn is clearly
+not a knowledge-base question. Two operational sources of waste are
+eliminated:
+
+- **Heartbeats**, **cron**, and **memory** triggers (from
+  `PluginHookAgentContext.trigger`) — gated deterministically, zero
+  Jina cost, zero ambiguity. In observed traces these accounted for the
+  majority of pgvector / LightRAG / Jina rerank calls.
+- **Meta-agent questions** ("what is your session id", "combien d'agents
+  dans cette instance") that the knowledge base can never answer.
+- **CLI test pings** (`isCli && /^test|ping|hello|salut.*$/i`) when the
+  sender is the local CLI harness.
+
+Two modes:
+
+- `heuristic` (default) — zero-cost regex + trigger rules only. Safe to
+  enable as a first step; never crashes, never consumes Jina tokens.
+- `jina-classifier` — same heuristics first, then Jina `/v1/classify`
+  for ambiguous queries. Supports both **zero-shot** (built-in labels)
+  and **few-shot** (operator-trained `classifierId`). The plugin does
+  NOT implement `/v1/train` — training is an out-of-band step.
+
+The router is **fail-open** by contract: any Jina outage falls back to
+`ALL` (the pre-3.2.0 behavior) and never blocks the agent.
+
+### Added — Jina-powered pgvector reranker (`jina.pgvectorReranker.*`)
+
+After the cosine-similarity recall stage, results may optionally be
+re-ordered by a Jina cross-encoder. This dramatically improves precision
+on noisy candidate sets (the 0.36–0.41 cosine scores we observed in
+production were below the practical relevance floor).
+
+- Default model: `jina-reranker-v2-base-multilingual` (recommended for
+  French content; v3 is English-biased).
+- Hard-coded `return_documents: false` for token economy (the plugin
+  already owns the source rows; only `(index, score)` is needed back).
+- Hard-coded `truncate: true` so over-long chunks get clipped rather
+  than failing the whole batch.
+- Independent cooldown counter — a Jina rerank outage does NOT trip the
+  router cooldown, and vice versa.
+- At init, warns if `topK < pgvectorRerankerTopN × 2` (not enough recall
+  for the reranker to meaningfully change ordering).
+
+### Added — structured event tracing (`[knowledge.event]`)
+
+Every router decision, source execution, reranker run, and cooldown
+transition emits a single-line JSON event through `logger.info`, prefixed
+with `[knowledge.event] `. Operators can scrape these lines into Opik,
+LangFuse, or any OTLP collector without the plugin needing to depend on
+a specific tracing SDK (preserves the single-`pg`-dep promise).
+
+### Added — modular Jina client (`src/jina/`)
+
+A small, dependency-free HTTP client (`client.ts`) used by the classifier
+and reranker. Features:
+
+- Bearer-only auth — the API key never appears in the URL or in error
+  messages.
+- AbortController-based 8 s timeout per request, composable with a
+  caller-supplied `AbortSignal`.
+- Defensive JSON parsing — CDN HTML 5xx pages don't crash the plugin.
+- Typed errors: `JinaAuthError` / `JinaRateLimitError` / `JinaApiError`
+  / `JinaNetworkError` (all extending `JinaError`).
+- Error bodies truncated to 200 chars in messages, matching the existing
+  pattern in `embeddings.ts` / `lightrag.ts`.
+
+### Changed — hook handler now reads `PluginHookAgentContext`
+
+`createBeforePromptBuildHandler` returns a handler with the canonical
+SDK signature `(event, ctx?)`. `ctx.trigger` is consumed by the router
+gate; other ctx fields are ignored. The change is backward-compatible —
+calling the handler with no `ctx` argument keeps the pre-3.2.0 behavior.
+
+### Changed — three independent cooldown counters
+
+The pre-existing 3-errors → 5-min cooldown remains shared between
+pgvector and LightRAG (the "global" scope). Router and pgvector reranker
+each get their own counter so a Jina outage on one path cannot stop the
+other. All three are reset to zero on the first success after expiry.
+
+### Migration
+
+Pre-3.2.0 configs continue to work identically — every new feature
+defaults to OFF and requires explicit opt-in via the `jina.*` block.
+The `jina` block as a whole is optional; omit it to keep current
+behavior.
+
+To enable the router (recommended starting point):
+
+```yaml
+plugins:
+  openclaw-knowledge:
+    config:
+      jina:
+        apiKey: ${JINA_API_KEY}
+        router:
+          enabled: true
+          mode: heuristic   # safe default, no Jina calls
+```
+
+> **Operational note — `isCli` heuristic.** The CLI-trivial skip rule
+> fires only when `ctx.messageProvider === "cli"`. The exact value the
+> OpenClaw SDK populates depends on the channel that initiated the
+> turn. Before enabling the router in production, log `ctx.messageProvider`
+> for one CLI turn and verify it matches `"cli"`. If your gateway uses
+> a different identifier, the safest path is to leave this branch
+> dormant — meta-agent regex and trigger gating already cover the most
+> wasteful traffic (heartbeats, "what is your session id?").
+
+To enable the pgvector reranker:
+
+```yaml
+      jina:
+        apiKey: ${JINA_API_KEY}
+        pgvectorReranker:
+          enabled: true
+          # model: jina-reranker-v2-base-multilingual  (default)
+          # topN: 5  (default)
+      topK: 20  # recommended ≥ rerankerTopN × 2
+```
+
+### Fixed during code review
+
+Eleven pre-release issues flagged across six Codex adversarial review
+passes (2026-05-23):
+
+- **Label/Route name mismatch.** The classifier labels used the literal
+  `"NO_RETRIEVAL"` while the `Route` type and `isKnownRoute()` only
+  accepted `"NONE"`. Effect: every no-retrieval prediction silently fell
+  back to `ALL`, defeating the whole point of the router for the most
+  important class. Few-shot classifiers trained against `"NONE"` were
+  also unreachable. Renamed `ROUTE_NO_RETRIEVAL` → `ROUTE_NONE` with the
+  literal value `"NONE"`. Operators training a few-shot classifier must
+  use the four canonical names `NONE`, `PGVECTOR_ONLY`, `LIGHTRAG_ONLY`,
+  `ALL`. Pinned by a regression test.
+
+- **Exclusive route on single-source deployment dropped retrieval.**
+  In a pgvector-only deployment (no LightRAG), a router decision of
+  `LIGHTRAG_ONLY` produced zero tasks and a silent context drop, even
+  though pgvector was available. Added `projectRouteOnEnabledSources()`
+  that falls back from `PGVECTOR_ONLY`/`LIGHTRAG_ONLY` to the available
+  source when the target is disabled (and to `NONE` when neither is
+  available). `ALL` and `NONE` remain pass-through. The router event
+  emitted to the log now reflects the EFFECTIVE (projected) route, not
+  the abstract decision. Covered by 7 unit tests + 1 e2e regression
+  test.
+
+- **Jina client timeout did not cover the body read.** The internal
+  `clearTimeout` ran in a `finally` immediately after `fetch()` returned,
+  BEFORE `resp.text()`. If an upstream proxy delivered headers fast but
+  stalled the body stream, the response could hang indefinitely (only
+  the SDK's outer timeout would eventually catch it — far too long for
+  `before_prompt_build`). Refactored `postJson` so the single
+  `clearTimeout` + signal-detach happen in an outer `finally` that wraps
+  the entire request-AND-body cycle. Added a dedicated regression test
+  using a `ReadableStream` body that only completes on abort.
+
+- **README documented the wrong no-retrieval label.** The "Adaptive
+  router" section listed `NO_RETRIEVAL` as one of the four routes, but
+  the code accepts only `NONE`. Operators following the doc to train a
+  few-shot classifier would have produced an unusable classifier.
+  Corrected to `NONE` and added an explicit reminder that few-shot
+  classifiers MUST be trained against the four canonical names.
+
+- **Privacy: query preview removed from debug logs.** The original
+  `emitQueryPreview` logged the first 80 chars of every user query when
+  `logger.debug` was active. In Ataraxis-style deployments those queries
+  routinely carry PHI / client content / occasionally secrets, so even a
+  truncated preview was a leak vector. Replaced by `emitQueryFingerprint`
+  which logs a non-reversible SHA-256 prefix (`fp=<12 hex chars>`) and
+  the integer length only. Operators still get turn-level correlation
+  across the router event, source events, and downstream Opik traces,
+  without any portion of the underlying text appearing in logs.
+  Regression test asserts that **every word of a sensitive query is
+  absent** from the emitted log line.
+
+- **Router heuristic falsely classified business questions as meta.**
+  The "status" trigger pattern matched any prompt ending with the word
+  "status", so `what is the ACME project status?` was being routed to
+  `NONE` (no retrieval). Anchored the relevant patterns with `^`/`$`
+  so only whole-prompt pings (`status?`, `system status?`, `are you
+  there?`) trigger the meta-skip. Business questions that happen to
+  mention the words remain on the retrieval path. Pinned by 4 new
+  regression tests.
+
+- **Privacy: Jina error bodies could echo PHI into error logs.**
+  `JinaApiError.message` includes the first 200 chars of the upstream
+  response body. On `/v1/rerank` failures, that body can echo the user
+  query or a document chunk back. The previous
+  `logger.error(\`...— \${err.message}\`)` re-published this content in
+  plain text. Added `summarizeJinaError()` that returns only the error
+  class and HTTP status code (e.g. `JinaApiError(status=503)`), and
+  used it everywhere the hook handler logs an error. Body content
+  never reaches the log. Covered by 7 new unit tests.
+
+- **Pgvector reranker lost the first turn after cooldown expiry.**
+  `maybeResetCooldown` was called AFTER the `rerankerActive` check, so
+  the first turn after the 5-min window expired still ran cosine-only,
+  even though the operator's log said `resuming`. Moved the reset
+  before the check. The behavior is now documented inline and the
+  ordering invariant is preserved by source comments — full e2e
+  coverage requires a pg.Pool seam that doesn't exist yet.
+
+- **Router cooldown re-enabled retrieval for heartbeats during a Jina
+  outage.** `runRouterWithCooldown` used to short-circuit straight to
+  `ALL` once the classifier circuit opened, bypassing the zero-cost
+  heuristic layer entirely. Result: during a 5-minute Jina outage,
+  every heartbeat / cron / meta-question would resume calling
+  pgvector + LightRAG — the exact waste the router was designed to
+  block. Fixed by DOWNGRADING the router mode to `"heuristic"` during
+  cooldown rather than short-circuiting, so heartbeat / trigger /
+  meta-regex / CLI rules still apply. Pinned by an end-to-end
+  regression test that: trips 3 classifier errors, then sends a
+  heartbeat turn and asserts ZERO fetch calls (no Gemini embed, no
+  LightRAG, no Jina). The error counter is also no longer reset by
+  successful heuristic-only turns during cooldown — that would have
+  prematurely declared the classifier healthy.
+
+- **Privacy: query fingerprint hash was dictionary-recoverable on
+  short prompts.** `emitQueryFingerprint` emitted the first 12 hex
+  chars of `SHA-256(query)` as a debug-only "non-reversible"
+  correlation key. On low-entropy prompts (the hook accepts queries as
+  short as 3 chars), the hash is brute-forceable offline against a
+  dictionary of likely prompts — so the "privacy invariant" was leaky
+  in exactly the deployments where it mattered most. Removed the hash
+  entirely. Replaced by `emitTurnMetadata(logger, ctx.runId, query.length)`
+  which emits the SDK's non-query-derived `runId` and a length count
+  only. Pinned by a regression test that asserts no query word AND no
+  long hex token appears in the debug line. Operators who want
+  cross-turn content correlation must instrument at the SDK layer with
+  their own keyed scheme (HMAC + deployment secret); the plugin will
+  not do it.
+
+- **Telemetry: `rawCount` was post-rerank, hiding recall vs pruning.**
+  When the pgvector reranker was active, `PgvectorEvent.rawCount`
+  reflected the post-rerank truncated size (`topN`), not the number of
+  candidates pgvector actually returned. Operators relying on the
+  event to monitor recall would see the wrong value. Fixed by carrying
+  the pre-rerank count as a dedicated `rawCount: number` field on the
+  internal `PgvectorSourceResult`, captured BEFORE `rerankPgvectorResults`
+  runs. `rerankedCount` continues to reflect the post-truncation final
+  size, so operators can compute pruning = `rawCount − rerankedCount`.
+
+### Test coverage
+
+- 56 pre-existing tests preserved (no behavioral regression on legacy
+  paths).
+- 133 new tests covering: Jina client error mapping (incl. body-stall
+  abort regression), `summarizeJinaError` privacy contract, classifier
+  defensive parsing across 4 known response shapes, reranker defensive
+  parsing, router heuristics across triggers / meta-regex / CLI / keyword
+  fast-paths (incl. business-status false-positive regression), router
+  orchestration in all fail-open scenarios incl. heuristic preservation
+  during classifier cooldown, route projection onto enabled sources,
+  pgvector reranker integration, turn-metadata tracing via SDK runId
+  (regression-pinned: no query content, no hash, in logs).
+- Total: 189 tests, all green.
+
 ### TODO — full migration to `kind: "context-engine"` (deferred)
 
 The OpenClaw doctor classifies the current `before_prompt_build`-only
@@ -208,7 +470,8 @@ For instance owners on `@lacneu/openclaw-knowledge@3.1.0` or `3.1.1`:
 - Release workflow: creates GitHub Release with tarball on tag push.
 - Architecture, lifecycle, and sequence diagrams in `schemas/`.
 
-[Unreleased]: https://github.com/OlivierNeu/openclaw-knowledge-plugin/compare/v3.1.0...HEAD
+[Unreleased]: https://github.com/OlivierNeu/openclaw-knowledge-plugin/compare/v3.2.0...HEAD
+[3.2.0]: https://github.com/OlivierNeu/openclaw-knowledge-plugin/compare/v3.1.2...v3.2.0
 [3.1.0]: https://github.com/OlivierNeu/openclaw-knowledge-plugin/compare/v1.2.0...v3.1.0
 [1.2.0]: https://github.com/OlivierNeu/openclaw-knowledge-plugin/compare/v1.1.2...v1.2.0
 [1.1.2]: https://github.com/OlivierNeu/openclaw-knowledge-plugin/compare/v1.1.1...v1.1.2

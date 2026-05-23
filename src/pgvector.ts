@@ -4,7 +4,14 @@
 // `halfvec(3072)` because pgvector's HNSW implementation caps at 2000 dims
 // for the native `vector` type. Both the column cast and the query parameter
 // cast must match, otherwise the planner falls back to a sequential scan.
+//
+// As of v3.2.0, results from `searchCollection` may optionally be re-ordered
+// by a Jina cross-encoder reranker (see `rerankPgvectorResults`). The vector
+// search remains the recall stage; the reranker is the precision stage.
 
+import { rerank } from "./jina/reranker.js";
+import { JinaError } from "./jina/errors.js";
+import type { RerankerModel } from "./jina/types.js";
 import type { PgPoolLike, PgvectorResult, PgvectorRow } from "./types.js";
 
 const SEARCH_SQL = `SELECT file_name, mime_type, text, file_id, source, owner,
@@ -96,4 +103,84 @@ export function formatPgvectorResults(
   }
 
   return output;
+}
+
+// ---------------------------------------------------------------------------
+// Reranker integration (v3.2.0)
+// ---------------------------------------------------------------------------
+
+export interface RerankPgvectorParams {
+  apiKey: string;
+  query: string;
+  model?: RerankerModel;
+  /** Cap on the number of results returned post-rerank. */
+  topN?: number;
+  timeoutMs?: number;
+  signal?: AbortSignal;
+}
+
+/**
+ * Re-order `results` using the Jina cross-encoder reranker.
+ *
+ * This is the precision stage on top of pgvector's recall: the cosine pass
+ * grabs ~20 coarse candidates, the reranker promotes the ones that actually
+ * match the user's intent.
+ *
+ * Contract:
+ * - On success, returns at most `topN` items in descending relevance order.
+ *   The original cosine `score` is **preserved** on each item; the reranker
+ *   produces its own score we expose via the log event, not in the
+ *   PgvectorResult.
+ * - On any error (including auth / rate limit), throws a `JinaError`. The
+ *   caller is responsible for falling back to the original cosine order —
+ *   we do NOT swallow here because the caller wants to track the failure
+ *   for the cooldown breaker.
+ * - On empty input, returns `[]` without hitting the network.
+ */
+export async function rerankPgvectorResults(
+  results: PgvectorResult[],
+  params: RerankPgvectorParams,
+): Promise<PgvectorResult[]> {
+  if (results.length === 0) return [];
+
+  // The reranker only sees the textual content. Empty/null texts cannot be
+  // ranked, so we filter them out BEFORE the API call to avoid wasting
+  // tokens on rows the cross-encoder can't score anyway.
+  const indexed = results
+    .map((r, i) => ({ row: r, originalIndex: i, text: r.text ?? "" }))
+    .filter((x) => x.text.trim().length > 0);
+
+  if (indexed.length === 0) return results.slice(0, params.topN ?? results.length);
+
+  try {
+    const reranked = await rerank({
+      apiKey: params.apiKey,
+      query: params.query,
+      documents: indexed.map((x) => x.text),
+      model: params.model,
+      topN: params.topN,
+      timeoutMs: params.timeoutMs,
+      signal: params.signal,
+    });
+
+    if (reranked.length === 0) {
+      // Defensive: reranker returned no usable items. Surface the original
+      // cosine order rather than wiping the candidate list.
+      return results.slice(0, params.topN ?? results.length);
+    }
+
+    // Map back to PgvectorResult using the reranker's `index` (which points
+    // into our filtered `indexed` array, NOT the original `results` array).
+    const out: PgvectorResult[] = [];
+    for (const item of reranked) {
+      const found = indexed[item.index];
+      if (found) out.push(found.row);
+    }
+    return out;
+  } catch (err) {
+    // Re-throw only if it's a Jina error the caller will recognize. Any
+    // other failure (programmer error) propagates as-is.
+    if (err instanceof JinaError) throw err;
+    throw err;
+  }
 }
