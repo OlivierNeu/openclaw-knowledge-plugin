@@ -189,13 +189,16 @@ export interface PgvectorRow {
 
 /**
  * Shape of the `before_prompt_build` event payload as consumed by this plugin.
- * We only rely on `messages`; the SDK may add other fields that we ignore.
  *
- * The full SDK type also exposes `prompt: string` (the raw user text). The
- * handler keeps using `extractQueryFromMessages` to stay compatible with the
- * existing tests; `prompt` is left to the SDK without being read here.
+ * As of v3.2.1, `prompt` is the PRIMARY source for the user query — it is
+ * the raw user text surfaced by the SDK, distinct from `messages` which may
+ * aggregate the full conversation window (with summaries, system prompt
+ * fragments, etc.). The handler reads `prompt` first; `messages` remains
+ * as a legacy fallback for SDK versions that do not populate it.
  */
 export interface BeforePromptBuildEvent {
+  /** Raw user prompt for this turn. SDK >= 2026.5.0. */
+  prompt?: string;
   messages?: PromptMessage[];
 }
 

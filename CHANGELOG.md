@@ -7,6 +7,109 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.2.1] - 2026-05-23
+
+### Fixed — router and reranker received the aggregated context, not the user query
+
+In 3.2.0, the hook handler called `extractQueryFromMessages(event.messages)`
+to obtain the user query that drove routing decisions and reranker calls.
+Empirical observation in production (Opik trace
+`019e565a-806b-...`) showed that on a real CLI turn with a 146-char user
+prompt (`"Sender (untrusted metadata)...\n[Sat 2026-05-23 15:40 EDT] Quel
+est la version du plugin knowledge ?"`), the `messages[last].content`
+slot reached **23 893 chars** — OpenClaw 2026.5.x aggregates the
+conversation window plus framing in there for LLM consumption.
+
+Effect: the heuristic router (keyword matching, CLI-trivial regex,
+meta-agent regex) ran against ~24 KB of accumulated context instead of
+the 50-char user utterance. Matches fired effectively at random and the
+router decisions became uncorrelated with the actual question. The
+Jina classifier, when active, embedded a 24 KB blob for every turn —
+needlessly expensive and noisy.
+
+The SDK exposes the raw user prompt directly via `event.prompt`
+(`PluginHookBeforePromptBuildEvent.prompt`, SDK >= 2026.5.0). The fix
+reads `event.prompt` first, strips the OpenClaw envelope (sender
+metadata + `[Day YYYY-MM-DD HH:MM TZ]` marker) via the new
+`stripOpenClawHeaders()` helper, and falls back to the legacy
+`extractQueryFromMessages` path only when `event.prompt` is absent.
+
+Two new exported helpers (`extractUserQuery`, `stripOpenClawHeaders`)
+cover the extraction logic and are unit-tested with 13 cases including
+the exact 24 KB regression scenario.
+
+### Migration
+
+Drop-in patch — no config change required. `update` the plugin and
+restart the gateway:
+
+```bash
+sudo docker exec openclaw-jerome openclaw plugins update @lacneu/openclaw-knowledge
+sudo docker exec openclaw-olivier openclaw plugins update @lacneu/openclaw-knowledge
+sudo docker restart openclaw-jerome openclaw-olivier
+```
+
+After the restart, `[knowledge.event]` logs should show `queryLength`
+in the tens-to-hundreds range on normal CLI turns (down from
+~24 000 in 3.2.0).
+
+### Envelope-stripping contract
+
+The OpenClaw envelope produced by `event.prompt` follows this grammar:
+
+```
+( <header> "(" ("untrusted"|"metadata") <variant> "):" \n ``` <body> ``` \n+ ){0,8}
+( [ <day> YYYY-MM-DD HH:MM[:SS] <tz> ] )?
+<user utterance>
+( <header> "(" ("untrusted"|"metadata") <variant> "):" <anything>  EOF )?
+```
+
+The trailing suffix's body can be a fenced code block OR raw lines
+(e.g. `<<<EXTERNAL_UNTRUSTED_CONTENT` / `Source:` markers). We anchor
+on the header line only and drop everything after it.
+
+`stripOpenClawHeaders` matches this shape anchored at the start:
+
+- ZERO to EIGHT inbound-context blocks whose header contains any
+  `(untrusted …)` sentinel — covers the six SDK-known sentinels
+  (`Sender`, `Conversation info`, `Thread starter`, `Replied message`,
+  `Forwarded message context`, `Chat history since last reply`) plus
+  headroom for future additions.
+- An OPTIONAL timestamp marker that can appear EITHER before OR after
+  the metadata blocks. Both `block+ ts?` (legacy CLI path) and
+  `ts blocks+` (timestamp-first injection path) are accepted because
+  production traces show the SDK emits both orderings. CLI turns
+  include the marker; webchat / Telegram channels can embed the
+  timestamp inside the `Conversation info` JSON instead. When present,
+  the TZ suffix is permissive (`[^\]\n]+`) so it accepts named
+  abbreviations (`EDT`, `UTC`, …) AND `Intl.DateTimeFormat` offsets
+  (`GMT+2`, `GMT+5:30`, `UTC-5`).
+- The leading anchor preserves user content that itself contains
+  timestamp-shaped substrings (e.g. a pasted log excerpt).
+- The hard cap of `MAX_ENVELOPE_BLOCKS + 2` iterations bounds the
+  regex engine's worst-case cost on malformed input.
+
+`extractUserQuery` is authoritative on `event.prompt`: when the SDK
+supplies it, the result of `stripOpenClawHeaders` is returned as-is,
+even when empty. The legacy `extractQueryFromMessages(event.messages)`
+fallback is only taken when `event.prompt` is `undefined` (older SDK).
+Downstream `MIN_QUERY_LENGTH` drops empty results, so the
+present-but-empty case is safe.
+
+### Test coverage
+
+- Total: 223 tests, all green.
+- 34 tests in `test/extract-query.test.ts` covering both helpers,
+  including the v3.2.0 regression scenario (146-char prompt vs 24 KB
+  messages aggregate), the Codex pass #7 regression (empty-stripped
+  prompt MUST NOT fall back to the messages aggregate), the Codex
+  pass #8 regression (inner timestamp in user content MUST NOT trigger
+  stripping), the Codex pass #9 regression (multiple stacked metadata
+  blocks before the marker MUST all be stripped), the Codex pass #10
+  regression (`(untrusted, for context)` sentinel + GMT/UTC offset TZ
+  formats), and the Codex pass #24 regression (timestamp-first envelope
+  ordering: `[Sat …] Sender (untrusted metadata): … user query`).
+
 ## [3.2.0] - 2026-05-23
 
 ### Added — Jina-powered router (`jina.router.*`)
@@ -470,7 +573,8 @@ For instance owners on `@lacneu/openclaw-knowledge@3.1.0` or `3.1.1`:
 - Release workflow: creates GitHub Release with tarball on tag push.
 - Architecture, lifecycle, and sequence diagrams in `schemas/`.
 
-[Unreleased]: https://github.com/OlivierNeu/openclaw-knowledge-plugin/compare/v3.2.0...HEAD
+[Unreleased]: https://github.com/OlivierNeu/openclaw-knowledge-plugin/compare/v3.2.1...HEAD
+[3.2.1]: https://github.com/OlivierNeu/openclaw-knowledge-plugin/compare/v3.2.0...v3.2.1
 [3.2.0]: https://github.com/OlivierNeu/openclaw-knowledge-plugin/compare/v3.1.2...v3.2.0
 [3.1.0]: https://github.com/OlivierNeu/openclaw-knowledge-plugin/compare/v1.2.0...v3.1.0
 [1.2.0]: https://github.com/OlivierNeu/openclaw-knowledge-plugin/compare/v1.1.2...v1.2.0
