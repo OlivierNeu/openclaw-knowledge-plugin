@@ -10,6 +10,11 @@ const BASE_CFG: RouterConfig = {
   enabled: true,
   mode: "jina-classifier",
   jinaApiKey: "jina_test",
+  // Default to a permissive threshold so the existing tests (which mock
+  // confident classifier scores ≥ 0.8) keep validating the classifier_hit
+  // path. The low-confidence guard is exercised explicitly by its own
+  // describe block below.
+  minConfidence: 0,
 };
 
 describe("decideRoute — disabled router", () => {
@@ -172,6 +177,238 @@ describe("decideRoute — Jina classifier success", () => {
     assert.equal(d.route, "ALL");
     assert.equal(d.reason, "classifier_fallback");
     assert.equal(d.score, null);
+  });
+});
+
+describe("decideRoute — low-confidence guard", () => {
+  afterEach(() => mock.restoreAll());
+
+  // The threshold used across this block matches the production default
+  // (`DEFAULT_ROUTER_MIN_CONFIDENCE = 0.35`). Tests pin the boundary
+  // semantics so a future tuning change is intentional and visible.
+  const THRESHOLD = 0.35;
+
+  it("falls back to ALL with classifier_low_confidence when score < minConfidence", async () => {
+    // Regression scenario observed on jerome (2026-05-23):
+    //   Query: "Quel est l'arbitrage principal de la réunion hebdomadaire
+    //           Ataraxis du 19 mai 2026 ?"
+    //   Classifier returned NONE @ 0.25 (noise floor — no real match),
+    //   the router trusted it and silently blocked RAG retrieval.
+    // With minConfidence=0.35 the router MUST fail open instead.
+    const NOISE_SCORE = 0.25;
+    mock.method(globalThis, "fetch", async () =>
+      new Response(
+        JSON.stringify({
+          data: [
+            {
+              predictions: [
+                {
+                  label:
+                    "NONE: meta-question about the agent itself, session identifier, system test, simple greeting, weather, or trivial smalltalk that does not depend on the knowledge base",
+                  score: NOISE_SCORE,
+                },
+              ],
+            },
+          ],
+        }),
+        { status: 200 },
+      ),
+    );
+
+    const d = await decideRoute(
+      { ...BASE_CFG, minConfidence: THRESHOLD },
+      {
+        query:
+          "Quel est l'arbitrage principal de la réunion hebdomadaire Ataraxis du 19 mai 2026 ?",
+      },
+    );
+    assert.equal(d.route, "ALL");
+    assert.equal(d.reason, "classifier_low_confidence");
+    assert.equal(d.score, NOISE_SCORE);
+  });
+
+  it("keeps classifier_hit when score === minConfidence (>= passes)", async () => {
+    // Exact-boundary score: the guard rejects only STRICTLY-lower scores.
+    // Pinning the inclusive boundary keeps tuning predictable.
+    mock.method(globalThis, "fetch", async () =>
+      new Response(
+        JSON.stringify({
+          data: [
+            {
+              predictions: [
+                {
+                  label:
+                    "LIGHTRAG_ONLY: knowledge graph question about entities and their relationships — which client, which coach, which mission, which programme links to which livrable",
+                  score: THRESHOLD,
+                },
+              ],
+            },
+          ],
+        }),
+        { status: 200 },
+      ),
+    );
+
+    const d = await decideRoute(
+      { ...BASE_CFG, minConfidence: THRESHOLD },
+      { query: "raconte-moi l'historique de la mission ABC" },
+    );
+    assert.equal(d.route, "LIGHTRAG_ONLY");
+    assert.equal(d.reason, "classifier_hit");
+    assert.equal(d.score, THRESHOLD);
+  });
+
+  it("keeps classifier_hit when score > minConfidence (clear match)", async () => {
+    mock.method(globalThis, "fetch", async () =>
+      new Response(
+        JSON.stringify({
+          data: [
+            {
+              predictions: [
+                {
+                  label:
+                    "PGVECTOR_ONLY: factual lookup that can be answered by a single document excerpt — version numbers, file names, dates, configuration values, raw quotes",
+                  score: 0.62,
+                },
+              ],
+            },
+          ],
+        }),
+        { status: 200 },
+      ),
+    );
+
+    const d = await decideRoute(
+      { ...BASE_CFG, minConfidence: THRESHOLD },
+      // Query deliberately ambiguous — avoids the heuristic keyword
+      // fast-paths so the classifier path is actually exercised.
+      { query: "rappelle-moi le contenu de ce paragraphe" },
+    );
+    assert.equal(d.route, "PGVECTOR_ONLY");
+    assert.equal(d.reason, "classifier_hit");
+    assert.equal(d.score, 0.62);
+  });
+
+  it("applies the guard to few-shot classifiers too", async () => {
+    // A trained classifier can also return low-confidence predictions
+    // (drift, distribution shift, etc.). The guard MUST apply uniformly
+    // to both classifier paths.
+    mock.method(globalThis, "fetch", async () =>
+      new Response(
+        JSON.stringify({ results: [{ label: "NONE", score: 0.20 }] }),
+        { status: 200 },
+      ),
+    );
+
+    const d = await decideRoute(
+      { ...BASE_CFG, minConfidence: THRESHOLD, classifierId: "openclaw-router-v1" },
+      // Query deliberately ambiguous — bypasses the heuristic keyword
+      // short-circuits so the few-shot classifier path is exercised.
+      { query: "rappelle-moi ce qu'on a fait hier" },
+    );
+    assert.equal(d.route, "ALL");
+    assert.equal(d.reason, "classifier_low_confidence");
+    assert.equal(d.score, 0.20);
+  });
+
+  it("applies DEFAULT_MIN_CONFIDENCE when minConfidence is omitted (public-API safety)", async () => {
+    // Codex pass #25 P2: a JS caller using the public export and
+    // omitting the new `minConfidence` field would previously bypass
+    // the guard (because `score < undefined` is `false` in JS).
+    // `decideRoute` now defaults to `DEFAULT_MIN_CONFIDENCE` at
+    // function entry so the guard kicks in regardless.
+    mock.method(globalThis, "fetch", async () =>
+      new Response(
+        JSON.stringify({
+          data: [
+            {
+              predictions: [
+                {
+                  label:
+                    "NONE: meta-question about the agent itself, session identifier, system test, simple greeting, weather, or trivial smalltalk that does not depend on the knowledge base",
+                  score: 0.25, // production noise-floor score
+                },
+              ],
+            },
+          ],
+        }),
+        { status: 200 },
+      ),
+    );
+
+    // Spread BASE_CFG MINUS minConfidence to simulate the legacy caller.
+    const { minConfidence: _omitted, ...legacyCfg } = BASE_CFG;
+    void _omitted;
+    const d = await decideRoute(
+      legacyCfg as RouterConfig,
+      { query: "rappelle-moi ce qu'on a fait hier" },
+    );
+    assert.equal(d.route, "ALL");
+    assert.equal(d.reason, "classifier_low_confidence");
+    assert.equal(d.score, 0.25);
+  });
+
+  it("clamps a misconfigured negative minConfidence into [0, 1] (defense-in-depth)", async () => {
+    // A negative threshold would make every score >= threshold, defeating
+    // the guard. The function clamps the value at entry so the guard
+    // semantics stay sane even when the config schema is bypassed.
+    mock.method(globalThis, "fetch", async () =>
+      new Response(
+        JSON.stringify({
+          data: [
+            {
+              predictions: [
+                {
+                  label:
+                    "PGVECTOR_ONLY: factual lookup that can be answered by a single document excerpt — version numbers, file names, dates, configuration values, raw quotes",
+                  score: 0.5,
+                },
+              ],
+            },
+          ],
+        }),
+        { status: 200 },
+      ),
+    );
+
+    const d = await decideRoute(
+      { ...BASE_CFG, minConfidence: -1 },
+      { query: "rappelle-moi le contenu de ce paragraphe" },
+    );
+    // Clamped to 0 → every positive score passes the guard.
+    assert.equal(d.route, "PGVECTOR_ONLY");
+    assert.equal(d.reason, "classifier_hit");
+  });
+
+  it("with minConfidence=0 acts on every confident-or-not prediction (legacy behavior)", async () => {
+    // Pin the escape hatch: setting minConfidence=0 disables the guard
+    // and reproduces the pre-3.2.2 behavior. Useful for evaluation runs.
+    mock.method(globalThis, "fetch", async () =>
+      new Response(
+        JSON.stringify({
+          data: [
+            {
+              predictions: [
+                {
+                  label:
+                    "NONE: meta-question about the agent itself, session identifier, system test, simple greeting, weather, or trivial smalltalk that does not depend on the knowledge base",
+                  score: 0.001,
+                },
+              ],
+            },
+          ],
+        }),
+        { status: 200 },
+      ),
+    );
+
+    const d = await decideRoute(
+      { ...BASE_CFG, minConfidence: 0 },
+      { query: "ambiguous query" },
+    );
+    assert.equal(d.route, "NONE");
+    assert.equal(d.reason, "classifier_hit");
+    assert.equal(d.score, 0.001);
   });
 });
 

@@ -7,6 +7,110 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.2.2] - 2026-05-23
+
+### Fixed — Jina classifier silently blocked retrieval on low-confidence scores
+
+After v3.2.1 fixed query extraction, jerome's production traces showed
+that 6 out of 8 user turns ended up with `route=NONE` from
+`reason=classifier_hit` with scores tightly clustered around **0.25**:
+
+```
+0.2540  0.2559  0.2642  0.2507  0.2630  0.2516
+```
+
+This pattern is the Jina v3 zero-shot **noise floor** — when no label
+actually matches the query, the engine still picks the closest one (most
+often `NONE` because its label happens to be embedded first), but the
+decision is essentially random. The previous router code trusted any
+prediction regardless of score, so the classifier silently blocked
+retrieval on legitimate questions.
+
+Confirmed regression scenario, from a real chat-export on 2026-05-23:
+
+> Query: `"Quel est l'arbitrage principal de la réunion hebdomadaire
+>         Ataraxis du 19 mai 2026 ?"`
+> Classifier: `NONE @ 0.25` → router blocked the RAG.
+> The agent then recovered via the `gworkspace-search` skill, but the
+> RAG never contributed and the turn took 43 s + 5 tool calls instead
+> of one direct injection.
+
+### Low-confidence guard
+
+`decideRoute` now requires the classifier score to clear a configurable
+`minConfidence` threshold (default `0.35`). Below the floor, the router
+fails open to `ALL` with reason `classifier_low_confidence`. A `null`
+score (Jina omitted the field) also triggers the fallback — we cannot
+prove confidence.
+
+Why `0.35`:
+- Observed noise floor: 0.25–0.27 across all six false `NONE` hits.
+- Observed real hits: typically 0.40–0.65 on Jina v3 zero-shot with
+  the descriptive built-in labels.
+- A 0.35 floor catches the noise band without rejecting clear matches.
+
+The threshold is exposed at:
+- `RouterConfig.minConfidence` (internal API)
+- `RouterPluginConfig.minConfidence` (user config, `[0, 1]`)
+- `ResolvedKnowledgeConfig.routerMinConfidence` (resolved + clamped)
+- `jina.router.minConfidence` in `openclaw.plugin.json` config schema
+
+`resolveConfig` clamps the resolved value into `[0, 1]` defensively;
+non-finite inputs collapse to `0` (the legacy / pre-3.2.2 behavior).
+
+### Logging discrimination
+
+`RouterReason` adds `classifier_low_confidence` so dashboards can tell
+"the classifier confidently said NONE" from "the classifier had no
+signal at all". Both flow into the same fail-open route (`ALL`), but
+the distinction matters when tuning labels or training a few-shot
+classifier — only `classifier_low_confidence` should drive label work.
+
+### Migration
+
+Drop-in patch. No config change required to activate the floor — the
+default takes effect immediately. To recover the pre-3.2.2 behavior
+explicitly (e.g. for an evaluation A/B), set
+`jina.router.minConfidence: 0` via `openclaw config set`.
+
+```bash
+sudo docker exec openclaw-jerome openclaw plugins update @lacneu/openclaw-knowledge
+sudo docker exec openclaw-olivier openclaw plugins update @lacneu/openclaw-knowledge
+sudo docker restart openclaw-jerome openclaw-olivier
+```
+
+After restart, watch the `[knowledge.event]` router lines: previously
+all-`NONE` low-confidence noise should turn into `route=ALL`,
+`reason=classifier_low_confidence`. Counts of true `classifier_hit`
+decisions stay unchanged (high-confidence scores still pass through).
+
+### Public-API safety (Codex pass #25)
+
+`decideRoute` now applies the default + clamp **at function entry**
+rather than relying on the caller. Previously, a legacy JS plugin
+using the public export `decideRoute` without supplying the new
+`minConfidence` field would have silently bypassed the guard
+(`score < undefined` is `false` in JS, so every prediction would have
+been treated as confident). The interface field is now declared
+optional, and the function defaults to `DEFAULT_MIN_CONFIDENCE` (also
+exported for callers who want to read the floor explicitly).
+
+The clamp helper inside `decideRoute` also defends against misconfigured
+negative thresholds — a negative value would have made every score
+clear the floor, defeating the guard.
+
+### Test coverage
+
+- Total: 232 tests, all green (was 223 in 3.2.1; +9 new).
+- 7 new tests in `test/router/router.test.ts` covering the Ataraxis
+  regression scenario, the exact boundary (`score === minConfidence`
+  passes), a clear-match scenario above threshold, the few-shot path,
+  the `minConfidence=0` escape hatch, the public-API safety case
+  (Codex #25 regression — omitted field still triggers the guard),
+  and the negative-value clamp.
+- 2 new tests in `test/config.test.ts` covering the default value
+  (`0.35`), override, and `[0, 1]` clamping with non-finite inputs.
+
 ## [3.2.1] - 2026-05-23
 
 ### Fixed — router and reranker received the aggregated context, not the user query

@@ -96,9 +96,40 @@ describe("resolveConfig — Jina nested block (v3.2.0)", () => {
     assert.equal(cfg.routerEnabled, false);
     assert.equal(cfg.routerMode, "heuristic");
     assert.equal(cfg.routerClassifierId, "");
+    assert.equal(cfg.routerMinConfidence, 0.35);
     assert.equal(cfg.pgvectorRerankerEnabled, false);
     assert.equal(cfg.pgvectorRerankerModel, "jina-reranker-v2-base-multilingual");
     assert.equal(cfg.pgvectorRerankerTopN, 5);
+  });
+
+  it("honors router.minConfidence override", () => {
+    const cfg = resolveConfig({
+      jina: { apiKey: "k", router: { enabled: true, minConfidence: 0.5 } },
+    });
+    assert.equal(cfg.routerMinConfidence, 0.5);
+  });
+
+  it("clamps router.minConfidence into [0, 1] and rejects non-finite values", () => {
+    // The JSON schema enforces this bound for well-formed configs, but
+    // we clamp defensively to avoid a misconfigured value breaking the
+    // classifier comparison silently. Pin the contract in tests.
+    assert.equal(
+      resolveConfig({ jina: { router: { minConfidence: -0.3 } } }).routerMinConfidence,
+      0,
+    );
+    assert.equal(
+      resolveConfig({ jina: { router: { minConfidence: 1.7 } } }).routerMinConfidence,
+      1,
+    );
+    assert.equal(
+      resolveConfig({ jina: { router: { minConfidence: Number.NaN } } }).routerMinConfidence,
+      0,
+    );
+    assert.equal(
+      resolveConfig({ jina: { router: { minConfidence: Number.POSITIVE_INFINITY } } })
+        .routerMinConfidence,
+      0,
+    );
   });
 
   it("substitutes ${ENV} in jina.apiKey", () => {

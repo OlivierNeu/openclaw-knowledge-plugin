@@ -40,6 +40,39 @@ export interface RouterConfig {
   labels?: readonly string[];
   /** Triggers that bypass retrieval (subset of NON_USER_TRIGGERS). */
   skipTriggers?: readonly string[];
+  /**
+   * Minimum classifier confidence (cosine similarity in `[0, 1]`) required
+   * to trust a classifier prediction. When `outcome.score` is below this
+   * threshold, the router fails open to `ALL` with reason
+   * `"classifier_low_confidence"` rather than acting on a noisy decision.
+   *
+   * Optional in the public interface so external JS callers that pre-date
+   * v3.2.2 still benefit from the guard via {@link DEFAULT_MIN_CONFIDENCE}.
+   * The internal call site in `src/index.ts` always passes a resolved,
+   * clamped value (see `ResolvedKnowledgeConfig.routerMinConfidence`).
+   *
+   * Rationale: Jina v3 zero-shot scores cluster around 0.25 when none of
+   * the labels actually match the query. Acting on those quasi-random
+   * predictions (especially `NONE`) silently blocks legitimate retrieval.
+   * Trusting only confident scores keeps the gate fail-safe.
+   */
+  minConfidence?: number;
+}
+
+/**
+ * Default applied by {@link decideRoute} when a caller omits
+ * `minConfidence` (e.g. older JS plugins that haven't migrated to the
+ * 3.2.2 shape). Matches the production default in `src/config.ts` —
+ * keep both constants in sync.
+ */
+export const DEFAULT_MIN_CONFIDENCE = 0.35;
+
+/** Clamp a finite number into `[0, 1]`. Non-finite values fall back to `0`. */
+function clampConfidence(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  if (value < 0) return 0;
+  if (value > 1) return 1;
+  return value;
 }
 
 export interface RouterRuntimeContext {
@@ -63,6 +96,11 @@ export async function decideRoute(
   cfg: RouterConfig,
   ctx: RouterRuntimeContext,
 ): Promise<RouterDecision> {
+  // Normalize the confidence threshold once at function entry so the
+  // low-confidence guard applies uniformly to every caller, including
+  // external JS plugins that may pass an undefined / out-of-range value.
+  const minConfidence = clampConfidence(cfg.minConfidence ?? DEFAULT_MIN_CONFIDENCE);
+
   // 0. Disabled → preserve legacy behavior.
   if (!cfg.enabled) {
     return { route: "ALL", reason: "router_disabled", score: null };
@@ -118,6 +156,20 @@ export async function decideRoute(
 
     if (!isKnownRoute(routeName)) {
       return { route: FALLBACK, reason: "classifier_fallback", score: outcome.score };
+    }
+
+    // Low-confidence guard: a classifier score below `minConfidence`
+    // means none of the labels actually matched the query (the engine
+    // just picked the least-bad one). Trusting it would silently block
+    // retrieval on legitimate questions. Fail open and log the score.
+    // A `null` score also fails open: when Jina omits the score field
+    // we cannot prove the prediction is confident.
+    if (outcome.score === null || outcome.score < minConfidence) {
+      return {
+        route: FALLBACK,
+        reason: "classifier_low_confidence",
+        score: outcome.score,
+      };
     }
 
     return {

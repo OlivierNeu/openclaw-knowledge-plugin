@@ -79,6 +79,13 @@ export interface RouterPluginConfig {
    * `POST /v1/train` — the plugin does NOT implement training.
    */
   classifierId?: string;
+  /**
+   * Minimum classifier confidence (cosine similarity in `[0, 1]`) required
+   * to trust a classifier prediction. When the top score is below this
+   * threshold, the router fails open to `ALL` rather than acting on a
+   * noisy decision. Default: `0.35`.
+   */
+  minConfidence?: number;
 }
 
 export interface PgvectorRerankerPluginConfig {
@@ -125,6 +132,12 @@ export interface ResolvedKnowledgeConfig {
   routerEnabled: boolean;
   routerMode: "heuristic" | "jina-classifier";
   routerClassifierId: string;
+  /**
+   * Minimum classifier confidence (cosine similarity in `[0, 1]`) required
+   * to act on a classifier prediction. Below this threshold the router
+   * fails open to `ALL`. See `RouterConfig.minConfidence` for rationale.
+   */
+  routerMinConfidence: number;
 
   // Pgvector reranker
   pgvectorRerankerEnabled: boolean;

@@ -4,6 +4,7 @@
 // rest of the plugin easy to test with deterministic values.
 
 import type { RerankerModel } from "./jina/types.js";
+import { DEFAULT_MIN_CONFIDENCE } from "./router/index.js";
 import type {
   JinaPluginConfig,
   KnowledgePluginConfig,
@@ -26,6 +27,14 @@ export function resolveEnv<T>(value: T): T {
   }) as unknown as T;
 }
 
+/** Clamp a finite number into `[0, 1]`. Non-finite values fall back to `0`. */
+function clamp01(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  if (value < 0) return 0;
+  if (value > 1) return 1;
+  return value;
+}
+
 const DEFAULT_POSTGRES_URL = "postgresql://openclaw:@postgresql:5432/knowledge";
 const DEFAULT_COLLECTIONS = ["knowledge_default"];
 const DEFAULT_TOP_K = 5;
@@ -35,6 +44,15 @@ const DEFAULT_LIGHTRAG_MODE: LightRAGQueryMode = "hybrid";
 const DEFAULT_LIGHTRAG_MAX_CHARS = 4000;
 
 const DEFAULT_ROUTER_MODE: "heuristic" | "jina-classifier" = "heuristic";
+// The router's confidence floor is owned by `src/router/index.ts`
+// (`DEFAULT_MIN_CONFIDENCE`). Re-export of a local alias would create
+// two sources of truth — we import the single constant instead.
+//
+// Empirical observation on jerome's traces (v3.2.1 deployment): Jina v3
+// zero-shot scores cluster at 0.25-0.27 when no label actually matches
+// the query, then resolve to a noisy `NONE` decision that wrongly
+// blocks retrieval. A floor of 0.35 catches that noise band while
+// staying below typical hit scores (≈ 0.40-0.65).
 const DEFAULT_RERANKER_MODEL: RerankerModel = "jina-reranker-v2-base-multilingual";
 const DEFAULT_RERANKER_TOP_N = 5;
 
@@ -85,6 +103,11 @@ export function resolveConfig(
     routerEnabled: router.enabled === true,
     routerMode: router.mode ?? DEFAULT_ROUTER_MODE,
     routerClassifierId,
+    // Clamp to [0, 1] to keep the classifier comparison well-defined
+    // even when a misconfigured value sneaks past the JSON schema.
+    routerMinConfidence: clamp01(
+      router.minConfidence ?? DEFAULT_MIN_CONFIDENCE,
+    ),
 
     // Pgvector reranker — disabled by default. Requires both the toggle
     // and a Jina key to actually activate at runtime (the handler checks

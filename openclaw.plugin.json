@@ -2,7 +2,7 @@
   "id": "openclaw-knowledge",
   "name": "Knowledge Base",
   "description": "Multi-source knowledge search (pgvector + LightRAG) with optional Jina-powered router & reranker — injects relevant documents and knowledge graph context before each turn via the before_prompt_build hook",
-  "version": "3.2.1",
+  "version": "3.2.2",
   "activation": {
     "onStartup": true
   },
@@ -105,6 +105,13 @@
               "classifierId": {
                 "type": "string",
                 "description": "Optional pre-trained Jina classifier_id (few-shot mode). Train it out-of-band via POST /v1/train then paste the ID here. When omitted, the router uses zero-shot with built-in labels."
+              },
+              "minConfidence": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1,
+                "default": 0.35,
+                "description": "Minimum classifier confidence (cosine similarity 0–1) required to trust a classifier prediction. Scores below this floor fail open to ALL with reason classifier_low_confidence. Default 0.35 — observed noise floor on Jina v3 zero-shot when no label matches."
               }
             }
           },
@@ -225,6 +232,11 @@
       "label": "Few-shot classifier ID",
       "advanced": true,
       "help": "Optional. When set, the router uses your pre-trained classifier instead of zero-shot labels."
+    },
+    "jina.router.minConfidence": {
+      "label": "Classifier min confidence",
+      "advanced": true,
+      "help": "Floor on classifier score (0–1). Below this, the router falls back to ALL. Default 0.35 — keeps NONE decisions safe when zero-shot signal is too weak."
     },
     "jina.pgvectorReranker.enabled": {
       "label": "Enable pgvector reranker",

@@ -27,9 +27,10 @@ export type RouterReason =
   | "heuristic_meta"       // skipped by meta-question regex
   | "heuristic_short"      // skipped by short-CLI rule
   | "heuristic_keyword"    // routed by keyword match
-  | "classifier_hit"       // classifier picked a route
-  | "classifier_fallback"  // classifier returned null → ALL
-  | "classifier_error";    // classifier threw / network → ALL
+  | "classifier_hit"             // classifier picked a route with confidence ≥ threshold
+  | "classifier_low_confidence"  // classifier score below minConfidence → ALL
+  | "classifier_fallback"        // classifier returned null → ALL
+  | "classifier_error";          // classifier threw / network → ALL
 
 export interface RouterDecision {
   route: Route;

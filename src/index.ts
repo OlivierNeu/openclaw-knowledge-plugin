@@ -337,6 +337,7 @@ async function runRouterWithCooldown(
         mode: effectiveMode,
         jinaApiKey: config.jinaApiKey,
         classifierId: config.routerClassifierId || undefined,
+        minConfidence: config.routerMinConfidence,
       },
       {
         query,
