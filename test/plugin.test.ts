@@ -862,3 +862,400 @@ describe("before_prompt_build — regression: exclusive route on single-source d
     assert.equal(fetchCalled, false);
   });
 });
+
+// ---------------------------------------------------------------------------
+// v3.2.3 observability events
+// ---------------------------------------------------------------------------
+
+/** Extract `[knowledge.event]` JSON payloads from a `state.infos` array. */
+function eventsByType<T extends string>(infos: string[], type: T): Record<string, unknown>[] {
+  const out: Record<string, unknown>[] = [];
+  for (const line of infos) {
+    const idx = line.indexOf("[knowledge.event] ");
+    if (idx === -1) continue;
+    try {
+      const json = line.slice(idx + "[knowledge.event] ".length);
+      const evt = JSON.parse(json) as Record<string, unknown>;
+      if (evt.type === type) out.push(evt);
+    } catch {
+      // skip malformed line (test diagnostics noise)
+    }
+  }
+  return out;
+}
+
+describe("before_prompt_build — v3.2.3 observability", () => {
+  afterEach(() => mock.restoreAll());
+
+  it("emits a sparse:false LightRAG event when context is substantial", async () => {
+    const { api, state } = makeFakeApi({
+      lightragUrl: "http://lightrag:9621",
+    });
+
+    mock.method(globalThis, "fetch", async () => ({
+      ok: true,
+      json: async () => ({
+        response:
+          "Entity: ACME Corp. Relation: signed contract with Olivier. " +
+          "Additional context line one. Additional context line two. " +
+          "Additional context line three. ".repeat(5),
+      }),
+    }) as unknown as Response);
+
+    register(api);
+    await state.handlers["before_prompt_build"]!({
+      messages: [{ role: "user", content: "tell me about ACME" }],
+    });
+
+    const lr = eventsByType(state.infos, "lightrag");
+    assert.equal(lr.length, 1);
+    assert.equal(lr[0]!.sparse, false);
+    assert.ok((lr[0]!.contextChars as number) >= 200);
+  });
+
+  it("emits a sparse:true LightRAG event when context is below 200 chars", async () => {
+    const { api, state } = makeFakeApi({
+      lightragUrl: "http://lightrag:9621",
+    });
+
+    // Production scenario observed 2026-05-23 19:42:05: LightRAG had
+    // nothing relevant indexed for the query and returned a tiny stub.
+    mock.method(globalThis, "fetch", async () => ({
+      ok: true,
+      json: async () => ({ response: "Entity: x. Relation: y." }), // <200 chars
+    }) as unknown as Response);
+
+    register(api);
+    await state.handlers["before_prompt_build"]!({
+      messages: [{ role: "user", content: "obscure topic with no coverage" }],
+    });
+
+    const lr = eventsByType(state.infos, "lightrag");
+    assert.equal(lr.length, 1);
+    assert.equal(lr[0]!.sparse, true);
+  });
+
+  it("emits a LightRAG event with sparse:true even when the response is empty", async () => {
+    // Empty response from LightRAG (no matches at all). The plugin
+    // injects nothing into the prompt, but the event MUST still fire
+    // so dashboards can distinguish "LightRAG ran and matched nothing"
+    // from "LightRAG was never called".
+    const { api, state } = makeFakeApi({
+      lightragUrl: "http://lightrag:9621",
+    });
+
+    mock.method(globalThis, "fetch", async () => ({
+      ok: true,
+      json: async () => ({ response: "" }),
+    }) as unknown as Response);
+
+    register(api);
+    const result = await state.handlers["before_prompt_build"]!({
+      messages: [{ role: "user", content: "totally unindexed subject" }],
+    });
+
+    assert.equal(result, undefined);
+    const lr = eventsByType(state.infos, "lightrag");
+    assert.equal(lr.length, 1);
+    assert.equal(lr[0]!.sparse, true);
+    assert.equal(lr[0]!.contextChars, 0);
+  });
+
+  it("emits pgvector event with errored:true + rawCount:null when SQL fails (Codex pass #28 P2)", async () => {
+    // Codex pass #28 P2 regression: a real SQL failure (DB down, schema
+    // drift, …) MUST NOT be confused with a clean 0-hit query. The event
+    // carries `errored: true` and `rawCount: null` so dashboards never
+    // count the failure as a "missed retrieval".
+    const { api, state } = makeFakeApi({
+      geminiApiKey: "test-key",
+      postgresUrl: "postgresql://localhost/knowledge",
+      collections: ["broken-collection"],
+    });
+
+    mock.method(globalThis, "fetch", async (url: string | URL | Request) => {
+      const urlStr = typeof url === "string" ? url : url.toString();
+      if (urlStr.includes("generativelanguage")) {
+        return {
+          ok: true,
+          json: async () => ({ embedding: { values: [0.1, 0.2] } }),
+        } as unknown as Response;
+      }
+      // No other fetch path expected — pgvector uses `pg`, not fetch.
+      return { ok: false, status: 500 } as unknown as Response;
+    });
+
+    register(api);
+    // pgvector pool.query will fail at runtime (no real DB available).
+    // The plugin must still emit the pgvector event with errored:true.
+    const result = await state.handlers["before_prompt_build"]!({
+      messages: [{ role: "user", content: "anything that triggers pgvector" }],
+    });
+
+    // No content injected because results are empty.
+    assert.equal(result, undefined);
+
+    const pg = eventsByType(state.infos, "pgvector");
+    assert.equal(pg.length, 1);
+    assert.equal(pg[0]!.errored, true);
+    assert.equal(pg[0]!.rawCount, null);
+    assert.equal(pg[0]!.topScore, null);
+    // The plugin also logs a sanitized error line (class name only,
+    // no SQL params / no query content).
+    assert.ok(
+      state.errors.some((e) => e.includes('pgvector collection "broken-collection" failed')),
+      "Expected a sanitized error line naming the failing collection",
+    );
+  });
+
+  // Note: the symmetric `errored:false + rawCount:0` path (pgvector ran,
+  // SQL OK, no row matched the threshold) is implicitly covered by the
+  // existing reranker tests in `pgvector reranker` describe block, which
+  // exercise `runPgvectorSource` with a fake `pg.Pool` returning rows.
+  // We do NOT duplicate that mocking here.
+});
+
+describe("before_prompt_build — v3.2.3 OWUI auto-prompt short-circuit", () => {
+  afterEach(() => mock.restoreAll());
+
+  it("skips retrieval entirely on an OWUI title-generation prompt", async () => {
+    // Open WebUI re-uses the active chat thread to ask the LLM for a
+    // title after every assistant turn. The prompt starts with the
+    // canonical `### Task:` header followed by `Generate ... title`.
+    // The heuristic META_PATTERN MUST short-circuit it before any
+    // network call (LightRAG, pgvector, Jina) is attempted.
+    const { api, state } = makeFakeApi({
+      lightragUrl: "http://lightrag:9621",
+      jina: { apiKey: "j", router: { enabled: true, mode: "jina-classifier" } },
+    });
+
+    let fetchCalled = false;
+    mock.method(globalThis, "fetch", async () => {
+      fetchCalled = true;
+      return { ok: true, json: async () => ({}) } as unknown as Response;
+    });
+
+    register(api);
+    const result = await state.handlers["before_prompt_build"]!({
+      messages: [
+        {
+          role: "user",
+          content:
+            "### Task:\nGenerate a concise, 3-5 word title with an emoji " +
+            "summarizing the chat history.\n### Guidelines:\n- Keep it short.\n" +
+            "### Output:\nJSON format: { \"title\": \"your concise title here\" }\n" +
+            "### Chat History:\n<chat_history>\nUSER: foo\nASSISTANT: bar\n</chat_history>",
+        },
+      ],
+    });
+
+    assert.equal(result, undefined);
+    assert.equal(fetchCalled, false);
+
+    const routerEvents = eventsByType(state.infos, "router");
+    assert.equal(routerEvents.length, 1);
+    assert.equal(routerEvents[0]!.route, "NONE");
+    assert.equal(routerEvents[0]!.reason, "heuristic_meta");
+  });
+
+  it("skips retrieval on an OWUI tag-generation prompt with the full 4-section template", async () => {
+    // The full 4-section OWUI shape (### Task: + ### Output: +
+    // ### Chat History: + <chat_history>…</chat_history> at EOF) is
+    // the discriminant signal — see code comment in heuristic.ts.
+    const { api, state } = makeFakeApi({
+      lightragUrl: "http://lightrag:9621",
+      jina: { apiKey: "j", router: { enabled: true } },
+    });
+
+    let fetchCalled = false;
+    mock.method(globalThis, "fetch", async () => {
+      fetchCalled = true;
+      return { ok: true, json: async () => ({}) } as unknown as Response;
+    });
+
+    register(api);
+    const result = await state.handlers["before_prompt_build"]!({
+      messages: [
+        {
+          role: "user",
+          content:
+            "### Task:\nSuggest 3-5 relevant tags for this conversation\n" +
+            "### Output:\nJSON format: { \"tags\": [\"...\"] }\n" +
+            "### Chat History:\n<chat_history>\nUSER: foo\nASSISTANT: bar\n</chat_history>",
+        },
+      ],
+    });
+
+    assert.equal(result, undefined);
+    assert.equal(fetchCalled, false);
+  });
+
+  it("does NOT short-circuit a real `### Task:` user prompt (Codex pass #28 P2 regression)", async () => {
+    // Codex pass #28 P2: the verb alone is too generic. A power user
+    // can legitimately write `### Task:\nCreate a migration plan from
+    // the docs` and that MUST reach the knowledge sources. The OWUI-
+    // specific output template (`### Output:\nJSON format: {`) is the
+    // discriminator.
+    const { api, state } = makeFakeApi({
+      lightragUrl: "http://lightrag:9621",
+      jina: { apiKey: "j", router: { enabled: true } },
+    });
+
+    mock.method(globalThis, "fetch", async () => ({
+      ok: true,
+      json: async () => ({
+        response:
+          "Entity: migration plan. " + "x".repeat(300),
+      }),
+    }) as unknown as Response);
+
+    register(api);
+    const result = await state.handlers["before_prompt_build"]!({
+      messages: [
+        {
+          role: "user",
+          content: "### Task:\nCreate a migration plan from the docs.",
+        },
+      ],
+    });
+
+    // The real `### Task:` prompt MUST reach the knowledge base.
+    assert.ok(result);
+    assert.ok(result!.appendSystemContext.includes("Knowledge Graph Context"));
+  });
+
+  it("does NOT short-circuit a structured JSON-output user task with a non-OWUI key (Codex pass #29 P2)", async () => {
+    // Codex pass #29 P2: a power user can legitimately ask for
+    // structured JSON extraction with a domain key. None of these
+    // prompts ships the `<chat_history>` block so they pass through.
+    const { api, state } = makeFakeApi({
+      lightragUrl: "http://lightrag:9621",
+      jina: { apiKey: "j", router: { enabled: true } },
+    });
+
+    mock.method(globalThis, "fetch", async () => ({
+      ok: true,
+      json: async () => ({
+        response: "Entity: ACME Corp. " + "x".repeat(300),
+      }),
+    }) as unknown as Response);
+
+    register(api);
+    const result = await state.handlers["before_prompt_build"]!({
+      messages: [
+        {
+          role: "user",
+          content:
+            "### Task:\nExtract all client names from the docs.\n" +
+            "### Guidelines:\n- Look in TeamDrives only.\n" +
+            '### Output:\nJSON format: { "clients": ["..."] }',
+        },
+      ],
+    });
+
+    // The structured user task MUST reach the knowledge base.
+    assert.ok(result);
+    assert.ok(result!.appendSystemContext.includes("Knowledge Graph Context"));
+  });
+
+  it("does NOT short-circuit when a user pastes the OWUI block but asks something after (Codex pass #31 P2)", async () => {
+    // Codex pass #31 P2 regression: a user can paste an OWUI-style
+    // template AS CONTEXT and then ask a question about it. The
+    // end-of-prompt anchor `\s*$` on the META_PATTERN defeats the
+    // match because the user question follows `</chat_history>`.
+    const { api, state } = makeFakeApi({
+      lightragUrl: "http://lightrag:9621",
+      jina: { apiKey: "j", router: { enabled: true } },
+    });
+
+    mock.method(globalThis, "fetch", async () => ({
+      ok: true,
+      json: async () => ({
+        response: "Entity: OWUI auto-prompt. " + "x".repeat(300),
+      }),
+    }) as unknown as Response);
+
+    register(api);
+    const result = await state.handlers["before_prompt_build"]!({
+      messages: [
+        {
+          role: "user",
+          content:
+            "### Task:\nAnalyse ce template OWUI.\n" +
+            "### Output:\nJSON format: { ... }\n" +
+            "### Chat History:\n<chat_history>USER: foo\nASSISTANT: bar</chat_history>\n\n" +
+            "Comment puis-je désactiver ces appels automatiques côté gateway ?",
+        },
+      ],
+    });
+
+    // The user has a real question AFTER the template — reaches the KB.
+    assert.ok(result);
+    assert.ok(result!.appendSystemContext.includes("Knowledge Graph Context"));
+  });
+
+  it("does NOT short-circuit a user `{ summary: ... }` request without chat_history (Codex pass #30 P2)", async () => {
+    // Codex pass #30 P2 regression: even the four canonical OWUI keys
+    // (title / tags / follow_ups / summary) are NOT discriminant on
+    // their own. A user can legitimately ask for a summary of docs
+    // in JSON output. Without the `<chat_history>` block, this MUST
+    // reach the knowledge sources.
+    const { api, state } = makeFakeApi({
+      lightragUrl: "http://lightrag:9621",
+      jina: { apiKey: "j", router: { enabled: true } },
+    });
+
+    mock.method(globalThis, "fetch", async () => ({
+      ok: true,
+      json: async () => ({
+        response: "Entity: Ataraxis CR. " + "x".repeat(300),
+      }),
+    }) as unknown as Response);
+
+    register(api);
+    const result = await state.handlers["before_prompt_build"]!({
+      messages: [
+        {
+          role: "user",
+          content:
+            "### Task:\nSummarize the latest Ataraxis CR meeting.\n" +
+            "### Guidelines:\n- Cite sources.\n" +
+            '### Output:\nJSON format: { "summary": "...", "decisions": [...] }',
+        },
+      ],
+    });
+
+    // No `<chat_history>` block → the user request reaches LightRAG.
+    assert.ok(result);
+    assert.ok(result!.appendSystemContext.includes("Knowledge Graph Context"));
+  });
+
+  it("does NOT short-circuit when a real query QUOTES the OWUI template later in the body", async () => {
+    // A power user might legitimately ask about the template itself.
+    // The anchor on `^` ensures the pattern only matches when the
+    // OWUI header is the FIRST thing in the prompt.
+    const { api, state } = makeFakeApi({
+      lightragUrl: "http://lightrag:9621",
+    });
+
+    mock.method(globalThis, "fetch", async () => ({
+      ok: true,
+      json: async () => ({ response: "Entity: tag pattern. " + "x".repeat(300) }),
+    }) as unknown as Response);
+
+    register(api);
+    const result = await state.handlers["before_prompt_build"]!({
+      messages: [
+        {
+          role: "user",
+          content:
+            "Can you explain what `### Task:\nGenerate a concise title` does " +
+            "in Open WebUI and why it appears between user turns?",
+        },
+      ],
+    });
+
+    // LightRAG WAS called → result should be defined and contain context.
+    assert.ok(result);
+    assert.ok(result!.appendSystemContext.includes("Knowledge Graph Context"));
+  });
+});

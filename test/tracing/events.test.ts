@@ -63,6 +63,7 @@ describe("emitEvent", () => {
         rerankedCount: 5,
         topScore: 0.92,
         durationMs: 250,
+        errored: false,
       } satisfies PgvectorEvent,
       {
         type: "lightrag",
@@ -70,6 +71,7 @@ describe("emitEvent", () => {
         contextChars: 1200,
         truncatedChars: 1000,
         durationMs: 500,
+        sparse: false,
       } satisfies LightRAGEvent,
       {
         type: "jina",

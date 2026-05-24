@@ -61,10 +61,23 @@ export interface RouterEvent {
 export interface PgvectorEvent {
   type: "pgvector";
   collections: string[];
-  rawCount: number;
+  /**
+   * Recall size of the vector search BEFORE the optional reranker.
+   * `null` when {@link errored} is `true` and the value is therefore
+   * not a meaningful "no hits" signal.
+   */
+  rawCount: number | null;
   rerankedCount: number | null;
   topScore: number | null;
   durationMs: number;
+  /**
+   * `true` when at least one configured collection's SQL search threw.
+   * Surfaces failure modes (DB down, schema drift, network) that would
+   * otherwise be indistinguishable from a 0-hit query in the event log.
+   *
+   * @since 3.2.3
+   */
+  errored: boolean;
 }
 
 export interface LightRAGEvent {
@@ -73,7 +86,24 @@ export interface LightRAGEvent {
   contextChars: number;
   truncatedChars: number;
   durationMs: number;
+  /**
+   * `true` when the LightRAG payload (post-truncation) is below
+   * {@link LIGHTRAG_SPARSE_THRESHOLD_CHARS}, i.e. the graph essentially
+   * returned nothing usable. Surfaces knowledge-coverage gaps in
+   * dashboards without re-inspecting the raw context.
+   *
+   * @since 3.2.3
+   */
+  sparse: boolean;
 }
+
+/**
+ * Threshold under which a LightRAG response is flagged `sparse`. Picked
+ * empirically: 200 chars is roughly two short sentences — anything
+ * below is too little to ground a non-trivial answer, so it is more
+ * useful to surface the gap than to act on it.
+ */
+export const LIGHTRAG_SPARSE_THRESHOLD_CHARS = 200;
 
 export interface JinaUsageEvent {
   type: "jina";

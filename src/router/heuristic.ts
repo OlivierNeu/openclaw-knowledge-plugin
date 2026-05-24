@@ -48,6 +48,45 @@ const META_PATTERNS: RegExp[] = [
   // Same anchoring for the FR variants ("tu es là ?").
   /^\s*(?:(?:system|the\s+system)\s+)?(?:status|ping|heartbeat)\s*[?!.]*\s*$/i,
   /^\s*(?:are\s+you\s+(?:there|alive)|t['e]es?\s+(?:la|en\s+ligne))\s*[?!.]*\s*$/i,
+  // Open WebUI automatic background prompts — Open WebUI re-uses the
+  // same chat thread to ask the LLM for a title, tags, follow-up
+  // questions, or a summary after every assistant turn. Successive
+  // code-review iterations rejected weaker signals:
+  //   - Codex #28: verb alone (Generate/Suggest/Create) matches real
+  //     prompts like "Create a migration plan from the docs".
+  //   - Codex #29: structural triple `### Task:` + `### Output:` +
+  //     `JSON format: {` matches power-user structured extraction.
+  //   - Codex #30: even the four canonical OWUI keys (title / tags /
+  //     follow_ups / summary) match real tasks like "Summarize the
+  //     documents with JSON format: { summary: ... }".
+  //   - Codex #31: just `### Task:` + `<chat_history>…</chat_history>`
+  //     matches a user asking to ANALYZE the OWUI template itself.
+  //
+  // To converge, we stack FOUR OWUI-specific structural markers so a
+  // hand-written prompt would have to mimic the EXACT OWUI shape to
+  // be falsely classified:
+  //
+  //   1. `### Task:`           at the START of the prompt (anchored)
+  //   2. `### Output:`          OWUI directive header
+  //   3. `### Chat History:`    OWUI section header (literal, not the
+  //                             generic XML tag — a user analyzing
+  //                             the OWUI template typically pastes
+  //                             only `<chat_history>` without the
+  //                             section header preceding it)
+  //   4. `<chat_history>…</chat_history>` block — and it MUST sit at
+  //                             the END of the prompt (`\s*$`). OWUI
+  //                             auto-prompts terminate exactly there;
+  //                             a user analyzing the template almost
+  //                             always appends a question / "explain"
+  //                             AFTER the closing tag, defeating the
+  //                             end anchor.
+  //
+  // The middle expansions are bounded (`{1,16000}`, `{1,4000}?`,
+  // `{0,32000}`) to keep the regex engine linear on malformed input.
+  // 16 KB covers the longest OWUI Guidelines block; 4 KB covers the
+  // Output + Examples section; 32 KB covers realistic chat history
+  // payloads (OWUI defaults to the last 6 messages).
+  /^\s*###\s*Task:[\s\S]{1,16000}\n###\s*Output:[\s\S]{1,4000}?\n###\s*Chat\s+History:\s*\n<chat_history>[\s\S]{0,32000}<\/chat_history>\s*$/i,
 ];
 
 // ---------------------------------------------------------------------------

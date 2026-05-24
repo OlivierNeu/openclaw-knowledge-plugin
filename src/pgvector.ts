@@ -42,29 +42,29 @@ export async function searchCollection(
 ): Promise<PgvectorResult[]> {
   const vectorStr = `[${vector.join(",")}]`;
 
-  try {
-    const result = await pool.query(SEARCH_SQL, [vectorStr, collection, topK]);
+  // Errors are intentionally NOT swallowed here. v3.2.3+ relies on the
+  // caller (`runPgvectorSource`) to use `Promise.allSettled` and distinguish
+  // "ran and found nothing" (empty array) from "the SQL failed" (rejection)
+  // so the observability event accurately reflects what happened.
+  const result = await pool.query(SEARCH_SQL, [vectorStr, collection, topK]);
 
-    // pg returns numeric columns as strings by default, so parse the score.
-    return result.rows
-      .map((row: PgvectorRow): PgvectorResult => ({
-        collection,
-        score: parseFloat(row.score),
-        file_name: row.file_name ?? null,
-        mime_type: row.mime_type ?? null,
-        text: row.text ?? null,
-        file_id: row.file_id ?? null,
-        source: row.source ?? null,
-        owner: row.owner ?? null,
-        chunk_index: row.chunk_index ?? null,
-        total_chunks: row.total_chunks ?? null,
-        timestamp_start: row.timestamp_start ?? null,
-        timestamp_end: row.timestamp_end ?? null,
-      }))
-      .filter((row) => row.score >= scoreThreshold);
-  } catch {
-    return [];
-  }
+  // pg returns numeric columns as strings by default, so parse the score.
+  return result.rows
+    .map((row: PgvectorRow): PgvectorResult => ({
+      collection,
+      score: parseFloat(row.score),
+      file_name: row.file_name ?? null,
+      mime_type: row.mime_type ?? null,
+      text: row.text ?? null,
+      file_id: row.file_id ?? null,
+      source: row.source ?? null,
+      owner: row.owner ?? null,
+      chunk_index: row.chunk_index ?? null,
+      total_chunks: row.total_chunks ?? null,
+      timestamp_start: row.timestamp_start ?? null,
+      timestamp_end: row.timestamp_end ?? null,
+    }))
+    .filter((row) => row.score >= scoreThreshold);
 }
 
 /**

@@ -97,11 +97,16 @@ describe("searchCollection", () => {
     assert.equal(results[0]!.file_name, "good.pdf");
   });
 
-  it("returns empty array on database error", async () => {
+  it("propagates the database error (v3.2.3 — Codex pass #28 P2)", async () => {
+    // v3.2.3 stopped swallowing pg errors so the caller can distinguish
+    // "ran and matched nothing" from "the SQL layer broke" in telemetry.
+    // The plugin's `runPgvectorSource` uses `Promise.allSettled` to keep
+    // graceful degradation across multiple collections.
     const pool = mockPool([], true);
-
-    const results = await searchCollection(pool, "col", [1], 5, 0.3);
-    assert.deepEqual(results, []);
+    await assert.rejects(
+      searchCollection(pool, "col", [1], 5, 0.3),
+      /connection refused/,
+    );
   });
 
   it("handles empty result set", async () => {

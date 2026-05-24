@@ -93,6 +93,159 @@ describe("heuristicRoute — meta-agent regex", () => {
     assert.equal(heuristicRoute({ query: "system status" }).route, "NONE");
     assert.equal(heuristicRoute({ query: "the system status?" }).route, "NONE");
   });
+
+  it("skips OWUI auto-prompts that ship the full 4-section template", () => {
+    // OWUI title / tags / follow-up / summary tasks all end with the
+    // canonical four-section structure:
+    //   ### Task:        — header
+    //   ### Output:      — JSON format directive
+    //   ### Chat History: — section header (literal)
+    //   <chat_history>…</chat_history>  — XML block at end-of-prompt
+    // The full shape is what we anchor on (see code comment in
+    // heuristic.ts for the rejected weaker signals).
+    const owuiChatHistoryTail =
+      "### Chat History:\n<chat_history>\n" +
+      "USER: Quelle est la version du plugin ?\nASSISTANT: 3.2.3\n" +
+      "</chat_history>";
+
+    const titleGen =
+      "### Task:\nGenerate a concise, 3-5 word title with an emoji " +
+      "summarizing the chat history.\n" +
+      '### Output:\nJSON format: { "title": "your concise title here" }\n' +
+      owuiChatHistoryTail;
+    const tagsGen =
+      "### Task:\nGenerate 1-3 broad tags categorizing the main themes.\n" +
+      '### Output:\nJSON format: { "tags": ["tag1", "tag2"] }\n' +
+      owuiChatHistoryTail;
+    const followupGen =
+      "### Task:\nSuggest 3-5 relevant follow-up questions.\n" +
+      '### Output:\nJSON format: { "follow_ups": [...] }\n' +
+      owuiChatHistoryTail;
+    const summaryGen =
+      "### Task:\nCreate a short summary of the conversation.\n" +
+      '### Output:\nJSON format: { "summary": "..." }\n' +
+      owuiChatHistoryTail;
+
+    for (const q of [titleGen, tagsGen, followupGen, summaryGen]) {
+      const v = heuristicRoute({ query: q });
+      assert.equal(v.route, "NONE", `"${q.slice(0, 40)}..." should be classified meta`);
+      assert.equal(v.reason, "heuristic_meta");
+    }
+  });
+
+  it("does NOT skip a real `### Task:` prompt WITHOUT the OWUI chat_history block", () => {
+    // Codex pass #28 P2 regression: a power user can legitimately write
+    // a structured task prompt that lacks the OWUI XML chat_history
+    // marker. Those MUST reach the router/sources, not be silently
+    // dropped.
+    const realTaskPrompts = [
+      "### Task:\nCreate a migration plan from the docs.",
+      "### Task:\nGenerate a list of pending refactors in the auth module.",
+      "### Task:\nSuggest improvements to the deployment pipeline.",
+      "### Task:\nCreate a summary of the last release.\n\n(no JSON output, just prose)",
+    ];
+    for (const q of realTaskPrompts) {
+      const v = heuristicRoute({ query: q });
+      assert.notEqual(
+        v.route,
+        "NONE",
+        `"${q.slice(0, 60)}..." should NOT be classified as OWUI metadata`,
+      );
+    }
+  });
+
+  it("does NOT skip a structured JSON-output user task with a non-OWUI key (Codex pass #29 P2)", () => {
+    // Codex pass #29 P2 regression: any structured task that asks for
+    // JSON output of a DOMAIN key MUST reach the knowledge sources.
+    // None of these prompts ship the OWUI `<chat_history>` block so
+    // they are passed through.
+    const realDomainTasks = [
+      "### Task:\nExtract all client names from the docs.\n" +
+        '### Output:\nJSON format: { "clients": ["..."] }',
+      "### Task:\nList the upcoming milestones from the project plans.\n" +
+        '### Output:\nJSON format: { "milestones": [{"date": "...", "name": "..."}] }',
+      "### Task:\nAnswer the user question from the provided context.\n" +
+        '### Output:\nJSON format: { "answer": "...", "sources": [...] }',
+      "### Task:\nExtract entities and their relations from the corpus.\n" +
+        '### Output:\nJSON format: { "entities": [...], "relations": [...] }',
+    ];
+    for (const q of realDomainTasks) {
+      const v = heuristicRoute({ query: q });
+      assert.notEqual(
+        v.route,
+        "NONE",
+        `"${q.slice(0, 60)}..." should NOT be classified as OWUI metadata`,
+      );
+    }
+  });
+
+  it("does NOT skip a user task that asks for `{ summary: ... }` from the docs (Codex pass #30 P2)", () => {
+    // Codex pass #30 P2 regression: even the four canonical OWUI keys
+    // (title / tags / follow_ups / summary) are NOT discriminant on
+    // their own. A user can legitimately ask for a `summary` of
+    // documents, or `tags` for an article, in JSON output. None of
+    // these prompts injects the `<chat_history>` block, so they MUST
+    // reach the knowledge sources.
+    const ambiguousButLegit = [
+      "### Task:\nSummarize the latest Ataraxis CR meeting.\n" +
+        '### Output:\nJSON format: { "summary": "...", "decisions": [...] }',
+      "### Task:\nAssign tags to the IFOA V5 document.\n" +
+        '### Output:\nJSON format: { "tags": ["...", "..."] }',
+      "### Task:\nPropose a chapter title for the report.\n" +
+        '### Output:\nJSON format: { "title": "..." }',
+      "### Task:\nSuggest follow-up questions for the prospect call.\n" +
+        '### Output:\nJSON format: { "follow_ups": ["..."] }',
+    ];
+    for (const q of ambiguousButLegit) {
+      const v = heuristicRoute({ query: q });
+      assert.notEqual(
+        v.route,
+        "NONE",
+        `"${q.slice(0, 60)}..." should NOT be classified as OWUI metadata`,
+      );
+    }
+  });
+
+  it("does NOT skip a user task that pastes the OWUI chat_history but adds a question after (Codex pass #31 P2)", () => {
+    // Codex pass #31 P2 regression: a user can paste an example
+    // OWUI-style block as CONTEXT and then ASK something after it.
+    // The end-of-prompt anchor `\s*$` defeats the match because the
+    // user's question follows the closing `</chat_history>` tag.
+    const pasteThenAsk =
+      "### Task:\nAnalyse ce template Open WebUI\n" +
+      "### Output:\nJSON format: { ... }\n" +
+      "### Chat History:\n<chat_history>\nUSER: foo\nASSISTANT: bar\n</chat_history>\n\n" +
+      "Comment puis-je désactiver ces appels automatiques côté gateway ?";
+    const v = heuristicRoute({ query: pasteThenAsk });
+    assert.notEqual(v.route, "NONE");
+  });
+
+  it("does NOT skip a user task that embeds <chat_history> without the OWUI section header (Codex pass #31 P2)", () => {
+    // Variant: the user pastes a `<chat_history>` block as inline
+    // example but does NOT reproduce the OWUI `### Chat History:`
+    // section header preceding it. Without all four structural
+    // markers, the pattern stays inactive.
+    const inlineXmlExample =
+      "### Task:\nAnalyse ce template Open WebUI\n" +
+      "### Output:\nJSON format: { ... }\n" +
+      "Voici un exemple inline: <chat_history>USER: x\nASSISTANT: y</chat_history>";
+    const v = heuristicRoute({ query: inlineXmlExample });
+    assert.notEqual(v.route, "NONE");
+  });
+
+  it("does NOT skip when the OWUI template appears mid-body (anchored on `^`)", () => {
+    // A user quoting the OWUI template in a real question MUST NOT be
+    // dropped. The pattern requires the header at the START of the
+    // prompt; anywhere else stays a user question.
+    const real =
+      "Pourquoi Open WebUI envoie-t-il ce template:\n" +
+      "### Task:\nGenerate a title\n" +
+      "### Output:\nJSON format: { ... }\n" +
+      "### Chat History:\n<chat_history>USER: x\nASSISTANT: y</chat_history>\n" +
+      "à chaque fin de tour, et comment puis-je désactiver ça ?";
+    const v = heuristicRoute({ query: real });
+    assert.notEqual(v.route, "NONE");
+  });
 });
 
 describe("heuristicRoute — CLI trivial pings", () => {

@@ -40,7 +40,11 @@ import { queryLightRAG, formatLightRAGResults } from "./lightrag.js";
 import { decideRoute } from "./router/index.js";
 import type { Route, RouterDecision } from "./router/types.js";
 import { JinaError, summarizeJinaError } from "./jina/errors.js";
-import { emitEvent, emitTurnMetadata } from "./tracing/events.js";
+import {
+  emitEvent,
+  emitTurnMetadata,
+  LIGHTRAG_SPARSE_THRESHOLD_CHARS,
+} from "./tracing/events.js";
 import type {
   BeforePromptBuildEvent,
   BeforePromptBuildResult,
@@ -597,6 +601,17 @@ interface PgvectorSourceResult {
   rawCount: number;
   reranked: boolean;
   durationMs: number;
+  /**
+   * `true` when at least one configured collection's SQL search rejected.
+   * Pure observability — the source still returns whatever results the
+   * other collections produced (graceful degradation). Used by
+   * {@link renderSection} to emit `errored:true` on the pgvector event
+   * so dashboards don't confuse "ran and matched nothing" with "the
+   * SQL layer broke".
+   *
+   * @since 3.2.3
+   */
+  errored: boolean;
 }
 
 async function runPgvectorSource(
@@ -608,10 +623,34 @@ async function runPgvectorSource(
 ): Promise<PgvectorSourceResult> {
   const startedAt = Date.now();
   const vector = await embedQuery(query, config.geminiApiKey);
-  const searches = config.collections.map((col) =>
-    searchCollection(pool, col, vector, config.topK, config.scoreThreshold),
+  // Use `Promise.allSettled` so a single failing collection (transient DB
+  // hiccup, bad schema on one shard, etc.) does NOT erase the results
+  // from the others. `errored` is set when ANY settle is rejected so
+  // the downstream event can flag the partial failure.
+  const settled = await Promise.allSettled(
+    config.collections.map((col) =>
+      searchCollection(pool, col, vector, config.topK, config.scoreThreshold),
+    ),
   );
-  const allResults = (await Promise.all(searches)).flat();
+  const allResults: PgvectorResult[] = [];
+  let errored = false;
+  for (let i = 0; i < settled.length; i++) {
+    const r = settled[i]!;
+    if (r.status === "fulfilled") {
+      allResults.push(...r.value);
+    } else {
+      errored = true;
+      // SECURITY: never log r.reason directly. pg errors can include
+      // the offending SQL parameter values (the embedding vector and,
+      // historically, the query text in older driver versions). We log
+      // the constructor name only — sufficient to triage without
+      // risking PHI / query leakage.
+      const reasonClass = (r.reason as Error | undefined)?.constructor?.name ?? "Error";
+      logger.error(
+        `openclaw-knowledge: pgvector collection "${config.collections[i]}" failed — ${reasonClass}`,
+      );
+    }
+  }
   allResults.sort((a, b) => b.score - a.score);
   // Capture the recall size BEFORE the reranker runs. This is the
   // number that monitors "how many candidates did pgvector find?"
@@ -641,6 +680,7 @@ async function runPgvectorSource(
       rawCount,
       reranked: false,
       durationMs: Date.now() - startedAt,
+      errored,
     };
   }
 
@@ -658,6 +698,7 @@ async function runPgvectorSource(
       rawCount,
       reranked: true,
       durationMs: Date.now() - startedAt,
+      errored,
     };
   } catch (err) {
     // Jina rerank failed → log a SANITIZED summary and fall back to
@@ -680,6 +721,7 @@ async function runPgvectorSource(
       rawCount,
       reranked: false,
       durationMs: Date.now() - startedAt,
+      errored,
     };
   }
 }
@@ -711,12 +753,13 @@ function renderSection(
 ): string | null {
   if (result.source === "pgvector") {
     const formatted = formatPgvectorResults(result.data, config.maxInjectChars);
-    if (!formatted) return null;
     const topScore = result.data[0]?.score?.toFixed(2) ?? "n/a";
     const rerankNote = result.reranked ? " [reranked]" : "";
-    logger.info(
-      `openclaw-knowledge: pgvector — ${result.data.length} result(s)${rerankNote} (top: ${topScore})`,
-    );
+    // Emit the event UNCONDITIONALLY — even when pgvector returned no
+    // result above threshold. The previous behavior (silent on empty)
+    // made it impossible to distinguish "pgvector ran and matched
+    // nothing" from "pgvector was never called". Operators need the
+    // former to monitor recall and trigger ingestion when warranted.
     emitEvent(logger, {
       type: "pgvector",
       collections: config.collections,
@@ -725,27 +768,52 @@ function renderSection(
       // final size that reaches the LLM (or `null` when the reranker
       // is inactive). This split lets operators monitor recall vs.
       // pruning independently.
-      rawCount: result.rawCount,
+      //
+      // When `errored` is set, `rawCount` is reported as `null` rather
+      // than `0` so dashboards do not conflate a partial SQL failure
+      // with a clean 0-hit query. See the `runPgvectorSource` comment
+      // about `Promise.allSettled` for the source of the flag.
+      rawCount: result.errored ? null : result.rawCount,
       rerankedCount: result.reranked ? result.data.length : null,
       topScore: result.data[0]?.score ?? null,
       durationMs: result.durationMs,
+      errored: result.errored,
     });
+    if (!formatted) {
+      logger.info(
+        `openclaw-knowledge: pgvector — no result above threshold (rawCount=${result.rawCount})`,
+      );
+      return null;
+    }
+    logger.info(
+      `openclaw-knowledge: pgvector — ${result.data.length} result(s)${rerankNote} (top: ${topScore})`,
+    );
     return "### Document Search Results (pgvector)\n" + formatted;
   }
 
   if (result.source === "lightrag") {
     const formatted = formatLightRAGResults(result.data, config.lightragMaxChars);
-    if (!formatted) return null;
-    logger.info(
-      `openclaw-knowledge: LightRAG — ${formatted.truncated.length}/${formatted.originalLength} chars (truncated from ${formatted.originalLength})`,
-    );
+    // Emit the event UNCONDITIONALLY too — sparse responses are the
+    // single most useful signal for diagnosing KG coverage gaps.
+    const truncatedLen = formatted?.truncated.length ?? 0;
+    const originalLen = formatted?.originalLength ?? result.data.length;
     emitEvent(logger, {
       type: "lightrag",
       mode: config.lightragQueryMode,
-      contextChars: formatted.originalLength,
-      truncatedChars: formatted.truncated.length,
+      contextChars: originalLen,
+      truncatedChars: truncatedLen,
       durationMs: result.durationMs,
+      sparse: truncatedLen < LIGHTRAG_SPARSE_THRESHOLD_CHARS,
     });
+    if (!formatted) {
+      logger.info(
+        `openclaw-knowledge: LightRAG — empty response (${originalLen} chars)`,
+      );
+      return null;
+    }
+    logger.info(
+      `openclaw-knowledge: LightRAG — ${formatted.truncated.length}/${formatted.originalLength} chars (truncated from ${formatted.originalLength})`,
+    );
     return "### Knowledge Graph Context (LightRAG)\n" + formatted.truncated;
   }
 

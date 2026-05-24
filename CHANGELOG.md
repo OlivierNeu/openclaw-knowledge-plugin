@@ -7,6 +7,173 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.2.3] - 2026-05-23
+
+### Added — observability for "ran and matched nothing" (P1)
+
+Post-3.2.2 production observation: when the router lets retrieval go
+through (route=ALL or route=PGVECTOR_ONLY/LIGHTRAG_ONLY), the event
+log can stay completely silent if a source returns zero hits above
+the score threshold. That makes it impossible to distinguish:
+
+- "pgvector / LightRAG ran and matched nothing"  →  knowledge gap
+- "pgvector / LightRAG was never called"         →  config / cooldown
+
+Both cases looked identical from dashboards. v3.2.3 fixes that.
+
+**`pgvector` event now emitted unconditionally**. Previously the event
+was inside the `if (formatted)` block in `renderSection`; a 0-hit
+query produced no event line. The event now fires every time pgvector
+is consulted, with `rawCount: 0`, `topScore: null`, `rerankedCount: null`
+when nothing matched. The plugin still returns `null` from
+`renderSection` (no prompt injection), but operators can now see the
+attempt and the empty result in dashboards.
+
+**`lightrag` event gains a `sparse: boolean` field**. Set to `true`
+when the truncated payload is shorter than the new constant
+`LIGHTRAG_SPARSE_THRESHOLD_CHARS` (200). The threshold is calibrated
+on the production noise floor observed 2026-05-23 19:42:05 where
+LightRAG returned 70 chars of stub on a 1862-char query (OWUI title
+generation — see P2 below). 200 chars ≈ two short sentences; below
+that, the response cannot ground a non-trivial answer.
+
+The `lightrag` event is now also emitted on empty responses, with
+`contextChars: 0` and `sparse: true`, for the same visibility reason
+as the pgvector change above.
+
+### Added — short-circuit Open WebUI auto-prompts (P2)
+
+Open WebUI re-uses the same chat thread to ask the LLM for chat
+metadata after every assistant turn:
+
+- Chat title:    `### Task:\nGenerate a concise, 3-5 word title …`
+- Tags:          `### Task:\nGenerate 1-3 broad tags …`
+- Follow-ups:    `### Task:\nSuggest 3-5 follow-up questions …`
+- Summary:       `### Task:\nCreate a short summary …`
+
+These are not user questions and have no business hitting the
+knowledge base. Previously the heuristic let them through, the
+Jina classifier was billed, and on jerome they typically scored 0.27
+→ `classifier_low_confidence` → ALL → wasted LightRAG call (the
+2026-05-23 19:42:05 case in the issue).
+
+The new META_PATTERN catches them at the start of the prompt:
+
+```
+/^\s*###\s*Task:\s*\n\s*(?:Generate|Suggest|Create)\s+/i
+```
+
+Result: route `NONE`, reason `heuristic_meta`, **zero Jina spend and
+zero RAG call** for the OWUI metadata loop. Anchored on `^` so a user
+who quotes the template inside a real question keeps their content.
+
+### Migration
+
+Drop-in patch. No config change required.
+
+```bash
+sudo docker exec openclaw-jerome openclaw plugins update @lacneu/openclaw-knowledge
+sudo docker exec openclaw-olivier openclaw plugins update @lacneu/openclaw-knowledge
+sudo docker restart openclaw-jerome openclaw-olivier
+```
+
+After restart, expect:
+
+- `[knowledge.event] {"type":"pgvector","rawCount":0,...}` lines on
+  queries where the collection had no hits above threshold.
+- `[knowledge.event] {"type":"lightrag",...,"sparse":true}` lines on
+  thin responses — track this as a KG-coverage indicator.
+- Zero `[knowledge.event] {"type":"router",...}` lines on OWUI
+  title/tag/followup prompts. They now appear as
+  `route=NONE,reason=heuristic_meta` and no downstream events follow.
+
+### Codex pass #28 corrections (P2)
+
+**P2 #1 — OWUI META_PATTERN tightened from verb-only to structural.**
+The initial pattern `^\s*### Task:\n\s*(Generate|Suggest|Create)\s+`
+also matched legitimate user prompts such as
+`### Task:\nCreate a migration plan from the docs`. The verb alone is
+not discriminant.
+
+**Codex pass #29 P2 follow-up — first try.**
+The structural triple `### Task:` + `### Output:` + `JSON format: {`
+also matched legitimate structured-output user tasks
+(`### Output:\nJSON format: { "clients": ["..."] }`). We added a
+whitelist on the first JSON key (title / tags / follow_ups / summary).
+
+**Codex pass #30 — second try: `<chat_history>` XML block.**
+The four canonical OWUI keys are themselves not specific enough — a
+user can legitimately ask for `{ "summary": "..." }` of documents.
+Added `<chat_history>…</chat_history>` anchor.
+
+**Codex pass #31 P2 — final discriminator: full 4-section template
+ending at EOF.**
+Even `<chat_history>…</chat_history>` was insufficient — a user
+analyzing the OWUI template could paste the block as content. The
+final pattern stacks FOUR OWUI-specific structural markers:
+
+```
+/^\s*###\s*Task:[\s\S]{1,16000}\n###\s*Output:[\s\S]{1,4000}?\n###\s*Chat\s+History:\s*\n<chat_history>[\s\S]{0,32000}<\/chat_history>\s*$/i
+```
+
+- `### Task:`         at the START of the prompt (anchored)
+- `### Output:`       OWUI directive section
+- `### Chat History:` OWUI section header (literal — a user
+                      pasting the XML inline omits this)
+- `<chat_history>…</chat_history>` block, AT END-OF-PROMPT (`\s*$`).
+  OWUI auto-prompts terminate exactly here; a user analyzing the
+  template typically appends a question AFTER the closing tag,
+  defeating the end anchor.
+
+Bounded greedy matches `{1,16000}`, `{1,4000}?`, `{0,32000}` keep
+the regex engine linear on malformed input.
+
+**P2 #2 — pgvector errored vs. empty distinguished.**
+`searchCollection` previously caught every SQL error and returned
+`[]`. Combined with the unconditional event emission added earlier in
+v3.2.3, a real database failure (DB down, schema drift, network) was
+logged as `rawCount: 0` — visually identical to a clean 0-hit query.
+
+The catch was removed from `searchCollection`. `runPgvectorSource`
+now uses `Promise.allSettled` over the per-collection searches; a
+single failing collection no longer erases the results from the
+others (graceful degradation preserved). The new
+`PgvectorSourceResult.errored` flag propagates to the event:
+
+- `errored: true`  → `rawCount: null` (failure, not a metric)
+- `errored: false` → `rawCount: N`     (real recall count)
+
+The per-collection failure is logged with the error **class name
+only** — no SQL params, no query content — to keep PHI out of logs.
+
+### Test coverage
+
+- Total: 250 tests, all green (was 230 in 3.2.2; +20 new).
+- 3 new tests in `test/plugin.test.ts` covering the LightRAG
+  `sparse:false`/`sparse:true`/empty-response paths.
+- 7 new tests in `test/plugin.test.ts` covering OWUI title-gen
+  (with the full 4-section template), tag-gen (with the full
+  template), Codex P2 #1 regression (real `### Task:` prompt MUST
+  reach sources), Codex P2 #29 regression (DOMAIN-key JSON task
+  MUST reach sources), Codex P2 #30 regression (user `{"summary":...}`
+  request MUST reach sources), Codex P2 #31 regression (user pastes
+  OWUI block then asks something after MUST reach sources), and
+  the mid-body negative case.
+- 1 new test in `test/plugin.test.ts` for the Codex P2 #2 regression
+  (`errored:true` + `rawCount:null` on SQL failure).
+- 7 new tests in `test/router/heuristic.test.ts`: OWUI positive
+  template (full 4-section shape), Codex #28 negative (real
+  `### Task:` prompts NOT skipped), Codex #29 negative (domain-key
+  JSON tasks NOT skipped), Codex #30 negative (user `{summary/tags/
+  title/follow_ups}` of docs NOT skipped), two Codex #31 negatives
+  (user pastes template-then-asks; user embeds XML inline without
+  the OWUI section header), and the anchor-on-start negative.
+- 1 updated test in `test/pgvector.test.ts` — `searchCollection` now
+  rejects instead of returning `[]` on DB errors.
+- 2 fixture updates in `test/tracing/events.test.ts` for the new
+  `sparse` field on `LightRAGEvent` and the new `errored` field on
+  `PgvectorEvent`.
+
 ## [3.2.2] - 2026-05-23
 
 ### Fixed — Jina classifier silently blocked retrieval on low-confidence scores
