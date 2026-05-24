@@ -2,7 +2,7 @@
   "id": "openclaw-knowledge",
   "name": "Knowledge Base",
   "description": "Multi-source knowledge search (pgvector + LightRAG) with optional Jina-powered router & reranker — injects relevant documents and knowledge graph context before each turn via the before_prompt_build hook",
-  "version": "3.2.3",
+  "version": "3.2.4",
   "activation": {
     "onStartup": true
   },
@@ -86,6 +86,13 @@
             "type": "string",
             "description": "Jina API key shared by router and reranker. Required when router.mode=jina-classifier or pgvectorReranker.enabled. Supports ${ENV_VAR} substitution."
           },
+          "rpmBudget": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1000,
+            "default": 60,
+            "description": "Soft RPM budget for ALL outbound Jina calls (router + reranker). When the sliding 60-second window exceeds this number, a jina_rpm_exceeded event is emitted and a warning is logged. The call is NEVER blocked — the existing 429 cooldown is the hard backstop. Default 60 leaves headroom below the Jina free tier ceiling (100 RPM). Set to 0 to disable the monitor."
+          },
           "router": {
             "type": "object",
             "additionalProperties": false,
@@ -136,6 +143,20 @@
                 "maximum": 100,
                 "default": 5,
                 "description": "Max number of results returned after rerank. Recommendation: keep topK ≥ topN × 2 so the cross-encoder has room to re-order."
+              },
+              "candidatePoolMax": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 100,
+                "default": 20,
+                "description": "Maximum number of cosine-ranked candidates submitted to Jina /v1/rerank per call. Trims Jina token spend on noisy recall. Set to 0 to disable the cap (legacy v3.2.3 behavior)."
+              },
+              "maxCharsPerDoc": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 20000,
+                "default": 2000,
+                "description": "Per-candidate text truncation length in characters before submission to Jina. The first ~2000 chars typically carry most of the relevance signal. Set to 0 to disable the truncation."
               }
             }
           }
@@ -252,6 +273,21 @@
       "label": "Reranker top-N",
       "advanced": true,
       "help": "Max results returned after rerank. Keep topK ≥ topN × 2."
+    },
+    "jina.pgvectorReranker.candidatePoolMax": {
+      "label": "Reranker candidate-pool cap",
+      "advanced": true,
+      "help": "Max candidates submitted to Jina per rerank call. Default 20. Set to 0 to disable the cap."
+    },
+    "jina.pgvectorReranker.maxCharsPerDoc": {
+      "label": "Reranker chars-per-doc cap",
+      "advanced": true,
+      "help": "Per-candidate text truncation before sending to Jina. Default 2000 chars. Set to 0 to disable truncation."
+    },
+    "jina.rpmBudget": {
+      "label": "Jina RPM budget (soft)",
+      "advanced": true,
+      "help": "Soft alert threshold on outbound Jina calls per minute. Default 60. Never blocks — only logs and emits jina_rpm_exceeded events. Set to 0 to disable."
     }
   }
 }

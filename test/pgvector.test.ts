@@ -369,4 +369,130 @@ describe("rerankPgvectorResults (v3.2.0)", () => {
       (err: unknown) => err instanceof Error && err.message.includes("429"),
     );
   });
+
+  // -------------------------------------------------------------------------
+  // v3.2.4 payload-size guards
+  // -------------------------------------------------------------------------
+
+  it("caps the candidate pool at candidatePoolMax before submission", async () => {
+    let submitted: string[] = [];
+    mock.method(globalThis, "fetch", async (_url: unknown, opts?: RequestInit) => {
+      const body = JSON.parse(opts?.body as string) as { documents: string[] };
+      submitted = body.documents;
+      return new Response(
+        JSON.stringify({ results: [{ index: 0, relevance_score: 0.9 }] }),
+        { status: 200 },
+      );
+    });
+
+    // 30 candidates, cap at 10 → only the first 10 reach Jina.
+    const inputs = Array.from({ length: 30 }, (_, i) =>
+      makeResult(`doc-${i}.pdf`, `text ${i}`, 0.9 - i * 0.01),
+    );
+    await rerankPgvectorResults(inputs, {
+      apiKey: "k",
+      query: "q",
+      candidatePoolMax: 10,
+    });
+    assert.equal(submitted.length, 10);
+    // First 10 in cosine order (already sorted by the caller).
+    assert.equal(submitted[0], "text 0");
+    assert.equal(submitted[9], "text 9");
+  });
+
+  it("truncates each candidate to maxCharsPerDoc before submission", async () => {
+    let submitted: string[] = [];
+    mock.method(globalThis, "fetch", async (_url: unknown, opts?: RequestInit) => {
+      const body = JSON.parse(opts?.body as string) as { documents: string[] };
+      submitted = body.documents;
+      return new Response(
+        JSON.stringify({ results: [{ index: 0, relevance_score: 0.9 }] }),
+        { status: 200 },
+      );
+    });
+
+    const longText = "x".repeat(8000); // > 2000
+    const inputs = [makeResult("A.pdf", longText, 0.5)];
+    await rerankPgvectorResults(inputs, {
+      apiKey: "k",
+      query: "q",
+      maxCharsPerDoc: 1500,
+    });
+    assert.equal(submitted.length, 1);
+    assert.equal(submitted[0]!.length, 1500);
+  });
+
+  it("calls onUsage with inputCount + totalChars + duration after a successful call", async () => {
+    mock.method(globalThis, "fetch", async () =>
+      new Response(
+        JSON.stringify({
+          results: [
+            { index: 0, relevance_score: 0.9 },
+            { index: 1, relevance_score: 0.7 },
+          ],
+        }),
+        { status: 200 },
+      ),
+    );
+
+    const usageCalls: Array<{ inputCount: number; totalChars: number; durationMs: number }> = [];
+    const inputs = [
+      makeResult("A.pdf", "abcdef", 0.5), // 6 chars
+      makeResult("B.pdf", "ghijklmn", 0.4), // 8 chars
+    ];
+    await rerankPgvectorResults(inputs, {
+      apiKey: "k",
+      query: "q",
+      onUsage: (u) => usageCalls.push(u),
+    });
+
+    assert.equal(usageCalls.length, 1);
+    assert.equal(usageCalls[0]!.inputCount, 2);
+    assert.equal(usageCalls[0]!.totalChars, 14);
+    assert.ok(usageCalls[0]!.durationMs >= 0);
+  });
+
+  it("does NOT call onUsage when the call fails", async () => {
+    mock.method(globalThis, "fetch", async () =>
+      new Response("server down", { status: 503 }),
+    );
+
+    const usageCalls: number[] = [];
+    const inputs = [makeResult("A.pdf", "text", 0.5)];
+    await assert.rejects(
+      () =>
+        rerankPgvectorResults(inputs, {
+          apiKey: "k",
+          query: "q",
+          onUsage: (u) => usageCalls.push(u.inputCount),
+        }),
+    );
+    assert.equal(usageCalls.length, 0);
+  });
+
+  it("with candidatePoolMax=0 or maxCharsPerDoc=0 keeps legacy behavior (no trim)", async () => {
+    let submitted: string[] = [];
+    mock.method(globalThis, "fetch", async (_url: unknown, opts?: RequestInit) => {
+      const body = JSON.parse(opts?.body as string) as { documents: string[] };
+      submitted = body.documents;
+      return new Response(
+        JSON.stringify({ results: [{ index: 0, relevance_score: 0.9 }] }),
+        { status: 200 },
+      );
+    });
+
+    const inputs = Array.from({ length: 5 }, (_, i) =>
+      makeResult(`doc-${i}.pdf`, "x".repeat(5000), 0.9 - i * 0.01),
+    );
+    // The resolver passes `undefined` to the helper when the config is 0 —
+    // simulate that here directly.
+    await rerankPgvectorResults(inputs, {
+      apiKey: "k",
+      query: "q",
+      candidatePoolMax: undefined,
+      maxCharsPerDoc: undefined,
+    });
+    assert.equal(submitted.length, 5);
+    assert.equal(submitted[0]!.length, 5000);
+  });
 });

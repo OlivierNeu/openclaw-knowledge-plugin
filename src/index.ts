@@ -40,6 +40,7 @@ import { queryLightRAG, formatLightRAGResults } from "./lightrag.js";
 import { decideRoute } from "./router/index.js";
 import type { Route, RouterDecision } from "./router/types.js";
 import { JinaError, summarizeJinaError } from "./jina/errors.js";
+import { RpmMonitor } from "./jina/rate-limit.js";
 import {
   emitEvent,
   emitTurnMetadata,
@@ -138,6 +139,31 @@ export function createBeforePromptBuildHandler(
     pgvector_reranker: newCooldown(),
   };
 
+  // Per-instance RPM monitor — one sliding window per plugin runtime.
+  // The `onExceeded` callback emits a structured event the FIRST time the
+  // budget is overshot in any given 60-second window, so dashboards alert
+  // BEFORE the operator sees billing surprises (especially relevant when
+  // the Jina key is shared with another service like Hindsight).
+  //
+  // When `config.jinaRpmBudget === 0`, the monitor is fully disabled
+  // (no instance constructed, no timestamps tracked, no callback ever
+  // fires). This matches the contract documented on
+  // `JinaPluginConfig.rpmBudget`. Defense-in-depth: even if a caller
+  // bypasses this gate and constructs `RpmMonitor` with budget=0
+  // directly, the `record()` method itself short-circuits to a no-op.
+  const rpmMonitor =
+    config.jinaRpmBudget > 0
+      ? new RpmMonitor({
+          budget: config.jinaRpmBudget,
+          onExceeded: ({ count, budget }) => {
+            logger.warn(
+              `openclaw-knowledge: Jina RPM budget exceeded — ${count}/${budget} requests in the last 60s`,
+            );
+            emitEvent(logger, { type: "jina_rpm_exceeded", count, budget });
+          },
+        })
+      : undefined;
+
   return async function beforePromptBuild(
     event: BeforePromptBuildEvent,
     ctx?: PluginHookAgentContext,
@@ -163,6 +189,7 @@ export function createBeforePromptBuildHandler(
       query,
       cooldowns.router,
       logger,
+      rpmMonitor,
     );
 
     // Project the abstract router decision onto the sources actually
@@ -198,7 +225,9 @@ export function createBeforePromptBuildHandler(
         config.pgvectorEnabled &&
         pool
       ) {
-        tasks.push(runPgvectorSource(pool, query, config, cooldowns.pgvector_reranker, logger));
+        tasks.push(
+          runPgvectorSource(pool, query, config, cooldowns.pgvector_reranker, logger, rpmMonitor),
+        );
       }
 
       if (shouldUseLightRAG(effectiveRoute) && config.lightragEnabled) {
@@ -317,6 +346,7 @@ async function runRouterWithCooldown(
   query: string,
   cooldown: CooldownState,
   logger: PluginLogger,
+  rpmMonitor: RpmMonitor | undefined,
 ): Promise<RouterDecision> {
   // Reset stale cooldown FIRST so we don't keep the classifier circuit
   // open longer than necessary (the first turn after expiry must be
@@ -342,6 +372,17 @@ async function runRouterWithCooldown(
         jinaApiKey: config.jinaApiKey,
         classifierId: config.routerClassifierId || undefined,
         minConfidence: config.routerMinConfidence,
+        onClassifierUsage: (usage) =>
+          emitEvent(logger, {
+            type: "jina",
+            endpoint: "classify",
+            model: usage.model,
+            durationMs: usage.durationMs,
+            // 1 query item per call. Few-shot adds no labels in the
+            // body, so inputCount = 1 covers both paths.
+            inputCount: 1,
+          }),
+        rpmMonitor,
       },
       {
         query,
@@ -620,6 +661,7 @@ async function runPgvectorSource(
   config: ResolvedKnowledgeConfig,
   rerankerCooldown: CooldownState,
   logger: PluginLogger,
+  rpmMonitor: RpmMonitor | undefined,
 ): Promise<PgvectorSourceResult> {
   const startedAt = Date.now();
   const vector = await embedQuery(query, config.geminiApiKey);
@@ -690,6 +732,17 @@ async function runPgvectorSource(
       query,
       model: config.pgvectorRerankerModel,
       topN: config.pgvectorRerankerTopN,
+      candidatePoolMax: config.pgvectorRerankerCandidatePoolMax || undefined,
+      maxCharsPerDoc: config.pgvectorRerankerMaxCharsPerDoc || undefined,
+      rpmMonitor,
+      onUsage: (usage) =>
+        emitEvent(logger, {
+          type: "jina",
+          endpoint: "rerank",
+          model: config.pgvectorRerankerModel,
+          durationMs: usage.durationMs,
+          inputCount: usage.inputCount,
+        }),
     });
     rerankerCooldown.consecutiveErrors = 0;
     return {

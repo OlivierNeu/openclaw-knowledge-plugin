@@ -38,6 +38,7 @@ import {
   JinaNetworkError,
   previewBody,
 } from "./errors.js";
+import type { RpmMonitor } from "./rate-limit.js";
 
 const DEFAULT_TIMEOUT_MS = 8_000;
 
@@ -52,6 +53,15 @@ export interface JinaRequestOptions {
    * signal so either source can cancel the request.
    */
   signal?: AbortSignal;
+  /**
+   * Optional RPM monitor. When supplied, `record()` is called BEFORE the
+   * outbound fetch so the count reflects the actual request even if the
+   * call later fails. Soft monitor — never blocks the call (see
+   * `src/jina/rate-limit.ts` for the design rationale).
+   *
+   * @since 3.2.4
+   */
+  rpmMonitor?: RpmMonitor;
 }
 
 interface PostJsonParams<Req> extends JinaRequestOptions {
@@ -77,7 +87,13 @@ export async function postJson<Req>({
   apiKey,
   timeoutMs = DEFAULT_TIMEOUT_MS,
   signal: callerSignal,
+  rpmMonitor,
 }: PostJsonParams<Req>): Promise<unknown> {
+  // Record BEFORE fetch so the count tracks the real outbound request,
+  // even if it later fails or times out. The monitor is purely
+  // observational; it never blocks the call.
+  rpmMonitor?.record();
+
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 

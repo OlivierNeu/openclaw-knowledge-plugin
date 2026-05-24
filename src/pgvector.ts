@@ -11,6 +11,7 @@
 
 import { rerank } from "./jina/reranker.js";
 import { JinaError } from "./jina/errors.js";
+import type { RpmMonitor } from "./jina/rate-limit.js";
 import type { RerankerModel } from "./jina/types.js";
 import type { PgPoolLike, PgvectorResult, PgvectorRow } from "./types.js";
 
@@ -115,6 +116,48 @@ export interface RerankPgvectorParams {
   model?: RerankerModel;
   /** Cap on the number of results returned post-rerank. */
   topN?: number;
+  /**
+   * Maximum number of candidates submitted to Jina. The cosine-ranked
+   * top `candidatePoolMax` results are sent; anything beyond is dropped
+   * client-side BEFORE the API call. Trims Jina token spend on noisy
+   * recall (typical pgvector returns 20-50 hits where only 10-15 are
+   * worth reranking).
+   *
+   * Default in the resolver: 20. `undefined` → no cap (legacy v3.2.3
+   * behavior).
+   *
+   * @since 3.2.4
+   */
+  candidatePoolMax?: number;
+  /**
+   * Pre-truncation length per candidate document, in CHARACTERS (the
+   * Jina API charges per token; characters are a coarse proxy ≈ 4× tokens
+   * for typical text). Each `documents[i]` is `slice(0, maxCharsPerDoc)`
+   * before submission. Long chunks (recipes, transcripts, prose) carry
+   * most of their relevance in the first few hundred chars — the tail
+   * costs tokens without adding signal.
+   *
+   * Default in the resolver: 2000 (≈ 500 tokens). `undefined` → no
+   * truncation (legacy v3.2.3 behavior).
+   *
+   * @since 3.2.4
+   */
+  maxCharsPerDoc?: number;
+  /**
+   * Optional callback fired AFTER a successful Jina call with the
+   * payload-level numbers the plugin's `jina` event emitter needs
+   * (inputCount, total characters sent, duration). Kept as a callback
+   * to avoid coupling pgvector.ts to the tracing module.
+   *
+   * @since 3.2.4
+   */
+  onUsage?: (usage: {
+    inputCount: number;
+    totalChars: number;
+    durationMs: number;
+  }) => void;
+  /** Optional RPM monitor (forwarded to the Jina client). @since 3.2.4 */
+  rpmMonitor?: RpmMonitor;
   timeoutMs?: number;
   signal?: AbortSignal;
 }
@@ -146,22 +189,50 @@ export async function rerankPgvectorResults(
   // The reranker only sees the textual content. Empty/null texts cannot be
   // ranked, so we filter them out BEFORE the API call to avoid wasting
   // tokens on rows the cross-encoder can't score anyway.
-  const indexed = results
+  let indexed = results
     .map((r, i) => ({ row: r, originalIndex: i, text: r.text ?? "" }))
     .filter((x) => x.text.trim().length > 0);
 
   if (indexed.length === 0) return results.slice(0, params.topN ?? results.length);
 
+  // 3.2.4 — payload-size guards. Both are no-ops when undefined so the
+  // legacy behavior is preserved for callers that haven't migrated.
+  if (
+    typeof params.candidatePoolMax === "number" &&
+    params.candidatePoolMax > 0 &&
+    indexed.length > params.candidatePoolMax
+  ) {
+    // `results` is already cosine-sorted by the caller (runPgvectorSource).
+    // `indexed` preserves that order via the `originalIndex` mapping, so
+    // slicing to the first N keeps the best candidates and drops the tail.
+    indexed = indexed.slice(0, params.candidatePoolMax);
+  }
+  const documents =
+    typeof params.maxCharsPerDoc === "number" && params.maxCharsPerDoc > 0
+      ? indexed.map((x) => x.text.slice(0, params.maxCharsPerDoc))
+      : indexed.map((x) => x.text);
+
+  const startedAt = Date.now();
   try {
     const reranked = await rerank({
       apiKey: params.apiKey,
       query: params.query,
-      documents: indexed.map((x) => x.text),
+      documents,
       model: params.model,
       topN: params.topN,
       timeoutMs: params.timeoutMs,
       signal: params.signal,
+      rpmMonitor: params.rpmMonitor,
     });
+
+    if (params.onUsage) {
+      const totalChars = documents.reduce((sum, d) => sum + d.length, 0);
+      params.onUsage({
+        inputCount: documents.length,
+        totalChars,
+        durationMs: Date.now() - startedAt,
+      });
+    }
 
     if (reranked.length === 0) {
       // Defensive: reranker returned no usable items. Surface the original

@@ -68,6 +68,19 @@ export interface JinaPluginConfig {
   apiKey?: string;
   router?: RouterPluginConfig;
   pgvectorReranker?: PgvectorRerankerPluginConfig;
+  /**
+   * Soft RPM budget for ALL outbound Jina calls (router + reranker
+   * combined). When the sliding 60-second window exceeds this number,
+   * a `jina_rpm_exceeded` event is emitted (at most once per window)
+   * and a warning is logged. **The call is NEVER blocked** — the
+   * existing 429 cooldown breaker is the hard backstop.
+   *
+   * Default: 60. Set well below the Jina free-tier ceiling (100 RPM)
+   * to leave headroom for a shared key (e.g. plugin + Hindsight).
+   *
+   * @since 3.2.4
+   */
+  rpmBudget?: number;
 }
 
 export interface RouterPluginConfig {
@@ -94,6 +107,25 @@ export interface PgvectorRerankerPluginConfig {
   model?: RerankerModel;
   /** Cap on results returned post-rerank. Default: `5`. */
   topN?: number;
+  /**
+   * Maximum number of candidate documents submitted to Jina per call.
+   * Pgvector recall is typically broad (20-50 hits) but only the top
+   * 10-15 are worth reranking. Trimming the tail saves Jina tokens
+   * linearly. Default: `20`. Set to `0` to disable the cap.
+   *
+   * @since 3.2.4
+   */
+  candidatePoolMax?: number;
+  /**
+   * Per-candidate text length cap (characters) before submission to
+   * Jina. The first ~2000 chars carry most of the relevance signal;
+   * longer chunks (transcripts, books) waste tokens on context the
+   * cross-encoder gets little additional signal from. Default: `2000`.
+   * Set to `0` to disable the truncation.
+   *
+   * @since 3.2.4
+   */
+  maxCharsPerDoc?: number;
 }
 
 export type LightRAGQueryMode = "naive" | "local" | "global" | "hybrid";
@@ -127,6 +159,13 @@ export interface ResolvedKnowledgeConfig {
 
   // Jina shared
   jinaApiKey: string;
+  /**
+   * Soft RPM budget for ALL outbound Jina calls. Default: 60.
+   * `0` disables the monitor entirely.
+   *
+   * @since 3.2.4
+   */
+  jinaRpmBudget: number;
 
   // Router
   routerEnabled: boolean;
@@ -143,6 +182,20 @@ export interface ResolvedKnowledgeConfig {
   pgvectorRerankerEnabled: boolean;
   pgvectorRerankerModel: RerankerModel;
   pgvectorRerankerTopN: number;
+  /**
+   * Cap on the number of candidates submitted to Jina /v1/rerank. `0`
+   * disables the cap (legacy v3.2.3 behavior). Default: `20`.
+   *
+   * @since 3.2.4
+   */
+  pgvectorRerankerCandidatePoolMax: number;
+  /**
+   * Per-candidate text truncation length in characters. `0` disables
+   * truncation. Default: `2000`.
+   *
+   * @since 3.2.4
+   */
+  pgvectorRerankerMaxCharsPerDoc: number;
 }
 
 // ---------------------------------------------------------------------------

@@ -100,6 +100,60 @@ describe("resolveConfig — Jina nested block (v3.2.0)", () => {
     assert.equal(cfg.pgvectorRerankerEnabled, false);
     assert.equal(cfg.pgvectorRerankerModel, "jina-reranker-v2-base-multilingual");
     assert.equal(cfg.pgvectorRerankerTopN, 5);
+    // v3.2.4 defaults
+    assert.equal(cfg.pgvectorRerankerCandidatePoolMax, 20);
+    assert.equal(cfg.pgvectorRerankerMaxCharsPerDoc, 2000);
+    assert.equal(cfg.jinaRpmBudget, 60);
+  });
+
+  it("honors pgvectorReranker.candidatePoolMax + maxCharsPerDoc overrides (v3.2.4)", () => {
+    const cfg = resolveConfig({
+      jina: {
+        apiKey: "k",
+        pgvectorReranker: {
+          enabled: true,
+          candidatePoolMax: 5,
+          maxCharsPerDoc: 800,
+        },
+      },
+    });
+    assert.equal(cfg.pgvectorRerankerCandidatePoolMax, 5);
+    assert.equal(cfg.pgvectorRerankerMaxCharsPerDoc, 800);
+  });
+
+  it("clamps negative / non-finite candidatePoolMax + maxCharsPerDoc to 0 (defense-in-depth)", () => {
+    const c1 = resolveConfig({
+      jina: { pgvectorReranker: { candidatePoolMax: -1, maxCharsPerDoc: -100 } },
+    });
+    assert.equal(c1.pgvectorRerankerCandidatePoolMax, 0);
+    assert.equal(c1.pgvectorRerankerMaxCharsPerDoc, 0);
+
+    const c2 = resolveConfig({
+      jina: {
+        pgvectorReranker: {
+          candidatePoolMax: Number.NaN,
+          maxCharsPerDoc: Number.POSITIVE_INFINITY,
+        },
+      },
+    });
+    assert.equal(c2.pgvectorRerankerCandidatePoolMax, 0);
+    assert.equal(c2.pgvectorRerankerMaxCharsPerDoc, 0);
+  });
+
+  it("honors jina.rpmBudget override (v3.2.4)", () => {
+    const cfg = resolveConfig({ jina: { apiKey: "k", rpmBudget: 30 } });
+    assert.equal(cfg.jinaRpmBudget, 30);
+  });
+
+  it("clamps negative / non-finite rpmBudget to 0 (v3.2.4)", () => {
+    assert.equal(
+      resolveConfig({ jina: { rpmBudget: -5 } }).jinaRpmBudget,
+      0,
+    );
+    assert.equal(
+      resolveConfig({ jina: { rpmBudget: Number.NaN } }).jinaRpmBudget,
+      0,
+    );
   });
 
   it("honors router.minConfidence override", () => {

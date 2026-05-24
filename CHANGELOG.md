@@ -7,6 +7,168 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.2.4] - 2026-05-24
+
+### Added — payload-size guards for the pgvector reranker
+
+Production observation on jerome's Jina dashboard (2026-05-17 →
+2026-05-24): rerank calls averaged **~66 600 tokens** each — way over
+the model's 8 K context window. Almost all of that came from LightRAG-
+side reranker chunking, but the plugin-side reranker would face the
+same risk once `knowledge_jerome` is alimented. v3.2.4 ships two
+preventive knobs to keep the plugin-side spend bounded:
+
+- **`jina.pgvectorReranker.candidatePoolMax`** (default `20`). Caps the
+  number of cosine-ranked candidates sent to Jina /v1/rerank. Pgvector
+  recall is typically 20-50 hits; only the top 10-15 are worth
+  reranking. Setting to `0` disables the cap (legacy v3.2.3 behavior).
+
+- **`jina.pgvectorReranker.maxCharsPerDoc`** (default `2000`). Pre-
+  truncates each candidate text BEFORE submission. Long chunks
+  (transcripts, books) carry most of their relevance signal in the
+  first ~2000 chars; the tail wastes Jina tokens without adding signal.
+  Setting to `0` disables truncation.
+
+Both guards are pure pre-filters — they do not alter the reranker's
+output ordering, only the input size.
+
+### Added — `jina` usage events
+
+The `JinaUsageEvent` shape (already exported since v3.2.0) is now
+actually emitted on every successful Jina API call:
+
+- **`/v1/classify`** — emitted from `decideRoute` via the new
+  `RouterConfig.onClassifierUsage` callback. `inputCount: 1` (one
+  query per call), `model: "zero-shot" | "few-shot"`.
+- **`/v1/rerank`** — emitted from `rerankPgvectorResults` via the new
+  `RerankPgvectorParams.onUsage` callback. `inputCount: N` (post-trim
+  document count).
+
+Dashboards can now graph Jina conso per turn AND per endpoint without
+re-deriving from log timestamps.
+
+### Added — soft RPM monitor
+
+A lightweight sliding-window counter (`src/jina/rate-limit.ts`)
+observes outbound Jina request rate across the whole plugin. When the
+configured `jina.rpmBudget` is exceeded within any 60-second window,
+the plugin:
+
+- emits a single `{type: "jina_rpm_exceeded", count, budget}` event
+  for that window,
+- logs a warning naming the budget and the observed count.
+
+**The call is never blocked.** The existing 429 cooldown breaker
+remains the hard backstop; the monitor only adds visibility so the
+operator can alert BEFORE billing surprises hit — especially relevant
+when the API key is shared with another service (e.g. Hindsight).
+Default budget: `60` RPM (well below the Jina free-tier 100 RPM
+ceiling). `0` disables the monitor.
+
+### LightRAG companion changes (operator action)
+
+A non-trivial share of Jina-token saving sits in the LightRAG `.env`
+config, NOT the plugin. The companion
+`openclaw-notes/lightrag/.env.template` is updated in the same patch
+to recommend:
+
+- `RERANK_MAX_TOKENS_PER_DOC=600` (was `480`): each candidate splits
+  into 2 sub-rerank calls instead of 3 (1200/600=2 vs 1200/480=3).
+  Cuts the per-rerank Jina spend by **~33%** at no quality cost
+  (sub-chunks remain complete; payload fits cleanly in v2's 8K
+  context window with no server-side truncation).
+- `MIN_RERANK_SCORE=0.05` (was `0.0`): drops pure-noise reranked
+  chunks. Cleaner injected context, ~10% fewer chars on the
+  downstream LLM prompt.
+- `RERANK_ENABLE_CHUNKING` stays `true` — disabling it would push
+  the cumulative payload (10 docs × 1200 tokens ≈ 12 K) over the
+  8 K v2-multilingual context window, triggering silent server-side
+  truncation (Jina's `truncate:true` policy) and lossy ranking. See
+  the `.env.template` block for the full operating-point comparison
+  (chunking-ON vs TOP_K=5 vs jina-reranker-v3).
+
+Apply on the NAS:
+
+```bash
+sudo vi /volume3/openclaw/lightrag/.env.jerome
+# Change: RERANK_MAX_TOKENS_PER_DOC=600
+# Change: MIN_RERANK_SCORE=0.05
+sudo docker restart openclaw-lightrag-jerome
+```
+
+Expected saving on jerome's observed rate: ~8.4 M → ~5.6 M tokens
+per 7 days (-33%), no quality regression.
+
+### Migration
+
+Drop-in plugin patch. Defaults preserve the v3.2.3 behavior on
+runtimes that don't set the new fields. To activate the new caps on
+both instances:
+
+```bash
+sudo docker exec openclaw-jerome openclaw plugins update @lacneu/openclaw-knowledge
+sudo docker exec openclaw-olivier openclaw plugins update @lacneu/openclaw-knowledge
+sudo docker restart openclaw-jerome openclaw-olivier
+```
+
+Verify post-restart:
+- `[knowledge.event] {"type":"jina","endpoint":"classify",...}` lines
+  appear on every classifier call.
+- `[knowledge.event] {"type":"jina","endpoint":"rerank","inputCount":N,...}`
+  lines appear on every rerank call. `inputCount` is now bounded by
+  `candidatePoolMax`.
+- `[knowledge.event] {"type":"jina_rpm_exceeded",...}` appears ONLY
+  during real overshoots (typically silent on single-user workloads).
+
+### Codex pass #33 correction (P2)
+
+`rpmBudget: 0` is documented as "disables the monitor entirely" on
+both `JinaPluginConfig.rpmBudget` and the `openclaw.plugin.json`
+schema. The initial implementation contradicted that promise: the
+overshoot check `count > this.budget` evaluated to `true` on the very
+first record (`1 > 0`), firing a spurious `jina_rpm_exceeded` event
+on every plugin turn.
+
+Fixed with defense-in-depth:
+
+- **`RpmMonitor.record()` / `RpmMonitor.peek()`** short-circuit to
+  `0` when `budget <= 0`. No timestamp tracked, no `onExceeded`
+  callback ever fires. Negative budgets get the same treatment.
+- **`src/index.ts`** skips constructing the monitor entirely when
+  `config.jinaRpmBudget === 0` — `rpmMonitor` becomes `undefined`
+  and every `rpmMonitor?.record()` callsite becomes a free no-op.
+
+### Codex pass #34 correction (P3)
+
+`RpmMonitor.lastExceededNotice` was initialized to `0`. The dedup
+check `t - lastExceededNotice >= 60_000` was unsatisfiable until
+simulated time reached 60s when a test clock started at `now=0` — a
+documented use case for `RpmMonitorOptions.now`. The first alert was
+silently suppressed during the first minute of any such test.
+
+Initialized to `Number.NEGATIVE_INFINITY` so the first overshoot
+fires regardless of clock origin. Production `Date.now()` was always
+well above 60_000, so this is a test-correctness fix with no behavior
+change in production.
+
+### Test coverage
+
+- Total: 271 tests, all green (was 250 in 3.2.3; +21 new).
+- New file `test/jina/rate-limit.test.ts` (12 tests) — sliding-window
+  count, 60s expiry, one-notice-per-window deduplication,
+  `DEFAULT_RPM_BUDGET` constant, **Codex #33 regression: budget=0
+  AND negative-budget disable the monitor completely**,
+  **Codex #34 regression: first overshoot fires even with a test
+  clock starting at `now=0`**.
+- 5 new tests in `test/pgvector.test.ts` — `candidatePoolMax` cap,
+  `maxCharsPerDoc` truncation, `onUsage` callback fires on success,
+  `onUsage` NOT fired on failure, legacy `undefined` keeps no-trim
+  behavior.
+- 4 new tests in `test/config.test.ts` — default values, override,
+  `[0, ∞)` clamping on the three new numeric fields.
+- 1 fixture update in `test/tracing/events.test.ts` for the new
+  `JinaRpmExceededEvent` shape.
+
 ## [3.2.3] - 2026-05-23
 
 ### Added — observability for "ran and matched nothing" (P1)

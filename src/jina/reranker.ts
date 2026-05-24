@@ -21,6 +21,7 @@
 //    empty array — the caller falls back to the original cosine order.
 
 import { postJson } from "./client.js";
+import type { RpmMonitor } from "./rate-limit.js";
 import type {
   JinaRerankRequest,
   RerankedItem,
@@ -50,6 +51,8 @@ export interface RerankParams {
   topN?: number;
   timeoutMs?: number;
   signal?: AbortSignal;
+  /** Optional RPM monitor (forwarded to {@link postJson}). @since 3.2.4 */
+  rpmMonitor?: RpmMonitor;
 }
 
 /**
@@ -71,6 +74,7 @@ export async function rerank({
   topN,
   timeoutMs,
   signal,
+  rpmMonitor,
 }: RerankParams): Promise<RerankedItem[]> {
   if (documents.length === 0) return [];
 
@@ -91,6 +95,7 @@ export async function rerank({
     apiKey,
     timeoutMs,
     signal,
+    rpmMonitor,
   });
 
   return parseRerankResponse(raw, documents.length);

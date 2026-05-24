@@ -16,6 +16,7 @@ import {
   classifyZeroShot,
 } from "../jina/classifier.js";
 import { JinaError } from "../jina/errors.js";
+import type { RpmMonitor } from "../jina/rate-limit.js";
 import {
   DEFAULT_ROUTER_LABELS,
   ROUTER_LABEL_NAMES,
@@ -57,6 +58,20 @@ export interface RouterConfig {
    * Trusting only confident scores keeps the gate fail-safe.
    */
   minConfidence?: number;
+  /**
+   * Optional callback fired AFTER a successful Jina `/v1/classify` call
+   * with payload-level numbers (duration, model). The plugin uses it to
+   * emit a `jina` usage event so dashboards can track classify spend
+   * per turn independently of the router decision.
+   *
+   * @since 3.2.4
+   */
+  onClassifierUsage?: (usage: {
+    durationMs: number;
+    model: "zero-shot" | "few-shot";
+  }) => void;
+  /** Optional RPM monitor (forwarded to the Jina client). @since 3.2.4 */
+  rpmMonitor?: RpmMonitor;
 }
 
 /**
@@ -128,6 +143,7 @@ export async function decideRoute(
   }
 
   try {
+    const startedAt = Date.now();
     const outcome = cfg.classifierId
       ? await classifyFewShot({
           apiKey: cfg.jinaApiKey,
@@ -135,13 +151,22 @@ export async function decideRoute(
           classifierId: cfg.classifierId,
           expectedLabels: ROUTER_LABEL_NAMES as string[],
           signal: ctx.signal,
+          rpmMonitor: cfg.rpmMonitor,
         })
       : await classifyZeroShot({
           apiKey: cfg.jinaApiKey,
           text: ctx.query,
           labels: (cfg.labels ?? DEFAULT_ROUTER_LABELS) as string[],
           signal: ctx.signal,
+          rpmMonitor: cfg.rpmMonitor,
         });
+
+    if (cfg.onClassifierUsage) {
+      cfg.onClassifierUsage({
+        durationMs: Date.now() - startedAt,
+        model: cfg.classifierId ? "few-shot" : "zero-shot",
+      });
+    }
 
     if (!outcome) {
       return { route: FALLBACK, reason: "classifier_fallback", score: null };

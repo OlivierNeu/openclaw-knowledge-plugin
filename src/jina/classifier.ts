@@ -22,6 +22,7 @@
 // → fail-open route).
 
 import { postJson } from "./client.js";
+import type { RpmMonitor } from "./rate-limit.js";
 import type {
   ClassificationOutcome,
   ClassifierEmbeddingModel,
@@ -46,6 +47,8 @@ export interface ZeroShotClassifyParams {
   model?: ClassifierEmbeddingModel;
   timeoutMs?: number;
   signal?: AbortSignal;
+  /** Optional RPM monitor (forwarded to {@link postJson}). @since 3.2.4 */
+  rpmMonitor?: RpmMonitor;
 }
 
 /**
@@ -65,6 +68,7 @@ export async function classifyZeroShot({
   model = DEFAULT_CLASSIFIER_MODEL,
   timeoutMs,
   signal,
+  rpmMonitor,
 }: ZeroShotClassifyParams): Promise<ClassificationOutcome | null> {
   if (labels.length < 2) {
     // Jina rejects requests with fewer than 2 labels; surface a clearer
@@ -84,6 +88,7 @@ export async function classifyZeroShot({
     apiKey,
     timeoutMs,
     signal,
+    rpmMonitor,
   });
 
   return parseClassificationResponse(raw, labels);
@@ -105,6 +110,8 @@ export interface FewShotClassifyParams {
   expectedLabels?: string[];
   timeoutMs?: number;
   signal?: AbortSignal;
+  /** Optional RPM monitor (forwarded to {@link postJson}). @since 3.2.4 */
+  rpmMonitor?: RpmMonitor;
 }
 
 /**
@@ -118,6 +125,7 @@ export async function classifyFewShot({
   expectedLabels,
   timeoutMs,
   signal,
+  rpmMonitor,
 }: FewShotClassifyParams): Promise<ClassificationOutcome | null> {
   if (!classifierId) {
     throw new Error("classifyFewShot: classifierId is required");
@@ -134,6 +142,7 @@ export async function classifyFewShot({
     apiKey,
     timeoutMs,
     signal,
+    rpmMonitor,
   });
 
   return parseClassificationResponse(raw, expectedLabels);

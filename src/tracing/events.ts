@@ -119,12 +119,26 @@ export interface CooldownEvent {
   consecutiveErrors: number;
 }
 
+/**
+ * Emitted (at most once per 60-second window) when the plugin's
+ * Jina RPM soft monitor observes the configured budget being exceeded.
+ * Pure observability — does not block any call.
+ *
+ * @since 3.2.4
+ */
+export interface JinaRpmExceededEvent {
+  type: "jina_rpm_exceeded";
+  count: number;
+  budget: number;
+}
+
 export type KnowledgeEvent =
   | RouterEvent
   | PgvectorEvent
   | LightRAGEvent
   | JinaUsageEvent
-  | CooldownEvent;
+  | CooldownEvent
+  | JinaRpmExceededEvent;
 
 // ---------------------------------------------------------------------------
 // Emitters

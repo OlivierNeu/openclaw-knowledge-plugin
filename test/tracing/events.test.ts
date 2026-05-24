@@ -10,6 +10,7 @@ import {
 } from "../../src/tracing/events.js";
 import type {
   CooldownEvent,
+  JinaRpmExceededEvent,
   JinaUsageEvent,
   KnowledgeEvent,
   LightRAGEvent,
@@ -85,6 +86,11 @@ describe("emitEvent", () => {
         scope: "router",
         consecutiveErrors: 3,
       } satisfies CooldownEvent,
+      {
+        type: "jina_rpm_exceeded",
+        count: 72,
+        budget: 60,
+      } satisfies JinaRpmExceededEvent,
     ];
 
     for (const evt of events) {
