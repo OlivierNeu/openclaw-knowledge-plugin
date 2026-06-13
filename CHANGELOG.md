@@ -86,12 +86,12 @@ Invalid `injectedChars` values (`NaN`, negative numbers) fall back to
 
 ### Added — payload-size guards for the pgvector reranker
 
-Production observation on jerome's Jina dashboard (2026-05-17 →
-2026-05-24): rerank calls averaged **~66 600 tokens** each — way over
-the model's 8 K context window. Almost all of that came from LightRAG-
-side reranker chunking, but the plugin-side reranker would face the
-same risk once `knowledge_jerome` is alimented. v3.2.4 ships two
-preventive knobs to keep the plugin-side spend bounded:
+Production observation: rerank calls were averaging far over the
+model's 8 K context window (**~66 600 tokens** each). Almost all of
+that came from LightRAG-side reranker chunking, but the plugin-side
+reranker would face the same risk once a shared collection is
+alimented. v3.2.4 ships two preventive knobs to keep the plugin-side
+spend bounded:
 
 - **`jina.pgvectorReranker.candidatePoolMax`** (default `20`). Caps the
   number of cosine-ranked candidates sent to Jina /v1/rerank. Pgvector
@@ -162,28 +162,28 @@ to recommend:
   the `.env.template` block for the full operating-point comparison
   (chunking-ON vs TOP_K=5 vs jina-reranker-v3).
 
-Apply on the NAS:
+Apply on the host:
 
 ```bash
-sudo vi /volume3/openclaw/lightrag/.env.jerome
+sudo vi /volume1/openclaw/lightrag/.env.agent
 # Change: RERANK_MAX_TOKENS_PER_DOC=600
 # Change: MIN_RERANK_SCORE=0.05
-sudo docker restart openclaw-lightrag-jerome
+sudo docker restart openclaw-lightrag-agent
 ```
 
-Expected saving on jerome's observed rate: ~8.4 M → ~5.6 M tokens
+Expected saving at the observed rate: ~8.4 M → ~5.6 M tokens
 per 7 days (-33%), no quality regression.
 
 ### Migration
 
 Drop-in plugin patch. Defaults preserve the v3.2.3 behavior on
-runtimes that don't set the new fields. To activate the new caps on
-both instances:
+runtimes that don't set the new fields. To activate the new caps,
+run on each configured instance:
 
 ```bash
-sudo docker exec openclaw-jerome openclaw plugins update @lacneu/openclaw-knowledge
-sudo docker exec openclaw-olivier openclaw plugins update @lacneu/openclaw-knowledge
-sudo docker restart openclaw-jerome openclaw-olivier
+# run on each configured instance
+sudo docker exec openclaw-agent openclaw plugins update @lacneu/openclaw-knowledge
+sudo docker restart openclaw-agent
 ```
 
 Verify post-restart:
@@ -290,9 +290,8 @@ metadata after every assistant turn:
 
 These are not user questions and have no business hitting the
 knowledge base. Previously the heuristic let them through, the
-Jina classifier was billed, and on jerome they typically scored 0.27
-→ `classifier_low_confidence` → ALL → wasted LightRAG call (the
-2026-05-23 19:42:05 case in the issue).
+Jina classifier was billed, and in production they typically scored
+~0.27 → `classifier_low_confidence` → ALL → wasted LightRAG call.
 
 The new META_PATTERN catches them at the start of the prompt:
 
@@ -309,9 +308,9 @@ who quotes the template inside a real question keeps their content.
 Drop-in patch. No config change required.
 
 ```bash
-sudo docker exec openclaw-jerome openclaw plugins update @lacneu/openclaw-knowledge
-sudo docker exec openclaw-olivier openclaw plugins update @lacneu/openclaw-knowledge
-sudo docker restart openclaw-jerome openclaw-olivier
+# run on each configured instance
+sudo docker exec openclaw-agent openclaw plugins update @lacneu/openclaw-knowledge
+sudo docker restart openclaw-agent
 ```
 
 After restart, expect:
@@ -415,7 +414,7 @@ only** — no SQL params, no query content — to keep PHI out of logs.
 
 ### Fixed — Jina classifier silently blocked retrieval on low-confidence scores
 
-After v3.2.1 fixed query extraction, jerome's production traces showed
+After v3.2.1 fixed query extraction, production traces showed
 that 6 out of 8 user turns ended up with `route=NONE` from
 `reason=classifier_hit` with scores tightly clustered around **0.25**:
 
@@ -433,7 +432,7 @@ retrieval on legitimate questions.
 Confirmed regression scenario, from a real chat-export on 2026-05-23:
 
 > Query: `"Quel est l'arbitrage principal de la réunion hebdomadaire
->         Ataraxis du 19 mai 2026 ?"`
+>         Acme du 19 mai 2026 ?"`
 > Classifier: `NONE @ 0.25` → router blocked the RAG.
 > The agent then recovered via the `gworkspace-search` skill, but the
 > RAG never contributed and the turn took 43 s + 5 tool calls instead
@@ -478,9 +477,9 @@ explicitly (e.g. for an evaluation A/B), set
 `jina.router.minConfidence: 0` via `openclaw config set`.
 
 ```bash
-sudo docker exec openclaw-jerome openclaw plugins update @lacneu/openclaw-knowledge
-sudo docker exec openclaw-olivier openclaw plugins update @lacneu/openclaw-knowledge
-sudo docker restart openclaw-jerome openclaw-olivier
+# run on each configured instance
+sudo docker exec openclaw-agent openclaw plugins update @lacneu/openclaw-knowledge
+sudo docker restart openclaw-agent
 ```
 
 After restart, watch the `[knowledge.event]` router lines: previously
@@ -506,7 +505,7 @@ clear the floor, defeating the guard.
 ### Test coverage
 
 - Total: 232 tests, all green (was 223 in 3.2.1; +9 new).
-- 7 new tests in `test/router/router.test.ts` covering the Ataraxis
+- 7 new tests in `test/router/router.test.ts` covering the Acme
   regression scenario, the exact boundary (`score === minConfidence`
   passes), a clear-match scenario above threshold, the few-shot path,
   the `minConfidence=0` escape hatch, the public-API safety case
@@ -552,9 +551,9 @@ Drop-in patch — no config change required. `update` the plugin and
 restart the gateway:
 
 ```bash
-sudo docker exec openclaw-jerome openclaw plugins update @lacneu/openclaw-knowledge
-sudo docker exec openclaw-olivier openclaw plugins update @lacneu/openclaw-knowledge
-sudo docker restart openclaw-jerome openclaw-olivier
+# run on each configured instance
+sudo docker exec openclaw-agent openclaw plugins update @lacneu/openclaw-knowledge
+sudo docker restart openclaw-agent
 ```
 
 After the restart, `[knowledge.event]` logs should show `queryLength`
@@ -788,7 +787,7 @@ passes (2026-05-23):
 
 - **Privacy: query preview removed from debug logs.** The original
   `emitQueryPreview` logged the first 80 chars of every user query when
-  `logger.debug` was active. In Ataraxis-style deployments those queries
+  `logger.debug` was active. In production deployments those queries
   routinely carry PHI / client content / occasionally secrets, so even a
   truncated preview was a leak vector. Replaced by `emitQueryFingerprint`
   which logs a non-reversible SHA-256 prefix (`fp=<12 hex chars>`) and
@@ -974,7 +973,7 @@ For instance owners on `@lacneu/openclaw-knowledge@3.1.0` or `3.1.1`:
   format (`### Document Search Results` + `### Knowledge Graph Context`), same
   parallel execution via `Promise.allSettled`, same cooldown (3 errors → 5 min),
   same Gemini native `embedContent` endpoint, same `halfvec(3072)` SQL cast.
-- Current plugin configurations (Olivier and Jerome instances) continue to work
+- Existing plugin configurations continue to work
   without any changes — all config keys and defaults are preserved. The breaking
   changes below are limited to internal types and legacy input shapes that were
   defensive cruft, not fields used by active deployments.

@@ -189,9 +189,9 @@ describe("decideRoute — low-confidence guard", () => {
   const THRESHOLD = 0.35;
 
   it("falls back to ALL with classifier_low_confidence when score < minConfidence", async () => {
-    // Regression scenario observed on jerome (2026-05-23):
+    // Regression scenario observed in production:
     //   Query: "Quel est l'arbitrage principal de la réunion hebdomadaire
-    //           Ataraxis du 19 mai 2026 ?"
+    //           Acme du 19 mai 2026 ?"
     //   Classifier returned NONE @ 0.25 (noise floor — no real match),
     //   the router trusted it and silently blocked RAG retrieval.
     // With minConfidence=0.35 the router MUST fail open instead.
@@ -219,7 +219,7 @@ describe("decideRoute — low-confidence guard", () => {
       { ...BASE_CFG, minConfidence: THRESHOLD },
       {
         query:
-          "Quel est l'arbitrage principal de la réunion hebdomadaire Ataraxis du 19 mai 2026 ?",
+          "Quel est l'arbitrage principal de la réunion hebdomadaire Acme du 19 mai 2026 ?",
       },
     );
     assert.equal(d.route, "ALL");

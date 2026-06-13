@@ -60,7 +60,7 @@ describe("stripOpenClawHeaders", () => {
   it("strips multiple stacked metadata blocks (Conversation info + Sender) + marker", () => {
     const prompt =
       "Conversation info (untrusted metadata):\n```yaml\nchannel: webchat\n```\n\n" +
-      senderBlock("olivier@example.com", "u-42") +
+      senderBlock("alice@example.com", "u-42") +
       DEFAULT_MARKER +
       "Quel est la version du plugin knowledge ?";
     assert.equal(
@@ -86,7 +86,7 @@ describe("stripOpenClawHeaders", () => {
     // JSON preamble as part of the user query.
     const prompt =
       "Conversation info (untrusted metadata):\n```yaml\nchannel: webchat\nts: 2026-05-23T19:40Z\n```\n\n" +
-      senderBlock("olivier@example.com", "u-42") +
+      senderBlock("alice@example.com", "u-42") +
       "Quel est la version du plugin ?";
     assert.equal(stripOpenClawHeaders(prompt), "Quel est la version du plugin ?");
   });
@@ -98,7 +98,7 @@ describe("stripOpenClawHeaders", () => {
     // observed in production.
     const prompt =
       DEFAULT_MARKER +
-      senderBlock("olivier@example.com", "u-42") +
+      senderBlock("alice@example.com", "u-42") +
       "Quel est la version du plugin ?";
     assert.equal(stripOpenClawHeaders(prompt), "Quel est la version du plugin ?");
   });
@@ -107,7 +107,7 @@ describe("stripOpenClawHeaders", () => {
     const prompt =
       DEFAULT_MARKER +
       "Conversation info (untrusted metadata):\n```yaml\nchannel: webchat\n```\n\n" +
-      senderBlock("olivier@example.com", "u-42") +
+      senderBlock("alice@example.com", "u-42") +
       "question réelle";
     assert.equal(stripOpenClawHeaders(prompt), "question réelle");
   });

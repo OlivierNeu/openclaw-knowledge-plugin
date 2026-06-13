@@ -354,7 +354,7 @@ describe("before_prompt_build — LightRAG execution", () => {
       ok: true,
       json: async () => ({
         response:
-          "Entity: ACME Corp. Relation: signed contract with Olivier.",
+          "Entity: ACME Corp. Relation: signed contract with Alice.",
       }),
     }) as unknown as Response);
 
@@ -901,7 +901,7 @@ describe("before_prompt_build — v3.2.3 observability", () => {
       ok: true,
       json: async () => ({
         response:
-          "Entity: ACME Corp. Relation: signed contract with Olivier. " +
+          "Entity: ACME Corp. Relation: signed contract with Alice. " +
           "Additional context line one. Additional context line two. " +
           "Additional context line three. ".repeat(5),
       }),
@@ -1212,7 +1212,7 @@ describe("before_prompt_build — v3.2.3 OWUI auto-prompt short-circuit", () => 
     mock.method(globalThis, "fetch", async () => ({
       ok: true,
       json: async () => ({
-        response: "Entity: Ataraxis CR. " + "x".repeat(300),
+        response: "Entity: Acme CR. " + "x".repeat(300),
       }),
     }) as unknown as Response);
 
@@ -1222,7 +1222,7 @@ describe("before_prompt_build — v3.2.3 OWUI auto-prompt short-circuit", () => 
         {
           role: "user",
           content:
-            "### Task:\nSummarize the latest Ataraxis CR meeting.\n" +
+            "### Task:\nSummarize the latest Acme CR meeting.\n" +
             "### Guidelines:\n- Cite sources.\n" +
             '### Output:\nJSON format: { "summary": "...", "decisions": [...] }',
         },

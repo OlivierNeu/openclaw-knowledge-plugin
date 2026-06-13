@@ -1,7 +1,7 @@
 // Default zero-shot labels for the Jina Classifier.
 //
 // The labels are intentionally bilingual: most prompts in the observed
-// traces are French (Ataraxis is a French-speaking deployment) but the
+// traces are French (the deployment is French-speaking) but the
 // system prompts and agent meta-questions are often English. Jina
 // `jina-embeddings-v3` handles both languages natively.
 //

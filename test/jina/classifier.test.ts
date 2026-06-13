@@ -9,7 +9,7 @@ import {
   parseClassificationResponse,
 } from "../../src/jina/classifier.js";
 
-const LABELS = ["NO_RETRIEVAL", "ATARAXIS_RETRIEVAL", "HYBRID"];
+const LABELS = ["NO_RETRIEVAL", "ACME_RETRIEVAL", "HYBRID"];
 
 describe("classifyZeroShot — request shape", () => {
   afterEach(() => mock.restoreAll());
@@ -144,10 +144,10 @@ describe("parseClassificationResponse — defensive shape handling", () => {
 
   it("parses shape #3: data[].label (flat)", () => {
     const r = parseClassificationResponse(
-      { data: [{ label: "ATARAXIS_RETRIEVAL", score: 0.81 }] },
+      { data: [{ label: "ACME_RETRIEVAL", score: 0.81 }] },
       LABELS,
     );
-    assert.deepEqual(r, { label: "ATARAXIS_RETRIEVAL", score: 0.81 });
+    assert.deepEqual(r, { label: "ACME_RETRIEVAL", score: 0.81 });
   });
 
   it("parses shape #4: data[].prediction + confidence aliases", () => {

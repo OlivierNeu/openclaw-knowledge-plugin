@@ -50,15 +50,15 @@ const DEFAULT_ROUTER_MODE: "heuristic" | "jina-classifier" = "heuristic";
 // (`DEFAULT_MIN_CONFIDENCE`). Re-export of a local alias would create
 // two sources of truth — we import the single constant instead.
 //
-// Empirical observation on jerome's traces (v3.2.1 deployment): Jina v3
+// Empirical observation in production traces (v3.2.1 deployment): Jina v3
 // zero-shot scores cluster at 0.25-0.27 when no label actually matches
 // the query, then resolve to a noisy `NONE` decision that wrongly
 // blocks retrieval. A floor of 0.35 catches that noise band while
 // staying below typical hit scores (≈ 0.40-0.65).
 const DEFAULT_RERANKER_MODEL: RerankerModel = "jina-reranker-v2-base-multilingual";
 const DEFAULT_RERANKER_TOP_N = 5;
-// 3.2.4 — payload-trimming defaults. Empirically calibrated on jerome's
-// Jina dashboard (2026-05-17 → 2026-05-24): 20 candidates × 2000 chars
+// 3.2.4 — payload-trimming defaults. Empirically calibrated from the
+// production Jina dashboard: 20 candidates × 2000 chars
 // fits in ~10K tokens (well below jina-reranker-v2's 8K context window
 // once the query is added) while preserving the top-precision band.
 const DEFAULT_RERANKER_CANDIDATE_POOL_MAX = 20;

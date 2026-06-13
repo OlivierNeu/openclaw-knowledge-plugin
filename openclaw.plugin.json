@@ -207,7 +207,7 @@
     "collections": {
       "label": "Collections to search",
       "placeholder": "knowledge_default",
-      "help": "Collection names in the knowledge_vectors table (e.g. knowledge_olivier, knowledge_shared)"
+      "help": "Collection names in the knowledge_vectors table (e.g. knowledge_default, knowledge_shared)"
     },
     "topK": {
       "label": "Top-K per collection",

@@ -280,7 +280,7 @@ a structured event line:
 
 ```
 [knowledge.event] {"type":"router","route":"PGVECTOR_ONLY","reason":"heuristic_keyword","score":null,"queryLength":42,"trigger":"user"}
-[knowledge.event] {"type":"pgvector","collections":["knowledge_olivier"],"rawCount":5,"rerankedCount":5,"topScore":0.78,"durationMs":124}
+[knowledge.event] {"type":"pgvector","collections":["knowledge_default"],"rawCount":5,"rerankedCount":5,"topScore":0.78,"durationMs":124}
 [knowledge.event] {"type":"cooldown","scope":"router","consecutiveErrors":3}
 ```
 

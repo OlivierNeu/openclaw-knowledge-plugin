@@ -187,7 +187,7 @@ describe("heuristicRoute — meta-agent regex", () => {
     // these prompts injects the `<chat_history>` block, so they MUST
     // reach the knowledge sources.
     const ambiguousButLegit = [
-      "### Task:\nSummarize the latest Ataraxis CR meeting.\n" +
+      "### Task:\nSummarize the latest Acme CR meeting.\n" +
         '### Output:\nJSON format: { "summary": "...", "decisions": [...] }',
       "### Task:\nAssign tags to the IFOA V5 document.\n" +
         '### Output:\nJSON format: { "tags": ["...", "..."] }',
@@ -282,7 +282,7 @@ describe("heuristicRoute — CLI trivial pings", () => {
 
 describe("heuristicRoute — keyword fast-paths", () => {
   it("routes to PGVECTOR_ONLY on 'version'", () => {
-    const v = heuristicRoute({ query: "quelle est la version d'OpenClaw de Jerome ?" });
+    const v = heuristicRoute({ query: "quelle est la version d'OpenClaw d'Alice ?" });
     assert.equal(v.route, "PGVECTOR_ONLY");
     assert.equal(v.reason, "heuristic_keyword");
   });
