@@ -82,9 +82,14 @@ describe("plugin metadata", () => {
   it("exposes correct plugin metadata", () => {
     assert.equal(plugin.id, "openclaw-knowledge");
     assert.equal(plugin.name, "Knowledge Base");
+    // `description` is typed `string | undefined` on the public supertype
+    // `OpenClawPluginDefinition` (we annotate the default export with the
+    // public type to keep `dist/index.d.ts` portable — see comment in
+    // `src/index.ts`). Narrow it explicitly before the substring asserts.
     assert.equal(typeof plugin.description, "string");
-    assert.ok(plugin.description.includes("pgvector"));
-    assert.ok(plugin.description.includes("LightRAG"));
+    const description = plugin.description ?? "";
+    assert.ok(description.includes("pgvector"));
+    assert.ok(description.includes("LightRAG"));
   });
 });
 

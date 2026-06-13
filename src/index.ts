@@ -24,6 +24,7 @@
 import pg from "pg";
 
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
+import type { OpenClawPluginDefinition } from "openclaw/plugin-sdk/plugin-entry";
 import type {
   OpenClawPluginApi,
   PluginLogger,
@@ -1087,7 +1088,15 @@ export function registerKnowledgePlugin(api: OpenClawPluginApi): void {
 // Canonical plugin entry
 // ---------------------------------------------------------------------------
 
-export default definePluginEntry({
+// Explicit annotation on the default export, otherwise TS2742 fires when
+// `declaration: true` is on: `definePluginEntry`'s return type
+// (`DefinedPluginEntry`) is a module-local alias that is NOT exported by
+// the SDK's public surface, so TypeScript has no portable name to write
+// into our emitted `dist/index.d.ts`. Pinning to the publicly-exported
+// supertype `OpenClawPluginDefinition` resolves the diagnostic without
+// loosening type safety (the return type is structurally assignable to
+// it — see `Pick<OpenClawPluginDefinition, …>` in the SDK definition).
+const knowledgePluginEntry: OpenClawPluginDefinition = definePluginEntry({
   id: "openclaw-knowledge",
   name: "Knowledge Base",
   description:
@@ -1096,3 +1105,5 @@ export default definePluginEntry({
     registerKnowledgePlugin(api);
   },
 });
+
+export default knowledgePluginEntry;
