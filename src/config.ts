@@ -5,6 +5,7 @@
 
 import { DEFAULT_RPM_BUDGET } from "./jina/rate-limit.js";
 import type { RerankerModel } from "./jina/types.js";
+import { resolveProvenanceLevel } from "./provenance.js";
 import { DEFAULT_MIN_CONFIDENCE } from "./router/index.js";
 import type {
   JinaPluginConfig,
@@ -133,6 +134,11 @@ export function resolveConfig(
     pgvectorRerankerMaxCharsPerDoc: clampNonNegInt(
       reranker.maxCharsPerDoc ?? DEFAULT_RERANKER_MAX_CHARS_PER_DOC,
     ),
+
+    // 3.3.0 — provenance reporting toward chat frontends. Off-list values
+    // (typos, future levels) normalize to "off": a misconfiguration must
+    // never silently leak content.
+    provenanceReport: resolveProvenanceLevel(cfg.provenanceReport),
   };
 }
 

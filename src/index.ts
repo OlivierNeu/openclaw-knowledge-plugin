@@ -30,10 +30,18 @@ import type {
 } from "openclaw/plugin-sdk/plugin-entry";
 
 import { resolveConfig } from "./config.js";
+import {
+  buildLightRAGProvenance,
+  buildPgvectorProvenance,
+  emitProvenanceReports,
+  resolveEmitAgentEvent,
+  type EmitAgentEventFn,
+  type ProvenanceReportV1,
+} from "./provenance.js";
 import { embedQuery } from "./embeddings.js";
 import {
   searchCollection,
-  formatPgvectorResults,
+  formatPgvectorResultsDetailed,
   rerankPgvectorResults,
 } from "./pgvector.js";
 import { queryLightRAG, formatLightRAGResults } from "./lightrag.js";
@@ -117,6 +125,13 @@ interface HookHandlerDeps {
   config: ResolvedKnowledgeConfig;
   pool: PgPoolLike | null;
   logger: PluginLogger;
+  /**
+   * Gateway agent-event emitter for provenance reports (provenance/v1).
+   * `undefined` on SDKs that predate emitAgentEvent — the handler then
+   * degrades to silence. MUST be bound to the FIRST registration's api
+   * (gateway re-registration quirk; see registerKnowledgePlugin).
+   */
+  emitAgentEvent?: EmitAgentEventFn;
 }
 
 /**
@@ -239,6 +254,7 @@ export function createBeforePromptBuildHandler(
       const settled = await Promise.allSettled(tasks);
 
       const sections: string[] = [];
+      const provenanceReports: (ProvenanceReportV1 | null)[] = [];
       let failedSources = 0;
 
       for (const result of settled) {
@@ -252,7 +268,10 @@ export function createBeforePromptBuildHandler(
         }
 
         const section = renderSection(result.value, config, logger);
-        if (section) sections.push(section);
+        if (section) {
+          sections.push(section.text);
+          provenanceReports.push(section.provenance);
+        }
       }
 
       // If every source we launched failed, treat the turn as a failure for
@@ -266,6 +285,17 @@ export function createBeforePromptBuildHandler(
       cooldowns.global.consecutiveErrors = 0;
 
       if (sections.length === 0) return undefined;
+
+      // Provenance reports describe EXACTLY the sections returned below —
+      // emitted just before the injection is handed to the gateway, so a
+      // dropped turn can never have reported sources it did not use.
+      emitProvenanceReports(
+        deps.emitAgentEvent,
+        logger,
+        ctx?.runId,
+        ctx?.sessionKey,
+        provenanceReports,
+      );
 
       return {
         appendSystemContext: [
@@ -799,13 +829,24 @@ async function runLightRAGSource(
   return { source: "lightrag", data: context, durationMs: Date.now() - startedAt };
 }
 
+/**
+ * Render one source's injectable section AND its provenance report (built
+ * HERE because this is where the final truncation happens — the report must
+ * mirror EXACTLY what reaches the LLM, contract rule "emit what was
+ * injected, not what was retrieved").
+ */
+interface RenderedSection {
+  text: string;
+  provenance: ProvenanceReportV1 | null;
+}
+
 function renderSection(
   result: SourceResult,
   config: ResolvedKnowledgeConfig,
   logger: PluginLogger,
-): string | null {
+): RenderedSection | null {
   if (result.source === "pgvector") {
-    const formatted = formatPgvectorResults(result.data, config.maxInjectChars);
+    const formatted = formatPgvectorResultsDetailed(result.data, config.maxInjectChars);
     const topScore = result.data[0]?.score?.toFixed(2) ?? "n/a";
     const rerankNote = result.reranked ? " [reranked]" : "";
     // Emit the event UNCONDITIONALLY — even when pgvector returned no
@@ -838,10 +879,27 @@ function renderSection(
       );
       return null;
     }
+    // `injectedCount` is the count of entries that actually fit in
+    // `maxInjectChars`. It is `<= result.data.length` — anything past the
+    // budget was dropped by `formatPgvectorResults`. The provenance
+    // report MUST mirror the injected subset (contract: "emit what was
+    // injected, not what was retrieved"), not the post-rerank candidate
+    // list — otherwise `metadata` mode leaks file names and `full` mode
+    // leaks excerpts of documents that never reached the LLM.
+    const injected = result.data.slice(0, formatted.injectedCount);
     logger.info(
-      `openclaw-knowledge: pgvector — ${result.data.length} result(s)${rerankNote} (top: ${topScore})`,
+      `openclaw-knowledge: pgvector — ${formatted.injectedCount}/${result.data.length} result(s)${rerankNote} (top: ${topScore})`,
     );
-    return "### Document Search Results (pgvector)\n" + formatted;
+    const text = "### Document Search Results (pgvector)\n" + formatted.output;
+    return {
+      text,
+      provenance: buildPgvectorProvenance(
+        injected,
+        config.collections,
+        config.provenanceReport,
+        text.length,
+      ),
+    };
   }
 
   if (result.source === "lightrag") {
@@ -867,7 +925,21 @@ function renderSection(
     logger.info(
       `openclaw-knowledge: LightRAG — ${formatted.truncated.length}/${formatted.originalLength} chars (truncated from ${formatted.originalLength})`,
     );
-    return "### Knowledge Graph Context (LightRAG)\n" + formatted.truncated;
+    const text = "### Knowledge Graph Context (LightRAG)\n" + formatted.truncated;
+    return {
+      text,
+      // `text.length` (header INCLUDED) is what actually reaches the LLM —
+      // pass it through so the provenance `injected.chars` field matches.
+      // The `formatted.truncated` body is still used for the `full`-level
+      // excerpt because the header is structural noise (no semantic
+      // content worth surfacing to the chat frontend).
+      provenance: buildLightRAGProvenance(
+        formatted.truncated,
+        config.lightragQueryMode,
+        config.provenanceReport,
+        text.length,
+      ),
+    };
   }
 
   return null;
@@ -921,7 +993,13 @@ function registerError(
  * OpenClaw plugin API. Returns nothing; side effects are setting a hook and
  * logging the initial status.
  */
+// FIRST registration's api (gateway re-registration quirk — see the handler
+// wiring below). Module-level: the ESM cache is per-process, so every later
+// registration in the same gateway process sees the original, "loaded" api.
+let stableApi: OpenClawPluginApi | null = null;
+
 export function registerKnowledgePlugin(api: OpenClawPluginApi): void {
+  if (stableApi === null) stableApi = api;
   const rawConfig = (api.pluginConfig ?? {}) as KnowledgePluginConfig;
   const config = resolveConfig(rawConfig);
 
@@ -985,6 +1063,12 @@ export function registerKnowledgePlugin(api: OpenClawPluginApi): void {
     config,
     pool,
     logger: api.logger,
+    // Provenance reports ride the agent-event bus. GATEWAY QUIRK
+    // (bench-verified 2026-06-12): the runtime RE-REGISTERS plugins per run
+    // and emitting through a re-registration's api is rejected "plugin is
+    // not loaded" — only the FIRST registration's api stays loaded, hence
+    // the module-level singleton.
+    emitAgentEvent: resolveEmitAgentEvent(stableApi ?? api),
   });
 
   // The SDK's `api.on<K>` signature is strongly typed per hook name, so we

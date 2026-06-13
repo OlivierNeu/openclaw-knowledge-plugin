@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import {
   searchCollection,
   formatPgvectorResults,
+  formatPgvectorResultsDetailed,
   rerankPgvectorResults,
 } from "../src/pgvector.js";
 import type { PgPoolLike, PgvectorRow, PgvectorResult } from "../src/types.js";
@@ -118,6 +119,10 @@ describe("searchCollection", () => {
 });
 
 describe("formatPgvectorResults", () => {
+  // Public API — signature is `(results, maxChars): string | null` and MUST
+  // stay stable across v3.x. Callers needing the count of entries actually
+  // injected use the internal `formatPgvectorResultsDetailed` variant
+  // (covered by the next `describe` block).
   it("returns null for empty results", () => {
     assert.equal(formatPgvectorResults([], 4000), null);
   });
@@ -139,11 +144,11 @@ describe("formatPgvectorResults", () => {
         timestamp_end: null,
       },
     ];
-    const output = formatPgvectorResults(results, 4000);
+    const formatted = formatPgvectorResults(results, 4000);
 
-    assert.ok(output !== null);
-    assert.ok(output!.includes("[knowledge] doc.pdf (score: 0.95)"));
-    assert.ok(output!.includes("Content: hello"));
+    assert.ok(formatted !== null);
+    assert.ok(formatted!.includes("[knowledge] doc.pdf (score: 0.95)"));
+    assert.ok(formatted!.includes("Content: hello"));
   });
 
   it("shows 'unknown' when file_name is missing", () => {
@@ -163,9 +168,9 @@ describe("formatPgvectorResults", () => {
         timestamp_end: null,
       },
     ];
-    const output = formatPgvectorResults(results, 4000);
+    const formatted = formatPgvectorResults(results, 4000);
 
-    assert.ok(output!.includes("[col] unknown (score: 0.50)"));
+    assert.ok(formatted!.includes("[col] unknown (score: 0.50)"));
   });
 
   it("includes timestamps when present", () => {
@@ -185,9 +190,9 @@ describe("formatPgvectorResults", () => {
         total_chunks: null,
       },
     ];
-    const output = formatPgvectorResults(results, 4000);
+    const formatted = formatPgvectorResults(results, 4000);
 
-    assert.ok(output!.includes("Segment: 00:05:30 - 00:06:15"));
+    assert.ok(formatted!.includes("Segment: 00:05:30 - 00:06:15"));
   });
 
   it("respects maxChars limit", () => {
@@ -206,8 +211,9 @@ describe("formatPgvectorResults", () => {
       timestamp_end: null,
     }));
 
-    const output = formatPgvectorResults(results, 500);
-    assert.ok(output!.length <= 500);
+    const formatted = formatPgvectorResults(results, 500);
+    assert.ok(formatted !== null);
+    assert.ok(formatted!.length <= 500);
   });
 
   it("includes multiple results in order", () => {
@@ -241,11 +247,132 @@ describe("formatPgvectorResults", () => {
         timestamp_end: null,
       },
     ];
-    const output = formatPgvectorResults(results, 4000);
+    const formatted = formatPgvectorResults(results, 4000);
 
-    const firstIdx = output!.indexOf("first.pdf");
-    const secondIdx = output!.indexOf("second.pdf");
+    const firstIdx = formatted!.indexOf("first.pdf");
+    const secondIdx = formatted!.indexOf("second.pdf");
     assert.ok(firstIdx < secondIdx);
+  });
+
+  it("returns null when even the first entry exceeds the budget", () => {
+    // Pre-v3.2.5 the helper returned `""` (falsy) so the caller's
+    // `if (!formatted)` skipped injection. The internal Detailed variant
+    // explicitly returns null in this case; the public wrapper inherits
+    // that behavior via `?.output ?? null`. Documented here so a future
+    // refactor cannot silently regress the "skip when nothing fits"
+    // semantics.
+    const results: PgvectorResult[] = [
+      {
+        collection: "col",
+        score: 0.9,
+        file_name: "huge.pdf",
+        text: "x".repeat(1000),
+        mime_type: null,
+        file_id: null,
+        source: null,
+        owner: null,
+        chunk_index: null,
+        total_chunks: null,
+        timestamp_start: null,
+        timestamp_end: null,
+      },
+    ];
+    assert.equal(formatPgvectorResults(results, 50), null);
+  });
+});
+
+describe("formatPgvectorResultsDetailed", () => {
+  // Internal variant — exposes `injectedCount` so the plugin's render path
+  // can size the provenance report exactly to what reached the LLM
+  // (PROVENANCE_CONTRACT: "emit what was injected, not what was retrieved").
+  it("returns null for empty results", () => {
+    assert.equal(formatPgvectorResultsDetailed([], 4000), null);
+  });
+
+  it("reports injectedCount === results.length when the budget is not hit", () => {
+    const results: PgvectorResult[] = [
+      {
+        collection: "a",
+        score: 0.9,
+        file_name: "first.pdf",
+        text: "aaa",
+        mime_type: null,
+        file_id: null,
+        source: null,
+        owner: null,
+        chunk_index: null,
+        total_chunks: null,
+        timestamp_start: null,
+        timestamp_end: null,
+      },
+      {
+        collection: "b",
+        score: 0.8,
+        file_name: "second.pdf",
+        text: "bbb",
+        mime_type: null,
+        file_id: null,
+        source: null,
+        owner: null,
+        chunk_index: null,
+        total_chunks: null,
+        timestamp_start: null,
+        timestamp_end: null,
+      },
+    ];
+    const detailed = formatPgvectorResultsDetailed(results, 4000);
+    assert.ok(detailed !== null);
+    assert.equal(detailed!.injectedCount, 2);
+    assert.ok(detailed!.output.includes("first.pdf"));
+    assert.ok(detailed!.output.includes("second.pdf"));
+  });
+
+  it("truncates and reports a strictly smaller injectedCount when budget bites", () => {
+    const results: PgvectorResult[] = Array.from({ length: 100 }, (_, i) => ({
+      collection: "col",
+      score: 0.9,
+      file_name: `file${i}.pdf`,
+      text: "x".repeat(100),
+      mime_type: null,
+      file_id: null,
+      source: null,
+      owner: null,
+      chunk_index: null,
+      total_chunks: null,
+      timestamp_start: null,
+      timestamp_end: null,
+    }));
+
+    const detailed = formatPgvectorResultsDetailed(results, 500);
+    assert.ok(detailed !== null);
+    assert.ok(detailed!.output.length <= 500);
+    // `injectedCount` MUST be strictly less than the input length whenever
+    // the budget bites — this is exactly the assertion the provenance
+    // contract relies on to slice `result.data` accurately.
+    assert.ok(detailed!.injectedCount > 0);
+    assert.ok(detailed!.injectedCount < results.length);
+  });
+
+  it("returns null when even the first entry exceeds the budget", () => {
+    // Same regression guard as the public wrapper — kept here so the
+    // Detailed-shape contract is pinned independently.
+    const results: PgvectorResult[] = [
+      {
+        collection: "col",
+        score: 0.9,
+        file_name: "huge.pdf",
+        text: "x".repeat(1000),
+        mime_type: null,
+        file_id: null,
+        source: null,
+        owner: null,
+        chunk_index: null,
+        total_chunks: null,
+        timestamp_start: null,
+        timestamp_end: null,
+      },
+    ];
+    assert.equal(formatPgvectorResultsDetailed(results, 50), null);
   });
 });
 

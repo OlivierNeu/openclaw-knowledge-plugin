@@ -7,6 +7,81 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — provenance reporting (provenance/v1, opt-in)
+
+New `provenanceReport` config (`"off"` default | `"metadata"` | `"full"`).
+When enabled, every injected knowledge section also emits a structured
+provenance report on the gateway agent-event bus (stream
+`openclaw-knowledge.provenance`) so a chat frontend (openclaw-webchat) can
+show the user **which documents fed this reply** — pgvector items carry
+`file_name`/`collection`/`score` (and the exact injected excerpt at `full`),
+LightRAG carries the mode and the injected context excerpt. The report mirrors
+EXACTLY what reached the LLM (post-rerank, post-truncation), never the raw
+retrieval. Normative contract: openclaw-webchat `docs/PROVENANCE_CONTRACT.md`.
+
+Robustness/privacy invariants: emission degrades to SILENCE on old SDKs
+(`emitAgentEvent` feature-detected), on a missing `runId`, or on a gateway
+rejection (logged, metadata only); reports never go through logs; the gateway
+re-registration quirk is handled by emitting through the FIRST registration's
+api (module singleton). Off-list config values normalize to `"off"`.
+
+### Fixed — pgvector provenance now reports ONLY entries actually injected
+
+`buildPgvectorProvenance` was previously fed the full post-rerank list
+(`result.data`) instead of the post-`maxInjectChars` subset that actually
+reaches the LLM. When the character budget truncated the list,
+`formatPgvectorResults` `break`ed after the budget was exhausted but the
+provenance report still exposed metadata (and excerpts in `full` mode) for
+the dropped entries — leaking file names and content for documents the
+LLM never saw, in violation of the PROVENANCE_CONTRACT rule "emit what was
+injected, not what was retrieved".
+
+A new internal helper `formatPgvectorResultsDetailed(results, maxChars):
+{ output, injectedCount } | null` carries the truncation logic and exposes
+the count of entries that actually fit the budget; `renderSection` uses it
+to slice `result.data` to the exact prefix injected and pass it to
+`buildPgvectorProvenance`. The public `formatPgvectorResults` signature
+remains `(results, maxChars) => string | null` (a thin wrapper over the
+Detailed variant) — preserving backward compatibility across the v3.x
+line. Both helpers return `null` when no entry fits the budget,
+preserving the prior `if (!formatted)` skip-path. The LightRAG provenance
+path was unaffected because it already used the post-truncation
+`formatted.truncated` text directly.
+
+### Fixed — provenance emission failures never leak payload to logs (codex pass #36 P2)
+
+`emitProvenanceReports` previously interpolated the gateway's raw `reason`
+string AND the caught `Error.message` into its `logger.warn` lines.
+Either path could echo back content the emitter was rejecting — the
+gateway commonly cites the offending field/value in its validation
+reasons, and third-party libs routinely enrich `Error.message` with input
+data. That broke the module-level invariant that report content NEVER
+reaches logs.
+
+The helper now classifies rejection reasons to a stable category code
+(`plugin_not_loaded`, `missing_run_context`, `invalid_stream`,
+`validation_error`, `rate_limited`, `rejected`) and, for thrown errors,
+logs only `throw:<Error.name>` (constructor name only — never `.message`,
+never the raw exception). Operators still get enough signal to triage;
+no payload byte can reach the log stream.
+
+### Fixed — LightRAG provenance `injected.chars` matches what the LLM actually saw (codex pass #36 P3)
+
+`buildLightRAGProvenance` was being called with `formatted.truncated`,
+which is the BODY of the section. The block actually delivered to the
+LLM also includes the `### Knowledge Graph Context (LightRAG)\n` header,
+so the report's `injected.chars` field was systematically short by the
+header length — contradicting the PROVENANCE_CONTRACT promise that the
+field reflects exactly what reached the model.
+
+`buildLightRAGProvenance` now takes an optional fourth parameter
+`injectedChars` for callers that track the full section length
+separately. The plugin's render path passes `text.length` (header
+INCLUDED). The `full`-level excerpt body remains the post-truncation
+context (the header carries no semantic content for the chat frontend).
+Invalid `injectedChars` values (`NaN`, negative numbers) fall back to
+`injectedText.length` to keep the report well-formed.
+
 ## [3.2.4] - 2026-05-24
 
 ### Added — payload-size guards for the pgvector reranker

@@ -25,8 +25,12 @@
       },
       "collections": {
         "type": "array",
-        "items": { "type": "string" },
-        "default": ["knowledge_default"],
+        "items": {
+          "type": "string"
+        },
+        "default": [
+          "knowledge_default"
+        ],
         "description": "Collection names to search in the knowledge_vectors table"
       },
       "topK": {
@@ -63,7 +67,12 @@
       },
       "lightragQueryMode": {
         "type": "string",
-        "enum": ["naive", "local", "global", "hybrid"],
+        "enum": [
+          "naive",
+          "local",
+          "global",
+          "hybrid"
+        ],
         "default": "hybrid",
         "description": "LightRAG query mode: naive (vector), local (entity), global (community), hybrid (recommended)"
       },
@@ -105,7 +114,10 @@
               },
               "mode": {
                 "type": "string",
-                "enum": ["heuristic", "jina-classifier"],
+                "enum": [
+                  "heuristic",
+                  "jina-classifier"
+                ],
                 "default": "heuristic",
                 "description": "heuristic: zero-cost regex + trigger rules only (safe start). jina-classifier: same heuristics first, then Jina /v1/classify for ambiguous queries."
               },
@@ -161,6 +173,16 @@
             }
           }
         }
+      },
+      "provenanceReport": {
+        "type": "string",
+        "enum": [
+          "off",
+          "metadata",
+          "full"
+        ],
+        "default": "off",
+        "description": "Provenance reporting toward chat frontends (provenance/v1): off = no emission; metadata = file names/collections/scores; full = plus the exact injected excerpts. Reports ride the gateway agent-event bus and land under the chat's own ACL — never in logs."
       }
     },
     "required": []

@@ -61,6 +61,16 @@ export interface KnowledgePluginConfig {
   // Jina-powered enhancements (router + pgvector reranker). All sub-fields
   // are optional; omitting `jina` entirely preserves pre-3.2.0 behavior.
   jina?: JinaPluginConfig;
+
+  /**
+   * Provenance reporting toward chat frontends (provenance/v1 — see the
+   * openclaw-webchat PROVENANCE_CONTRACT): "off" (default, no emission),
+   * "metadata" (file names/collections/scores, no content), "full"
+   * (plus the exact injected excerpts).
+   *
+   * @since 3.3.0
+   */
+  provenanceReport?: string;
 }
 
 export interface JinaPluginConfig {
@@ -196,6 +206,13 @@ export interface ResolvedKnowledgeConfig {
    * @since 3.2.4
    */
   pgvectorRerankerMaxCharsPerDoc: number;
+
+  /**
+   * Provenance reporting level (provenance/v1). Default "off".
+   *
+   * @since 3.3.0
+   */
+  provenanceReport: "off" | "metadata" | "full";
 }
 
 // ---------------------------------------------------------------------------

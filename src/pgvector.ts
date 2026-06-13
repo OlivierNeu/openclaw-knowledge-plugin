@@ -69,20 +69,49 @@ export async function searchCollection(
 }
 
 /**
- * Format pgvector results for injection into the system prompt.
- * Respects a character budget so we never blow the context window with a
- * single oversized chunk — entries are appended whole until the budget is hit.
+ * Outcome of `formatPgvectorResultsDetailed`. Exposes both the prompt-ready
+ * string AND the count of entries that actually fit within the character
+ * budget, so callers can keep the provenance report aligned with what reached
+ * the LLM (PROVENANCE_CONTRACT: "emit what was injected, not what was
+ * retrieved").
  *
- * Returns `null` when there is nothing useful to inject so the caller can
- * easily skip empty sections.
+ * Because entries are appended whole in input order and the loop `break`s
+ * the moment the budget is exhausted, the injected subset is always a
+ * contiguous prefix `results.slice(0, injectedCount)`.
+ *
+ * @since 3.2.5
  */
-export function formatPgvectorResults(
+export interface FormattedPgvectorResults {
+  /** Prompt-ready text — concatenation of the first `injectedCount` entries. */
+  output: string;
+  /** Number of entries from `results` that actually fit in `maxChars`. */
+  injectedCount: number;
+}
+
+/**
+ * Format pgvector results for injection into the system prompt AND report
+ * how many input entries were actually included.
+ *
+ * Internal sibling of the public `formatPgvectorResults`. The public
+ * variant returns only the prompt text and is kept backward-compatible;
+ * this one exposes `injectedCount` so the plugin's render path can size
+ * the provenance report to the injected subset (contract: "emit what
+ * was injected, not what was retrieved").
+ *
+ * Returns `null` when there is nothing useful to inject (empty input OR
+ * the budget cannot fit a single entry) so the caller can skip empty
+ * sections AND skip emitting a provenance report for zero injected items.
+ *
+ * @since 3.2.5
+ */
+export function formatPgvectorResultsDetailed(
   results: PgvectorResult[],
   maxChars: number,
-): string | null {
+): FormattedPgvectorResults | null {
   if (results.length === 0) return null;
 
   let output = "";
+  let injectedCount = 0;
   for (const r of results) {
     const lines: string[] = [
       `[${r.collection}] ${r.file_name ?? "unknown"} (score: ${r.score.toFixed(2)})`,
@@ -101,9 +130,34 @@ export function formatPgvectorResults(
 
     if (output.length + entry.length > maxChars) break;
     output += entry;
+    injectedCount += 1;
   }
 
-  return output;
+  // No entry fit the budget — equivalent to "nothing to inject" so the
+  // caller skips the header AND the provenance report. Preserves the
+  // pre-3.2.5 `if (!formatted)` semantics when output was an empty string.
+  if (injectedCount === 0) return null;
+
+  return { output, injectedCount };
+}
+
+/**
+ * Format pgvector results for injection into the system prompt.
+ * Respects a character budget so we never blow the context window with a
+ * single oversized chunk — entries are appended whole until the budget is hit.
+ *
+ * Returns `null` when there is nothing useful to inject so the caller can
+ * easily skip empty sections.
+ *
+ * Public API — signature kept stable across the v3.x line. Callers needing
+ * the count of entries actually injected should use
+ * `formatPgvectorResultsDetailed` (internal to this package).
+ */
+export function formatPgvectorResults(
+  results: PgvectorResult[],
+  maxChars: number,
+): string | null {
+  return formatPgvectorResultsDetailed(results, maxChars)?.output ?? null;
 }
 
 // ---------------------------------------------------------------------------
