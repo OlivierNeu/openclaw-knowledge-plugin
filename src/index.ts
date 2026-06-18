@@ -84,6 +84,7 @@ export type {
   KnowledgePluginConfig,
   LightRAGQueryMode,
   PgPoolLike,
+  PgvectorMockResult,
   PgvectorResult,
   PgvectorRerankerPluginConfig,
   PgvectorRow,
@@ -92,6 +93,7 @@ export type {
   PromptMessage,
   ResolvedKnowledgeConfig,
   RouterPluginConfig,
+  TestModePluginConfig,
 } from "./types.js";
 
 // ---------------------------------------------------------------------------
@@ -236,18 +238,24 @@ export function createBeforePromptBuildHandler(
     try {
       const tasks: Promise<SourceResult>[] = [];
 
-      if (
-        shouldUsePgvector(effectiveRoute) &&
-        config.pgvectorEnabled &&
-        pool
-      ) {
-        tasks.push(
-          runPgvectorSource(pool, query, config, cooldowns.pgvector_reranker, logger, rpmMonitor),
-        );
+      if (shouldUsePgvector(effectiveRoute) && config.pgvectorEnabled) {
+        if (config.testModeEnabled) {
+          // TEST mode: canned hits, no embedding call, no pg pool.
+          tasks.push(runPgvectorMock(config));
+        } else if (pool) {
+          tasks.push(
+            runPgvectorSource(pool, query, config, cooldowns.pgvector_reranker, logger, rpmMonitor),
+          );
+        }
       }
 
       if (shouldUseLightRAG(effectiveRoute) && config.lightragEnabled) {
-        tasks.push(runLightRAGSource(query, config));
+        if (config.testModeEnabled) {
+          // TEST mode: canned context, no LightRAG server call.
+          tasks.push(runLightRAGMock(query, config));
+        } else {
+          tasks.push(runLightRAGSource(query, config));
+        }
       }
 
       if (tasks.length === 0) return undefined;
@@ -684,6 +692,14 @@ interface PgvectorSourceResult {
    * @since 3.2.3
    */
   errored: boolean;
+  /**
+   * `true` when this result was produced by TEST mode (canned data) rather
+   * than a real vector search. Threaded into the pgvector event so synthetic
+   * turns are distinguishable in observability tooling.
+   *
+   * @since 3.2.7
+   */
+  mock?: boolean;
 }
 
 async function runPgvectorSource(
@@ -814,6 +830,11 @@ interface LightRAGSourceResult {
   source: "lightrag";
   data: string;
   durationMs: number;
+  /**
+   * `true` when this context came from TEST mode (canned data) rather than a
+   * live LightRAG server. @since 3.2.7
+   */
+  mock?: boolean;
 }
 
 async function runLightRAGSource(
@@ -828,6 +849,61 @@ async function runLightRAGSource(
     config.lightragQueryMode,
   );
   return { source: "lightrag", data: context, durationMs: Date.now() - startedAt };
+}
+
+// ---------------------------------------------------------------------------
+// TEST mode — mocked sources (no network, no DB).
+//
+// These mirror the real `run*Source` functions EXACTLY: same return shape,
+// same downstream path (renderSection → events → provenance →
+// appendSystemContext). The only difference is the data origin. This is the
+// whole point: the agent receives genuinely-injected context, so a downstream
+// LLM trace (e.g. LiteLLM → Langfuse) reflects the real impact, while the
+// plugin makes ZERO calls to a LightRAG server or PostgreSQL.
+// ---------------------------------------------------------------------------
+
+/**
+ * Substitute the `{{query}}` token (whitespace-tolerant) in a mock template.
+ *
+ * The replacement is passed as a CALLBACK, not a string, so the query is
+ * inserted VERBATIM. A string replacement argument would interpret `$&`,
+ * `` $` ``, `$'`, `$$` and `$1`-style sequences — common in code/shell
+ * questions — and corrupt the very query this feature is meant to reflect.
+ */
+export function renderMockResponse(template: string, query: string): string {
+  return template.replace(/\{\{\s*query\s*\}\}/g, () => query);
+}
+
+async function runLightRAGMock(
+  query: string,
+  config: ResolvedKnowledgeConfig,
+): Promise<LightRAGSourceResult> {
+  const startedAt = Date.now();
+  const data = renderMockResponse(config.lightragMockResponse, query);
+  return {
+    source: "lightrag",
+    data,
+    durationMs: Date.now() - startedAt,
+    mock: true,
+  };
+}
+
+async function runPgvectorMock(
+  config: ResolvedKnowledgeConfig,
+): Promise<PgvectorSourceResult> {
+  const startedAt = Date.now();
+  // `pgvectorMockResults` is already normalized and score-sorted by
+  // resolveConfig, so it needs no embedding pass and no pool.
+  const data = config.pgvectorMockResults;
+  return {
+    source: "pgvector",
+    data,
+    rawCount: data.length,
+    reranked: false,
+    durationMs: Date.now() - startedAt,
+    errored: false,
+    mock: true,
+  };
 }
 
 /**
@@ -873,6 +949,8 @@ function renderSection(
       topScore: result.data[0]?.score ?? null,
       durationMs: result.durationMs,
       errored: result.errored,
+      // Only present in TEST mode — production event lines are unchanged.
+      ...(result.mock ? { mock: true as const } : {}),
     });
     if (!formatted) {
       logger.info(
@@ -916,6 +994,8 @@ function renderSection(
       truncatedChars: truncatedLen,
       durationMs: result.durationMs,
       sparse: truncatedLen < LIGHTRAG_SPARSE_THRESHOLD_CHARS,
+      // Only present in TEST mode — production event lines are unchanged.
+      ...(result.mock ? { mock: true as const } : {}),
     });
     if (!formatted) {
       logger.info(
@@ -1025,11 +1105,24 @@ export function registerKnowledgePlugin(api: OpenClawPluginApi): void {
     );
   }
 
-  // Only instantiate the pg pool when pgvector is actually in play. Booting
-  // a pool with no valid connection string would keep the plugin disabled
-  // anyway and leak sockets on hot-reload.
+  // TEST mode safety: loud, unmissable warning. A mis-set flag feeds an agent
+  // canned facts it will treat as real, so this must never go unnoticed.
+  if (config.testModeEnabled) {
+    api.logger.warn(
+      "openclaw-knowledge: ⚠️  TEST MODE ACTIVE — sources are MOCKED. " +
+        "LightRAG returns canned context and pgvector returns canned results; " +
+        "NO connection is made to a LightRAG server or PostgreSQL. The mocked " +
+        "context IS injected into the agent prompt (so its impact is real and " +
+        "observable downstream). NEVER enable testMode in production.",
+    );
+  }
+
+  // Only instantiate the pg pool when pgvector is actually in play AND we are
+  // not in test mode (mocks need no DB). Booting a pool with no valid
+  // connection string would keep the plugin disabled anyway and leak sockets
+  // on hot-reload.
   let pool: PgPoolLike | null = null;
-  if (config.pgvectorEnabled) {
+  if (config.pgvectorEnabled && !config.testModeEnabled) {
     const realPool = new pg.Pool({
       connectionString: config.postgresUrl,
       max: 3,
@@ -1041,15 +1134,16 @@ export function registerKnowledgePlugin(api: OpenClawPluginApi): void {
     pool = realPool;
   }
 
+  const mockNote = config.testModeEnabled ? " [MOCK]" : "";
   const sources: string[] = [];
   if (config.pgvectorEnabled) {
     const rerankNote = config.pgvectorRerankerEnabled
       ? ` + reranker(${config.pgvectorRerankerModel})`
       : "";
-    sources.push(`pgvector (${config.collections.join(", ")})${rerankNote}`);
+    sources.push(`pgvector (${config.collections.join(", ")})${rerankNote}${mockNote}`);
   }
   if (config.lightragEnabled) {
-    sources.push(`LightRAG (${config.lightragQueryMode})`);
+    sources.push(`LightRAG (${config.lightragQueryMode})${mockNote}`);
   }
 
   const routerNote = config.routerEnabled

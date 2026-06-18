@@ -78,6 +78,14 @@ export interface PgvectorEvent {
    * @since 3.2.3
    */
   errored: boolean;
+  /**
+   * `true` when these results came from TEST mode (canned data, no DB).
+   * Omitted entirely in normal operation so production event lines are
+   * byte-for-byte unchanged. Lets dashboards exclude synthetic traffic.
+   *
+   * @since 3.2.7
+   */
+  mock?: boolean;
 }
 
 export interface LightRAGEvent {
@@ -95,6 +103,11 @@ export interface LightRAGEvent {
    * @since 3.2.3
    */
   sparse: boolean;
+  /**
+   * `true` when this context came from TEST mode (canned data, no live
+   * LightRAG server). Omitted in normal operation. @since 3.2.7
+   */
+  mock?: boolean;
 }
 
 /**

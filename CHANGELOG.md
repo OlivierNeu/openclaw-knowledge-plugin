@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.2.7] - 2026-06-18
+
+### Added — TEST mode (mocked sources, opt-in)
+
+New `testMode` config block lets the plugin run in an **isolated test
+environment with no live LightRAG server and no PostgreSQL/pgvector
+backend**. When `testMode.enabled` is `true`, BOTH sources return canned
+data instead of querying anything:
+
+- **LightRAG** → `testMode.lightragMockResponse` (a realistic synthetic
+  knowledge-graph context by default; the `{{query}}` token is substituted
+  with the user's query at runtime so you can confirm it reaches the source).
+- **pgvector** → `testMode.pgvectorMockResults` (a small realistic
+  synthetic hit set by default; each entry is normalized to a full result
+  row and sorted by descending score).
+
+The mocked context is **genuinely injected** into the agent's system prompt
+via the unchanged `before_prompt_build` → `appendSystemContext` path, so the
+plugin's real impact on the agent's answers is observable downstream — e.g.
+the agent's LLM call (traced via LiteLLM → Langfuse) reflects the injected
+context. The plugin makes **zero** outbound calls in test mode (no Gemini
+embedding, no LightRAG query) and **no pg pool is created**.
+
+Safety: off by default; a loud `⚠️ TEST MODE ACTIVE` warning is logged at
+registration; the ready line and the `lightrag`/`pgvector` tracing events are
+flagged so synthetic traffic is distinguishable (`mock:true`, only present in
+test mode — production event lines are byte-for-byte unchanged). A source
+counts as "enabled" under the mock even without its URL/credentials, but an
+explicit `pgvectorEnabled`/`lightragEnabled: false` still wins, so a single
+source can be mocked in isolation. **Never enable `testMode` in production.**
+
 ### Added — provenance reporting (provenance/v1, opt-in)
 
 New `provenanceReport` config (`"off"` default | `"metadata"` | `"full"`).

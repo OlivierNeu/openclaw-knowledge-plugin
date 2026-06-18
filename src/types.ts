@@ -68,9 +68,71 @@ export interface KnowledgePluginConfig {
    * "metadata" (file names/collections/scores, no content), "full"
    * (plus the exact injected excerpts).
    *
-   * @since 3.3.0
+   * @since 3.2.7
    */
   provenanceReport?: string;
+
+  /**
+   * TEST mode — mock both knowledge sources so the plugin can run in an
+   * isolated test environment with NO live LightRAG server and NO
+   * PostgreSQL/pgvector backend. The goal is to observe the plugin's real
+   * impact on the agent's answers (the mocked context is genuinely
+   * injected into the system prompt, so any downstream LLM trace —
+   * e.g. LiteLLM → Langfuse — reflects it). Off by default; see the loud
+   * registration warning. NEVER enable in production.
+   *
+   * @since 3.2.7
+   */
+  testMode?: TestModePluginConfig;
+}
+
+/**
+ * Raw TEST-mode configuration block (from
+ * `plugins.entries.openclaw-knowledge.config.testMode`).
+ *
+ * @since 3.2.7
+ */
+export interface TestModePluginConfig {
+  /**
+   * Master switch. When `true`, BOTH sources are mocked: LightRAG returns
+   * {@link lightragMockResponse} and pgvector returns
+   * {@link pgvectorMockResults} — no network call, no DB pool. When the
+   * mock is active a source counts as "enabled" even without its
+   * credentials/URL, so the plugin still registers its hook. Default `false`.
+   */
+  enabled?: boolean;
+  /**
+   * Canned LightRAG context returned in test mode. The literal token
+   * `{{query}}` (whitespace-tolerant) is substituted with the user's query
+   * at runtime so operators can confirm the query reaches the source.
+   * Defaults to a realistic synthetic knowledge-graph context (> 200 chars
+   * so it is not flagged `sparse`).
+   */
+  lightragMockResponse?: string;
+  /**
+   * Canned pgvector hits returned in test mode. Each entry is normalized to
+   * a full {@link PgvectorResult} (missing fields default to `null`, missing
+   * `collection` to the first configured collection, missing `score` to
+   * `0.8`) and the list is sorted by descending score to mirror the real
+   * cosine-ranked path. Defaults to a small realistic synthetic set.
+   */
+  pgvectorMockResults?: PgvectorMockResult[];
+}
+
+/**
+ * Ergonomic, partial shape an operator writes for a single mocked pgvector
+ * hit. Only the fields worth asserting on are exposed; everything else is
+ * filled with `null` by the resolver.
+ *
+ * @since 3.2.7
+ */
+export interface PgvectorMockResult {
+  file_name?: string;
+  text?: string;
+  /** Cosine-like score in `[0, 1]`. Default `0.8`. */
+  score?: number;
+  /** Collection label. Defaults to the first configured collection. */
+  collection?: string;
 }
 
 export interface JinaPluginConfig {
@@ -210,9 +272,31 @@ export interface ResolvedKnowledgeConfig {
   /**
    * Provenance reporting level (provenance/v1). Default "off".
    *
-   * @since 3.3.0
+   * @since 3.2.7
    */
   provenanceReport: "off" | "metadata" | "full";
+
+  /**
+   * TEST mode master switch (resolved from `testMode.enabled`). When `true`
+   * both sources are mocked and no pg pool / network call is made.
+   *
+   * @since 3.2.7
+   */
+  testModeEnabled: boolean;
+  /**
+   * Resolved LightRAG canned context for test mode (defaults applied,
+   * `{{query}}` still un-substituted — substitution happens per-turn).
+   *
+   * @since 3.2.7
+   */
+  lightragMockResponse: string;
+  /**
+   * Resolved pgvector canned hits for test mode (normalized to full
+   * {@link PgvectorResult} shape and sorted by descending score).
+   *
+   * @since 3.2.7
+   */
+  pgvectorMockResults: PgvectorResult[];
 }
 
 // ---------------------------------------------------------------------------

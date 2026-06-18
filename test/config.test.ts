@@ -263,3 +263,96 @@ describe("resolveConfig — Jina nested block (v3.2.0)", () => {
     assert.equal(cfg.pgvectorRerankerTopN, 10);
   });
 });
+
+describe("resolveConfig — TEST mode (v3.2.7)", () => {
+  it("defaults testMode to OFF and resolves realistic default mocks", () => {
+    const cfg = resolveConfig({});
+    assert.equal(cfg.testModeEnabled, false);
+    // Default LightRAG mock is realistic and > 200 chars (not sparse).
+    assert.ok(cfg.lightragMockResponse.length > 200);
+    assert.ok(cfg.lightragMockResponse.includes("{{query}}"));
+    // Default pgvector mocks are normalized full rows, score-sorted desc.
+    assert.ok(cfg.pgvectorMockResults.length >= 2);
+    assert.ok(
+      cfg.pgvectorMockResults[0]!.score >= cfg.pgvectorMockResults[1]!.score,
+    );
+    assert.equal(cfg.pgvectorMockResults[0]!.mime_type, null);
+  });
+
+  it("enables BOTH sources when testMode is on, even without creds/URL", () => {
+    // No geminiApiKey, no lightragUrl — normally both sources are disabled.
+    const off = resolveConfig({});
+    assert.equal(off.pgvectorEnabled, false);
+    assert.equal(off.lightragEnabled, false);
+
+    const on = resolveConfig({ testMode: { enabled: true } });
+    assert.equal(on.testModeEnabled, true);
+    assert.equal(on.pgvectorEnabled, true);
+    assert.equal(on.lightragEnabled, true);
+  });
+
+  it("lets an explicit source disable win over testMode (mock one source)", () => {
+    const lrOnly = resolveConfig({
+      testMode: { enabled: true },
+      pgvectorEnabled: false,
+    });
+    assert.equal(lrOnly.pgvectorEnabled, false);
+    assert.equal(lrOnly.lightragEnabled, true);
+
+    const pgOnly = resolveConfig({
+      testMode: { enabled: true },
+      lightragEnabled: false,
+    });
+    assert.equal(pgOnly.pgvectorEnabled, true);
+    assert.equal(pgOnly.lightragEnabled, false);
+  });
+
+  it("honors a custom lightragMockResponse verbatim", () => {
+    const cfg = resolveConfig({
+      testMode: { enabled: true, lightragMockResponse: "custom ctx {{query}}" },
+    });
+    assert.equal(cfg.lightragMockResponse, "custom ctx {{query}}");
+  });
+
+  it("normalizes custom pgvector mocks: nulls, default collection, score, sort", () => {
+    const cfg = resolveConfig({
+      collections: ["knowledge_alice"],
+      testMode: {
+        enabled: true,
+        pgvectorMockResults: [
+          { file_name: "low.md", text: "low", score: 0.2 },
+          { file_name: "high.md", text: "high", score: 0.9 },
+          { text: "no-name-no-score" }, // score → 0.8, collection → collections[0]
+        ],
+      },
+    });
+    const rows = cfg.pgvectorMockResults;
+    assert.equal(rows.length, 3);
+    // Sorted by descending score: 0.9, 0.8 (default), 0.2
+    assert.deepEqual(
+      rows.map((r) => r.score),
+      [0.9, 0.8, 0.2],
+    );
+    // Missing collection falls back to the first configured collection.
+    const noName = rows.find((r) => r.file_name === null);
+    assert.ok(noName);
+    assert.equal(noName!.collection, "knowledge_alice");
+    // Unspecified fields are null, not undefined.
+    assert.equal(rows[0]!.file_id, null);
+    assert.equal(rows[0]!.timestamp_start, null);
+  });
+
+  it("clamps mock scores into [0, 1]", () => {
+    const cfg = resolveConfig({
+      testMode: {
+        enabled: true,
+        pgvectorMockResults: [
+          { file_name: "a", text: "a", score: 1.7 },
+          { file_name: "b", text: "b", score: -0.5 },
+        ],
+      },
+    });
+    const scores = cfg.pgvectorMockResults.map((r) => r.score);
+    assert.ok(scores.every((s) => s >= 0 && s <= 1));
+  });
+});

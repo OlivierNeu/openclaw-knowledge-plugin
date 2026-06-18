@@ -8,7 +8,10 @@
 import { describe, it, afterEach, mock } from "node:test";
 import assert from "node:assert/strict";
 
-import plugin, { registerKnowledgePlugin } from "../src/index.js";
+import plugin, {
+  registerKnowledgePlugin,
+  renderMockResponse,
+} from "../src/index.js";
 import type {
   BeforePromptBuildEvent,
   BeforePromptBuildResult,
@@ -1262,5 +1265,187 @@ describe("before_prompt_build — v3.2.3 OWUI auto-prompt short-circuit", () => 
     // LightRAG WAS called → result should be defined and contain context.
     assert.ok(result);
     assert.ok(result!.appendSystemContext.includes("Knowledge Graph Context"));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Hook: TEST mode (mocked sources, no network, no DB) — v3.2.7
+// ---------------------------------------------------------------------------
+
+/** Parse the structured `[knowledge.event]` JSON lines from info logs. */
+function knowledgeEvents(infos: string[]): Record<string, unknown>[] {
+  return infos
+    .filter((m) => m.includes("[knowledge.event]"))
+    .map((m) => {
+      const idx = m.indexOf("{");
+      return idx >= 0 ? (JSON.parse(m.slice(idx)) as Record<string, unknown>) : null;
+    })
+    .filter((e): e is Record<string, unknown> => e !== null);
+}
+
+describe("renderMockResponse", () => {
+  it("substitutes the {{query}} token (whitespace-tolerant)", () => {
+    assert.equal(renderMockResponse("a {{query}} b", "X"), "a X b");
+    assert.equal(renderMockResponse("a {{ query }} b", "X"), "a X b");
+    assert.equal(
+      renderMockResponse("{{query}} and {{query}}", "X"),
+      "X and X",
+    );
+  });
+
+  it("returns the template unchanged when no token is present", () => {
+    assert.equal(renderMockResponse("no token here", "X"), "no token here");
+  });
+
+  it("inserts the query VERBATIM even with $-replacement sequences", () => {
+    // String.replace would interpret these as special patterns if the query
+    // were passed as the replacement string instead of via a callback.
+    for (const q of ["$&", "$`", "$'", "$$", "$1", "a$&b$'c"]) {
+      assert.equal(
+        renderMockResponse("Q: {{query}}", q),
+        `Q: ${q}`,
+        `query "${q}" must be inserted verbatim`,
+      );
+    }
+  });
+});
+
+describe("before_prompt_build — TEST mode", () => {
+  afterEach(() => mock.restoreAll());
+
+  it("logs a loud warning and marks sources [MOCK] at registration", () => {
+    const { api, state } = makeFakeApi({ testMode: { enabled: true } });
+    register(api);
+
+    assert.ok(
+      state.warnings.some((w) => w.includes("TEST MODE ACTIVE")),
+      "expected a loud TEST MODE warning",
+    );
+    const ready = state.infos.find((m) => m.includes("ready"));
+    assert.ok(ready);
+    assert.ok(ready!.includes("[MOCK]"));
+    assert.ok(ready!.includes("pgvector"));
+    assert.ok(ready!.includes("LightRAG"));
+  });
+
+  it("injects BOTH mocked sources without ANY network/DB call", async () => {
+    const { api, state } = makeFakeApi({ testMode: { enabled: true } });
+
+    const fetchMock = mock.method(globalThis, "fetch", async () => {
+      throw new Error("fetch must not be called in TEST mode");
+    });
+
+    register(api);
+    const result = await state.handlers["before_prompt_build"]!({
+      prompt: "tell me about Projet Hélios",
+    });
+
+    // No embedding call, no LightRAG call.
+    assert.equal(fetchMock.mock.callCount(), 0);
+
+    assert.ok(result);
+    const ctx = result!.appendSystemContext;
+    assert.ok(ctx.includes("Relevant Knowledge Base"));
+    assert.ok(ctx.includes("Document Search Results (pgvector)"));
+    assert.ok(ctx.includes("Knowledge Graph Context (LightRAG)"));
+    // Distinctive citable fact from the default mock reached the prompt.
+    assert.ok(ctx.includes("HX-2026-0042"));
+    // No source-failure errors.
+    assert.ok(!state.errors.some((e) => e.includes("source failed")));
+  });
+
+  it("substitutes {{query}} in the LightRAG mock with the real query", async () => {
+    const { api, state } = makeFakeApi({
+      testMode: {
+        enabled: true,
+        lightragMockResponse:
+          "Graph context for the question: {{query}}. " + "x".repeat(250),
+      },
+    });
+    mock.method(globalThis, "fetch", async () => {
+      throw new Error("fetch must not be called in TEST mode");
+    });
+
+    register(api);
+    const result = await state.handlers["before_prompt_build"]!({
+      prompt: "what is the Hélios reference id?",
+    });
+
+    assert.ok(result);
+    assert.ok(
+      result!.appendSystemContext.includes(
+        "the question: what is the Hélios reference id?",
+      ),
+    );
+  });
+
+  it("emits lightrag + pgvector events flagged mock:true", async () => {
+    const { api, state } = makeFakeApi({ testMode: { enabled: true } });
+    mock.method(globalThis, "fetch", async () => {
+      throw new Error("fetch must not be called in TEST mode");
+    });
+
+    register(api);
+    await state.handlers["before_prompt_build"]!({
+      prompt: "tell me about the project",
+    });
+
+    const events = knowledgeEvents(state.infos);
+    const lr = events.find((e) => e.type === "lightrag");
+    const pg = events.find((e) => e.type === "pgvector");
+    assert.ok(lr, "expected a lightrag event");
+    assert.ok(pg, "expected a pgvector event");
+    assert.equal(lr!.mock, true);
+    assert.equal(pg!.mock, true);
+  });
+
+  it("mocks a single source when the other is explicitly disabled", async () => {
+    const { api, state } = makeFakeApi({
+      testMode: { enabled: true },
+      pgvectorEnabled: false,
+    });
+    mock.method(globalThis, "fetch", async () => {
+      throw new Error("fetch must not be called in TEST mode");
+    });
+
+    register(api);
+    const result = await state.handlers["before_prompt_build"]!({
+      prompt: "tell me about the project",
+    });
+
+    assert.ok(result);
+    const ctx = result!.appendSystemContext;
+    assert.ok(ctx.includes("Knowledge Graph Context (LightRAG)"));
+    assert.ok(!ctx.includes("Document Search Results (pgvector)"));
+  });
+
+  it("injects operator-supplied pgvector mock results", async () => {
+    const { api, state } = makeFakeApi({
+      testMode: {
+        enabled: true,
+        pgvectorMockResults: [
+          {
+            file_name: "secret-plan.md",
+            text: "The launch date is 2026-07-01.",
+            score: 0.95,
+          },
+        ],
+      },
+      lightragEnabled: false,
+    });
+    mock.method(globalThis, "fetch", async () => {
+      throw new Error("fetch must not be called in TEST mode");
+    });
+
+    register(api);
+    const result = await state.handlers["before_prompt_build"]!({
+      prompt: "when do we launch?",
+    });
+
+    assert.ok(result);
+    const ctx = result!.appendSystemContext;
+    assert.ok(ctx.includes("secret-plan.md"));
+    assert.ok(ctx.includes("2026-07-01"));
+    assert.ok(!ctx.includes("Knowledge Graph Context (LightRAG)"));
   });
 });

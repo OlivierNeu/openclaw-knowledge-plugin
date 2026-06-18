@@ -191,6 +191,10 @@ openclaw gateway restart
 | `jina.pgvectorReranker.enabled` | boolean | `false` | Cross-encoder re-ordering of pgvector results |
 | `jina.pgvectorReranker.model` | string | `"jina-reranker-v2-base-multilingual"` | Reranker model |
 | `jina.pgvectorReranker.topN` | number | `5` | Max results returned after rerank |
+| **TEST mode (optional, v3.2.7+)** | | | |
+| `testMode.enabled` | boolean | `false` | Mock BOTH sources — no LightRAG/Postgres connection. **Never enable in production.** |
+| `testMode.lightragMockResponse` | string | synthetic context | Canned LightRAG context; `{{query}}` is substituted at runtime |
+| `testMode.pgvectorMockResults` | object[] | synthetic hits | Canned pgvector hits (`file_name`, `text`, `score`, `collection`) |
 
 ### LightRAG query modes
 
@@ -200,6 +204,88 @@ openclaw gateway restart
 | `local` | Entity neighborhood traversal | Questions about a specific entity |
 | `global` | Community summaries | Broad, overview questions |
 | `hybrid` | Combines local + global | **Recommended for most cases** |
+
+### TEST mode — run without LightRAG or Postgres (v3.2.7+)
+
+TEST mode lets you deploy the plugin into an **isolated test environment**
+that has **no live LightRAG server and no PostgreSQL/pgvector backend**, while
+still observing the plugin's real impact on the agent's answers. Both sources
+return canned data, but that data is **genuinely injected** into the agent's
+system prompt through the normal `before_prompt_build` → `appendSystemContext`
+path — so the agent reasons over it exactly as it would over real retrieval,
+and any downstream LLM trace (e.g. the agent's call routed through LiteLLM to
+Langfuse) reflects the injected context.
+
+The plugin makes **zero outbound calls** in test mode: no Gemini embedding,
+no LightRAG query, and **no pg pool is created**.
+
+```json
+{
+  "plugins": {
+    "entries": {
+      "openclaw-knowledge": {
+        "enabled": true,
+        "config": {
+          "collections": ["knowledge_test"],
+          "testMode": {
+            "enabled": true,
+            "lightragMockResponse": "Knowledge-graph context for \"{{query}}\": Projet Hélios, reference HX-2026-0042, owned by équipe Plateforme.",
+            "pgvectorMockResults": [
+              { "file_name": "guide-helios.md", "text": "Hélios rollout: prep, switch, validation. Ref HX-2026-0042.", "score": 0.87 },
+              { "file_name": "faq-helios.md", "text": "Hélios is piloted by équipe Plateforme since 2026-02-14.", "score": 0.72 }
+            ]
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+Notes:
+
+- **No credentials needed.** Under the mock, each source counts as "enabled"
+  even without `geminiApiKey` / `lightragUrl`. To mock a **single** source,
+  set the other's explicit toggle off (`"pgvectorEnabled": false` or
+  `"lightragEnabled": false`) — the explicit disable always wins.
+- **Defaults are realistic.** Omit `lightragMockResponse` /
+  `pgvectorMockResults` and the plugin injects a synthetic "Projet Hélios"
+  knowledge set (with a citable `HX-2026-0042` reference) so you can confirm
+  injection worked straight from the agent's reply.
+- **`{{query}}`** in `lightragMockResponse` is replaced with the user's query
+  at runtime, proving the query travels through the source.
+- **Mock fidelity divergences** (intentional — the mock path has no DB/Jina):
+  - Mock pgvector results **always inject regardless of `scoreThreshold`**
+    (the real path filters `score >= scoreThreshold`).
+  - The **Jina reranker is bypassed** in test mode (it needs a live endpoint);
+    ordering is controlled entirely by the mock `score` values.
+- **Router still applies.** The adaptive router (if enabled) runs normally. In
+  the default `heuristic` mode it works fully offline; in `jina-classifier`
+  mode it would call Jina and fail open to "retrieve" if Jina is unreachable.
+  For a fully offline test env, keep the router off or in `heuristic` mode.
+- **Safety.** A loud `⚠️ TEST MODE ACTIVE` warning is logged at registration,
+  the ready line marks each source `[MOCK]`, and the `lightrag`/`pgvector`
+  tracing events carry `mock:true`. **Never enable `testMode` in production** —
+  it feeds the agent canned facts it will treat as real.
+
+#### Verifying the impact (Langfuse)
+
+The mock context is genuinely injected, so it reaches the agent's LLM call.
+Whether it shows up in **Langfuse** depends on how your test agent is wired:
+Langfuse traces calls that go **through LiteLLM** (and the LightRAG server).
+A typical production OpenClaw agent routes its chat/reasoning calls **straight
+to the model provider** (e.g. `openai-codex`), which Langfuse does **not**
+trace — so for Langfuse visibility, the test agent must route its LLM calls
+through LiteLLM. The plugin injects correctly either way; this only affects
+observability.
+
+End-to-end check that the plugin really influences answers:
+
+1. Deploy with `testMode.enabled: true`.
+2. Ask the agent a question answerable **only** from the mock, e.g.
+   *"What is the Hélios reference id?"*
+3. Confirm the agent answers `HX-2026-0042` (the default mock's citable fact).
+   If it does, the injection path works end-to-end.
 
 ---
 

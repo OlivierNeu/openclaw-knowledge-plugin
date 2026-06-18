@@ -2,7 +2,7 @@
   "id": "openclaw-knowledge",
   "name": "Knowledge Base",
   "description": "Multi-source knowledge search (pgvector + LightRAG) with optional Jina-powered router & reranker — injects relevant documents and knowledge graph context before each turn via the before_prompt_build hook",
-  "version": "3.2.4",
+  "version": "3.2.7",
   "activation": {
     "onStartup": true
   },
@@ -183,6 +183,51 @@
         ],
         "default": "off",
         "description": "Provenance reporting toward chat frontends (provenance/v1): off = no emission; metadata = file names/collections/scores; full = plus the exact injected excerpts. Reports ride the gateway agent-event bus and land under the chat's own ACL — never in logs."
+      },
+      "testMode": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "TEST mode — mock BOTH sources so the plugin runs in an isolated test environment with no live LightRAG server and no PostgreSQL/pgvector backend. The mocked context is genuinely injected into the agent prompt, so its impact is real and observable downstream (e.g. the agent's LLM call traced via LiteLLM → Langfuse reflects it). Off by default. NEVER enable in production.",
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "default": false,
+            "description": "Master switch. When true, LightRAG and pgvector return canned data instead of querying a server/DB — and each source counts as enabled even without its URL/credentials. The explicit pgvectorEnabled/lightragEnabled:false toggles still win, so you can mock a single source in isolation. A loud warning is logged at registration."
+          },
+          "lightragMockResponse": {
+            "type": "string",
+            "description": "Canned LightRAG context returned in test mode. The token {{query}} (whitespace-tolerant) is replaced with the user's query at runtime. Defaults to a realistic synthetic knowledge-graph context (>200 chars, with a citable reference id) so injection is easy to confirm from the agent's answer."
+          },
+          "pgvectorMockResults": {
+            "type": "array",
+            "description": "Canned pgvector hits returned in test mode. Each entry is normalized to a full result row (missing fields → null, missing collection → first configured collection, missing score → 0.8) and sorted by descending score. Defaults to a small realistic synthetic set.",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "file_name": {
+                  "type": "string",
+                  "description": "Source document name shown in the injected block."
+                },
+                "text": {
+                  "type": "string",
+                  "description": "Chunk content injected into the prompt."
+                },
+                "score": {
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1,
+                  "default": 0.8,
+                  "description": "Cosine-like similarity score (0–1)."
+                },
+                "collection": {
+                  "type": "string",
+                  "description": "Collection label. Defaults to the first configured collection."
+                }
+              }
+            }
+          }
+        }
       }
     },
     "required": []
@@ -310,6 +355,21 @@
       "label": "Jina RPM budget (soft)",
       "advanced": true,
       "help": "Soft alert threshold on outbound Jina calls per minute. Default 60. Never blocks — only logs and emits jina_rpm_exceeded events. Set to 0 to disable."
+    },
+    "testMode.enabled": {
+      "label": "TEST mode (mock sources)",
+      "advanced": true,
+      "help": "Mock LightRAG + pgvector for infra-less test environments. The mocked context is really injected so its impact is observable. NEVER enable in production."
+    },
+    "testMode.lightragMockResponse": {
+      "label": "Mock LightRAG context",
+      "advanced": true,
+      "help": "Canned LightRAG context for test mode. Use {{query}} to echo the user's query. Defaults to a realistic synthetic graph context."
+    },
+    "testMode.pgvectorMockResults": {
+      "label": "Mock pgvector results",
+      "advanced": true,
+      "help": "Canned pgvector hits for test mode (file_name/text/score/collection). Defaults to a small realistic synthetic set."
     }
   }
 }
