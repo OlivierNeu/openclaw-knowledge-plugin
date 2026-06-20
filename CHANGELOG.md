@@ -7,6 +7,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.2.8] - 2026-06-20
+
+### Added — LightRAG source references surfaced in provenance (provenance/v1)
+
+LightRAG (≥ 1.4.5) returns a structured `references` array — the source
+documents it attributed the assembled context to — alongside the `response`
+context blob. The plugin previously discarded it. It is now captured and, when
+`provenanceReport` is `"metadata"` or `"full"`, surfaced as **metadata-only
+source-attribution items** (`file_name` = the source `file_path`) on the
+gateway agent-event bus. Per the provenance contract, document items are keyed
+by `file_name`; LightRAG's per-query `reference_id` ordinal is intentionally
+not surfaced. A chat
+frontend (openclaw-webchat) can now show the user **which source documents fed
+a LightRAG-grounded answer** — closing the gap that previously left LightRAG
+provenance as one opaque context blob (pgvector already carried per-hit
+`file_name`/`collection`/`score`).
+
+Privacy invariant preserved: a reference's `content` field (the RETRIEVED
+text) is **never** copied to an item's `text`. The injected blob is truncated
+to `lightragMaxChars` and a reference may have been truncated out entirely, so
+mapping `content → text` would re-introduce the exact "report what was
+retrieved, not injected" leak fixed for pgvector in 3.2.3. The ONLY item
+carrying injected text remains the single `lightrag-context` blob item (gated
+on `full`). The same invariant is applied to the reference list itself: when
+the context is truncated to `lightragMaxChars`, references are filtered to
+those whose `file_path` still appears in the injected text (LightRAG embeds
+source markers inline), so a `metadata`/`full` report never attributes the
+answer to a document whose content was cut before reaching the LLM. With no
+truncation, every reference is kept. The filter is best-effort and fails
+toward UNDER-attribution (dropping a reference it cannot confirm) rather than
+over-attribution. The empty-context guard still wins: no injected text → no report,
+even when references are present. References are deduplicated by `file_path`
+(first-seen order, LightRAG returns them ranked) and the total item count is
+capped at `PROVENANCE_MAX_ITEMS` with the context blob item always retained.
+
+A `referenceCount` field is added to the `lightrag` tracing event (`0` on
+servers that don't emit references or in TEST mode).
+
+This requires no config change — references surface automatically wherever
+`provenanceReport` is already enabled. Source attribution inherits the exact
+same per-instance LightRAG workspace scoping as the context itself (the plugin
+queries `lightrag-olivier` vs `lightrag-jerome`), so it introduces **no new
+isolation surface**.
+
+#### Internal-API change
+
+`queryLightRAG` now returns `{ context: string; references: LightRAGReference[] }`
+instead of `string`. The data comes from a single `/query` response, so no
+extra round-trip is added. `truncateLightRAG` / `formatLightRAGResults` are
+unchanged. New exported types: `LightRAGReference`, `LightRAGQueryResult`; new
+exported helper `parseLightRAGReferences`.
+
 ## [3.2.7] - 2026-06-18
 
 ### Added — TEST mode (mocked sources, opt-in)

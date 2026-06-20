@@ -257,6 +257,64 @@ describe("buildLightRAGProvenance", () => {
     assert.equal(buildLightRAGProvenance(body, "mix", "metadata", -1)?.injected?.chars, body.length);
     assert.equal(buildLightRAGProvenance(body, "mix", "metadata", Number.NaN)?.injected?.chars, body.length);
   });
+
+  it("no references -> identical single opaque item (no regression)", () => {
+    const report = buildLightRAGProvenance("ctx", "mix", "metadata", undefined, []);
+    assert.deepEqual(report?.items, [{ id: "lightrag-context", type: "mix" }]);
+  });
+
+  it("metadata: emits one file_name item per reference + the context item last", () => {
+    const report = buildLightRAGProvenance("ctx", "hybrid", "metadata", undefined, [
+      { file_path: "a.md", reference_id: "1" },
+      { file_path: "b.md" },
+    ]);
+    // reference_id is intentionally NOT surfaced (PROVENANCE_CONTRACT §3:
+    // documents are keyed by file_name; reference_id is a per-query ordinal).
+    assert.deepEqual(report?.items, [
+      { file_name: "a.md", type: "hybrid" },
+      { file_name: "b.md", type: "hybrid" },
+      { id: "lightrag-context", type: "hybrid" },
+    ]);
+  });
+
+  it("full: reference items NEVER carry text; only the context item does", () => {
+    // The trap: a reference's `content` is RETRIEVED, not INJECTED. Mapping
+    // it to item.text would leak excerpts the LLM never saw. Lock it shut.
+    const report = buildLightRAGProvenance("injected blob", "hybrid", "full", undefined, [
+      { file_path: "a.md" },
+      { file_path: "b.md" },
+    ]);
+    const refItems = report!.items.filter((i) => i.file_name);
+    assert.equal(refItems.length, 2);
+    assert.ok(refItems.every((i) => i.text === undefined), "reference items must have no text");
+    const ctxItem = report!.items.find((i) => i.id === "lightrag-context");
+    assert.equal(ctxItem?.text, "injected blob");
+  });
+
+  it("dedups references by file_path, preserving first-seen order", () => {
+    const report = buildLightRAGProvenance("ctx", "hybrid", "metadata", undefined, [
+      { file_path: "a.md", reference_id: "1" },
+      { file_path: "a.md", reference_id: "99" }, // dup → dropped
+      { file_path: "b.md" },
+    ]);
+    const fileNames = report!.items.filter((i) => i.file_name).map((i) => i.file_name);
+    assert.deepEqual(fileNames, ["a.md", "b.md"]);
+  });
+
+  it("caps total items at PROVENANCE_MAX_ITEMS, always keeping the context item", () => {
+    const many = Array.from({ length: 50 }, (_, i) => ({ file_path: `f${i}.md` }));
+    const report = buildLightRAGProvenance("ctx", "hybrid", "metadata", undefined, many);
+    assert.ok(report!.items.length <= PROVENANCE_MAX_ITEMS);
+    // The context blob item is never dropped by the cap.
+    assert.ok(report!.items.some((i) => i.id === "lightrag-context"));
+  });
+
+  it("empty context + non-empty references -> still null (nothing injected)", () => {
+    const report = buildLightRAGProvenance("", "hybrid", "full", undefined, [
+      { file_path: "a.md" },
+    ]);
+    assert.equal(report, null);
+  });
 });
 
 describe("emitProvenanceReports (fail-silent guards)", () => {

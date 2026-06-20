@@ -3,7 +3,11 @@
 import { describe, it, afterEach, mock } from "node:test";
 import assert from "node:assert/strict";
 
-import { queryLightRAG, truncateLightRAG } from "../src/lightrag.js";
+import {
+  queryLightRAG,
+  truncateLightRAG,
+  parseLightRAGReferences,
+} from "../src/lightrag.js";
 
 describe("queryLightRAG", () => {
   afterEach(() => {
@@ -37,10 +41,11 @@ describe("queryLightRAG", () => {
       "find my contracts",
       "hybrid",
     );
-    assert.equal(result, "Contract A signed on 2025-01-01.");
+    assert.equal(result.context, "Contract A signed on 2025-01-01.");
+    assert.deepEqual(result.references, []);
   });
 
-  it("returns empty string when response field is missing", async () => {
+  it("returns empty context when response field is missing", async () => {
     mock.method(globalThis, "fetch", async () => ({
       ok: true,
       json: async () => ({ other: "data" }),
@@ -52,7 +57,68 @@ describe("queryLightRAG", () => {
       "query",
       "global",
     );
-    assert.equal(result, "");
+    assert.equal(result.context, "");
+    assert.deepEqual(result.references, []);
+  });
+
+  it("falls back to the `context` field when `response` is absent", async () => {
+    mock.method(globalThis, "fetch", async () => ({
+      ok: true,
+      json: async () => ({ context: "via context field" }),
+    }) as unknown as Response);
+
+    const result = await queryLightRAG("http://lightrag:9621", "", "q", "hybrid");
+    assert.equal(result.context, "via context field");
+  });
+
+  it("extracts structured source references from the response", async () => {
+    mock.method(globalThis, "fetch", async () => ({
+      ok: true,
+      json: async () => ({
+        response: "Context with two sources.",
+        references: [
+          { reference_id: "1", file_path: "offre-1.md", content: "ignored body" },
+          { reference_id: "2", file_path: "offre-2.md" },
+        ],
+      }),
+    }) as unknown as Response);
+
+    const result = await queryLightRAG("http://lightrag:9621", "", "q", "hybrid");
+    assert.equal(result.context, "Context with two sources.");
+    assert.deepEqual(result.references, [
+      { file_path: "offre-1.md", reference_id: "1" },
+      { file_path: "offre-2.md", reference_id: "2" },
+    ]);
+  });
+});
+
+describe("parseLightRAGReferences", () => {
+  it("returns [] for non-array / missing input", () => {
+    assert.deepEqual(parseLightRAGReferences(undefined), []);
+    assert.deepEqual(parseLightRAGReferences(null), []);
+    assert.deepEqual(parseLightRAGReferences("nope"), []);
+    assert.deepEqual(parseLightRAGReferences({}), []);
+  });
+
+  it("keeps only entries with a non-empty string file_path", () => {
+    const refs = parseLightRAGReferences([
+      { reference_id: "1", file_path: "a.md" },
+      { reference_id: "2", file_path: "" }, // empty → dropped
+      { reference_id: "3" }, // no file_path → dropped
+      { file_path: "b.md" }, // no reference_id → kept, id omitted
+      "not-an-object", // → dropped
+      null, // → dropped
+      { file_path: 42 }, // non-string → dropped
+    ]);
+    assert.deepEqual(refs, [
+      { file_path: "a.md", reference_id: "1" },
+      { file_path: "b.md" },
+    ]);
+  });
+
+  it("omits a non-string reference_id", () => {
+    const refs = parseLightRAGReferences([{ reference_id: 5, file_path: "a.md" }]);
+    assert.deepEqual(refs, [{ file_path: "a.md" }]);
   });
 
   it("omits X-API-Key header when no API key", async () => {

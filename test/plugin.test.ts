@@ -11,6 +11,7 @@ import assert from "node:assert/strict";
 import plugin, {
   registerKnowledgePlugin,
   renderMockResponse,
+  referencesInInjectedContext,
 } from "../src/index.js";
 import type {
   BeforePromptBuildEvent,
@@ -1307,6 +1308,68 @@ describe("renderMockResponse", () => {
         `query "${q}" must be inserted verbatim`,
       );
     }
+  });
+});
+
+describe("referencesInInjectedContext", () => {
+  const refs = [
+    { file_path: "alpha.md" },
+    { file_path: "beta.md" },
+    { file_path: "gamma.md" },
+  ];
+
+  it("keeps ALL references when there was no truncation", () => {
+    // injectedText covers the whole context (length >= originalLength).
+    const text = "short context, no markers at all";
+    const kept = referencesInInjectedContext(refs, text, text.length);
+    assert.deepEqual(kept, refs);
+  });
+
+  it("keeps only references whose file_path survived truncation", () => {
+    // Simulate a long context truncated to a body that mentions only alpha+gamma.
+    const injected = "… [Source: alpha.md] … and also gamma.md appears here …";
+    const originalLength = injected.length + 5000; // pretend much was cut
+    const kept = referencesInInjectedContext(refs, injected, originalLength);
+    assert.deepEqual(kept.map((r) => r.file_path), ["alpha.md", "gamma.md"]);
+  });
+
+  it("drops all references on truncation when none appear (safe under-attribution)", () => {
+    const injected = "a synthesized blob with no source markers";
+    const kept = referencesInInjectedContext(refs, injected, injected.length + 1000);
+    assert.deepEqual(kept, []);
+  });
+
+  it("does NOT match a path as a substring of a longer path", () => {
+    // `plan.md` must not be kept just because `old-plan.md` (a DIFFERENT
+    // file) survived truncation — boundary-aware matching, not bare includes.
+    const twoRefs = [{ file_path: "plan.md" }, { file_path: "old-plan.md" }];
+    const injected = "context … [Source: old-plan.md] …";
+    const kept = referencesInInjectedContext(twoRefs, injected, injected.length + 500);
+    assert.deepEqual(kept.map((r) => r.file_path), ["old-plan.md"]);
+  });
+
+  it("does NOT match a filename inside a deeper path of another file", () => {
+    // ref `plan.md` vs an injected `archive/plan.md` (different file): the
+    // leading `/` is a path char, so it must not match.
+    const kept = referencesInInjectedContext(
+      [{ file_path: "plan.md" }],
+      "see archive/plan.md for details",
+      9999_999, // force the truncation branch
+    );
+    assert.deepEqual(kept, []);
+  });
+
+  it("matches a genuine path containing slashes", () => {
+    const kept = referencesInInjectedContext(
+      [{ file_path: "archive/plan.md" }],
+      "[Source: archive/plan.md]",
+      9999_999,
+    );
+    assert.deepEqual(kept.map((r) => r.file_path), ["archive/plan.md"]);
+  });
+
+  it("returns [] unchanged for an empty reference list", () => {
+    assert.deepEqual(referencesInInjectedContext([], "ctx", 9999), []);
   });
 });
 

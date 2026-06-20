@@ -202,6 +202,37 @@ export interface PgvectorRerankerPluginConfig {
 
 export type LightRAGQueryMode = "naive" | "local" | "global" | "hybrid";
 
+/**
+ * One source reference from a LightRAG `/query` response. LightRAG (≥ 1.4.5)
+ * returns a structured `references` array alongside the assembled `response`
+ * context, each entry pointing at a source document. We capture ONLY the
+ * source-attribution fields (`reference_id`, `file_path`) — never the
+ * reference's `content`, which is the RETRIEVED text, not the INJECTED text
+ * (see `buildLightRAGProvenance` for why mixing the two would leak excerpts
+ * the LLM never saw).
+ *
+ * @since 3.2.8
+ */
+export interface LightRAGReference {
+  /** LightRAG's opaque reference identifier (e.g. "5"), when provided. */
+  reference_id?: string;
+  /** Source document path/name LightRAG attributes this context to. */
+  file_path: string;
+}
+
+/**
+ * Result of {@link queryLightRAG}: the assembled context blob plus the
+ * structured source references. Pre-3.2.8 the function returned just the
+ * context string; the object form carries the references needed for
+ * provenance source-attribution without a second round-trip.
+ *
+ * @since 3.2.8
+ */
+export interface LightRAGQueryResult {
+  context: string;
+  references: LightRAGReference[];
+}
+
 // ---------------------------------------------------------------------------
 // Resolved configuration (after defaults + env substitution)
 // ---------------------------------------------------------------------------

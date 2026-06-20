@@ -19,7 +19,7 @@
 // The tracing invariant is untouched: NOTHING here goes through logs.
 
 import type { PluginLogger } from "openclaw/plugin-sdk/plugin-entry";
-import type { PgvectorResult } from "./types.js";
+import type { LightRAGReference, PgvectorResult } from "./types.js";
 
 export type ProvenanceReportLevel = "off" | "metadata" | "full";
 
@@ -144,18 +144,53 @@ export function buildPgvectorProvenance(
  *                      (codex pass #36 P3). Negative values fall back to
  *                      `injectedText.length` to keep the report
  *                      well-formed even on caller mistakes.
+ * @param references    source documents LightRAG attributed this context to
+ *                      (since 3.2.8). Surfaced as metadata-only items
+ *                      (`file_name` = path) so the chat frontend can show
+ *                      WHICH sources fed the answer. CRITICAL: a reference's
+ *                      `content` is the RETRIEVED text, NOT the injected
+ *                      text — it is deliberately never copied to `item.text`,
+ *                      because the injected blob is truncated to
+ *                      `lightragMaxChars` and a reference may have been
+ *                      truncated out. Mapping content→text would re-introduce
+ *                      the exact "report what was retrieved, not injected"
+ *                      leak fixed for pgvector. The ONLY item carrying
+ *                      injected text remains the single `lightrag-context`
+ *                      blob item below. The empty-context guard still wins:
+ *                      no injected text → no report, even with references.
  */
 export function buildLightRAGProvenance(
   injectedText: string,
   mode: string,
   level: ProvenanceReportLevel,
   injectedChars?: number,
+  references: LightRAGReference[] = [],
 ): ProvenanceReportV1 | null {
   if (level === "off" || injectedText.length === 0) return null;
-  const item: ProvenanceItemV1 = { id: "lightrag-context", type: mode };
-  if (level === "full") {
-    item.text = injectedText.slice(0, PROVENANCE_EXCERPT_MAX_CHARS);
+
+  // Source-attribution items: one per UNIQUE file_path, order preserved
+  // (LightRAG returns them ranked). Reserve one slot for the context blob
+  // item so it is never dropped by the cap. NEVER set `text` here.
+  const refItems: ProvenanceItemV1[] = [];
+  const seen = new Set<string>();
+  for (const ref of references) {
+    if (refItems.length >= PROVENANCE_MAX_ITEMS - 1) break;
+    if (seen.has(ref.file_path)) continue;
+    seen.add(ref.file_path);
+    // Document items are identified by `file_name` per PROVENANCE_CONTRACT §3
+    // (only memory items use `id`). LightRAG's `reference_id` is a per-query
+    // ordinal ("1", "2", …) — unstable and collision-prone as an item key —
+    // so it is intentionally NOT surfaced here. `file_path` is the key.
+    refItems.push({ file_name: ref.file_path, type: mode });
   }
+
+  // The single blob item is the ONLY carrier of injected (post-truncation)
+  // text, gated on `full` exactly as before.
+  const contextItem: ProvenanceItemV1 = { id: "lightrag-context", type: mode };
+  if (level === "full") {
+    contextItem.text = injectedText.slice(0, PROVENANCE_EXCERPT_MAX_CHARS);
+  }
+
   const reportedChars =
     typeof injectedChars === "number" && injectedChars >= 0
       ? injectedChars
@@ -166,7 +201,7 @@ export function buildLightRAGProvenance(
     kind: "documents",
     injected: { chars: reportedChars, position: "system_append" },
     retrieval: { route: "lightrag", lightrag: { mode } },
-    items: [item],
+    items: [...refItems, contextItem],
   };
 }
 

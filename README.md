@@ -367,6 +367,7 @@ a structured event line:
 ```
 [knowledge.event] {"type":"router","route":"PGVECTOR_ONLY","reason":"heuristic_keyword","score":null,"queryLength":42,"trigger":"user"}
 [knowledge.event] {"type":"pgvector","collections":["knowledge_default"],"rawCount":5,"rerankedCount":5,"topScore":0.78,"durationMs":124}
+[knowledge.event] {"type":"lightrag","mode":"hybrid","contextChars":3820,"truncatedChars":3820,"durationMs":210,"sparse":false,"referenceCount":3}
 [knowledge.event] {"type":"cooldown","scope":"router","consecutiveErrors":3}
 ```
 
@@ -396,6 +397,27 @@ Operators who need CONTENT correlation across turns (e.g. "this user
 asked the same question twice") must instrument at the SDK layer with
 a keyed HMAC and a deployment-side secret; the plugin will not do it
 for them.
+
+### Source attribution (provenance, v3.2.8+)
+
+Separately from the tracing events above (which go to logs and **never**
+carry content), when `provenanceReport` is `"metadata"` or `"full"` the
+plugin emits a **provenance report** on the gateway agent-event bus
+(stream `openclaw-knowledge.provenance`), scoped to the chat's own ACL —
+so a chat frontend can show the user *which sources fed this reply*:
+
+- **pgvector** items carry `file_name`, `collection`, `score` (and the exact
+  injected excerpt at `"full"`).
+- **LightRAG** items now carry the **source `file_path`** of each document the
+  graph attributed the context to (from LightRAG's `references`, server
+  ≥ 1.4.5), plus the single injected-context excerpt at `"full"`. This is the
+  hook for letting users deep-dive the exact sources behind a LightRAG-grounded
+  answer — the agent can then fetch the verbatim document via a skill.
+
+A reference's retrieved `content` is deliberately never exposed as injected
+text (only the truncated, actually-injected blob is), and reports are gated
+behind `provenanceReport` — both off by default. Source attribution inherits
+the same per-instance LightRAG workspace isolation as the context itself.
 
 ### Cooldown isolation
 

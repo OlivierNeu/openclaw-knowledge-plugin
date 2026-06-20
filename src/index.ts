@@ -59,6 +59,7 @@ import type {
   BeforePromptBuildEvent,
   BeforePromptBuildResult,
   KnowledgePluginConfig,
+  LightRAGReference,
   PgPoolLike,
   PgvectorResult,
   PluginHookAgentContext,
@@ -83,6 +84,8 @@ export type {
   JinaPluginConfig,
   KnowledgePluginConfig,
   LightRAGQueryMode,
+  LightRAGQueryResult,
+  LightRAGReference,
   PgPoolLike,
   PgvectorMockResult,
   PgvectorResult,
@@ -829,6 +832,12 @@ async function runPgvectorSource(
 interface LightRAGSourceResult {
   source: "lightrag";
   data: string;
+  /**
+   * Structured source references LightRAG attributed the context to. Empty
+   * on older servers / in TEST mode. Surfaced through provenance as
+   * metadata-only source attribution. @since 3.2.8
+   */
+  references: LightRAGReference[];
   durationMs: number;
   /**
    * `true` when this context came from TEST mode (canned data) rather than a
@@ -842,13 +851,18 @@ async function runLightRAGSource(
   config: ResolvedKnowledgeConfig,
 ): Promise<LightRAGSourceResult> {
   const startedAt = Date.now();
-  const context = await queryLightRAG(
+  const { context, references } = await queryLightRAG(
     config.lightragUrl,
     config.lightragApiKey,
     query,
     config.lightragQueryMode,
   );
-  return { source: "lightrag", data: context, durationMs: Date.now() - startedAt };
+  return {
+    source: "lightrag",
+    data: context,
+    references,
+    durationMs: Date.now() - startedAt,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -883,9 +897,63 @@ async function runLightRAGMock(
   return {
     source: "lightrag",
     data,
+    // No synthetic source references in test mode — provenance only emits
+    // through a live gateway anyway. The blob still injects normally.
+    references: [],
     durationMs: Date.now() - startedAt,
     mock: true,
   };
+}
+
+/**
+ * Restrict LightRAG source references to those that actually survived
+ * injection, mirroring the pgvector "emit what was injected, not what was
+ * retrieved" invariant for the graph path.
+ *
+ * LightRAG's assembled context embeds source markers (file names /
+ * `[Source: …]`) inline. When the context is truncated to `lightragMaxChars`,
+ * keeping the FULL reference list would attribute the answer to documents
+ * whose content was cut before reaching the LLM. So on truncation we keep
+ * only references whose `file_path` still appears in the injected text. When
+ * NO truncation occurred (`injectedText` covers the whole context) every
+ * reference was injected and all are kept regardless of marker format.
+ *
+ * Best-effort by construction: if a LightRAG build does not embed file paths
+ * in the context, truncation drops references it cannot confirm — UNDER-
+ * attributing (safe) rather than over-attributing.
+ *
+ * @internal exported for unit testing
+ */
+export function referencesInInjectedContext(
+  references: LightRAGReference[],
+  injectedText: string,
+  originalLength: number,
+): LightRAGReference[] {
+  // `injectedText` is the post-truncation body; when it covers the whole
+  // (trimmed) context there was no truncation, so everything was injected.
+  if (injectedText.length >= originalLength) return references;
+  return references.filter((ref) =>
+    referenceMarkerPresent(ref.file_path, injectedText),
+  );
+}
+
+// Characters that can appear inside a file path/name. A reference is only
+// considered "present" when its path is bounded by something OUTSIDE this set
+// (or a string edge) on both sides — so a bare-substring match like
+// `plan.md` inside `old-plan.md` (or `a/plan.md`) does NOT over-attribute.
+const PATH_CHARS = "A-Za-z0-9._/-";
+
+/**
+ * True when `filePath` appears in `injectedText` as a whole token — i.e.
+ * delimited by a non-path character (or string edge) on each side. Linear
+ * time (literal needle + single-char boundary classes, no nested
+ * quantifiers), so no ReDoS exposure.
+ */
+function referenceMarkerPresent(filePath: string, injectedText: string): boolean {
+  if (filePath.length === 0) return false;
+  const escaped = filePath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const re = new RegExp(`(?:^|[^${PATH_CHARS}])${escaped}(?:[^${PATH_CHARS}]|$)`);
+  return re.test(injectedText);
 }
 
 async function runPgvectorMock(
@@ -994,6 +1062,9 @@ function renderSection(
       truncatedChars: truncatedLen,
       durationMs: result.durationMs,
       sparse: truncatedLen < LIGHTRAG_SPARSE_THRESHOLD_CHARS,
+      // Number of source references LightRAG attributed the context to.
+      // 0 on older servers (no `references` field) or in TEST mode.
+      referenceCount: result.references.length,
       // Only present in TEST mode — production event lines are unchanged.
       ...(result.mock ? { mock: true as const } : {}),
     });
@@ -1019,6 +1090,14 @@ function renderSection(
         config.lightragQueryMode,
         config.provenanceReport,
         text.length,
+        // Only references whose content actually survived truncation — keeps
+        // provenance attribution to "what was injected", not what was
+        // retrieved (mirrors the pgvector slice-to-injectedCount rule).
+        referencesInInjectedContext(
+          result.references,
+          formatted.truncated,
+          formatted.originalLength,
+        ),
       ),
     };
   }

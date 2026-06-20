@@ -104,6 +104,12 @@ export interface LightRAGEvent {
    */
   sparse: boolean;
   /**
+   * Number of source references LightRAG attributed the context to. `0` on
+   * servers that don't emit a `references` field or in TEST mode. Lets
+   * dashboards track source-attribution coverage. @since 3.2.8
+   */
+  referenceCount?: number;
+  /**
    * `true` when this context came from TEST mode (canned data, no live
    * LightRAG server). Omitted in normal operation. @since 3.2.7
    */
