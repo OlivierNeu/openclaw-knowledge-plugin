@@ -897,9 +897,11 @@ async function runLightRAGMock(
   return {
     source: "lightrag",
     data,
-    // No synthetic source references in test mode — provenance only emits
-    // through a live gateway anyway. The blob still injects normally.
-    references: [],
+    // Synthetic source references so a TEST deployment on a live gateway can
+    // exercise the LightRAG "Sources" provenance panel (3.2.9). They flow
+    // through the same provenance path as real references; the truncation
+    // filter is a no-op here since the mock blob fits the budget.
+    references: config.lightragMockReferences,
     durationMs: Date.now() - startedAt,
     mock: true,
   };

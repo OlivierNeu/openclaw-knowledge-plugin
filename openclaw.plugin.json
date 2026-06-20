@@ -2,7 +2,7 @@
   "id": "openclaw-knowledge",
   "name": "Knowledge Base",
   "description": "Multi-source knowledge search (pgvector + LightRAG) with optional Jina-powered router & reranker — injects relevant documents and knowledge graph context before each turn via the before_prompt_build hook",
-  "version": "3.2.8",
+  "version": "3.2.9",
   "activation": {
     "onStartup": true
   },
@@ -226,6 +226,13 @@
                 }
               }
             }
+          },
+          "lightragMockReferences": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Canned LightRAG source references in test mode — a list of source document file_paths. These flow through provenance like real references (v3.2.8+), so a TEST deployment on a live gateway can exercise the LightRAG 'Sources' panel, mirroring pgvectorMockResults for pgvector. Defaults to a small synthetic set aligned with the default mock context. Set to [] for LightRAG with no source attribution."
           }
         }
       }
@@ -370,6 +377,11 @@
       "label": "Mock pgvector results",
       "advanced": true,
       "help": "Canned pgvector hits for test mode (file_name/text/score/collection). Defaults to a small realistic synthetic set."
+    },
+    "testMode.lightragMockReferences": {
+      "label": "Mock LightRAG sources",
+      "advanced": true,
+      "help": "Canned LightRAG source file_paths for test mode. Surfaced through provenance as the 'Sources' panel. Defaults to a small synthetic set; set to [] for no source attribution."
     }
   }
 }

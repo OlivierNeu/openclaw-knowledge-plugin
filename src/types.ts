@@ -117,6 +117,18 @@ export interface TestModePluginConfig {
    * cosine-ranked path. Defaults to a small realistic synthetic set.
    */
   pgvectorMockResults?: PgvectorMockResult[];
+  /**
+   * Canned LightRAG source references returned in test mode — a list of
+   * source document `file_path`s. These flow through provenance exactly like
+   * real references (since 3.2.8), so a TEST deployment on a live gateway can
+   * exercise the "which sources fed this answer" panel for LightRAG, mirroring
+   * what {@link pgvectorMockResults} already enables for pgvector. Defaults to
+   * a small synthetic set aligned with the default mock context. Set to `[]`
+   * to mock LightRAG with no source attribution.
+   *
+   * @since 3.2.9
+   */
+  lightragMockReferences?: string[];
 }
 
 /**
@@ -328,6 +340,13 @@ export interface ResolvedKnowledgeConfig {
    * @since 3.2.7
    */
   pgvectorMockResults: PgvectorResult[];
+  /**
+   * Resolved LightRAG source references for test mode (normalized to
+   * {@link LightRAGReference} from the configured `file_path` list).
+   *
+   * @since 3.2.9
+   */
+  lightragMockReferences: LightRAGReference[];
 }
 
 // ---------------------------------------------------------------------------

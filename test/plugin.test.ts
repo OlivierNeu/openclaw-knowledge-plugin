@@ -1462,6 +1462,25 @@ describe("before_prompt_build — TEST mode", () => {
     assert.equal(pg!.mock, true);
   });
 
+  it("surfaces mocked LightRAG source references (referenceCount)", async () => {
+    const { api, state } = makeFakeApi({
+      testMode: {
+        enabled: true,
+        lightragMockReferences: ["deck.md", "notes.md", "spec.md"],
+      },
+    });
+    mock.method(globalThis, "fetch", async () => {
+      throw new Error("fetch must not be called in TEST mode");
+    });
+
+    register(api);
+    await state.handlers["before_prompt_build"]!({ prompt: "tell me about the deck" });
+
+    const lr = knowledgeEvents(state.infos).find((e) => e.type === "lightrag");
+    assert.ok(lr);
+    assert.equal(lr!.referenceCount, 3);
+  });
+
   it("mocks a single source when the other is explicitly disabled", async () => {
     const { api, state } = makeFakeApi({
       testMode: { enabled: true },

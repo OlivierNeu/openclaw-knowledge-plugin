@@ -195,6 +195,7 @@ openclaw gateway restart
 | `testMode.enabled` | boolean | `false` | Mock BOTH sources — no LightRAG/Postgres connection. **Never enable in production.** |
 | `testMode.lightragMockResponse` | string | synthetic context | Canned LightRAG context; `{{query}}` is substituted at runtime |
 | `testMode.pgvectorMockResults` | object[] | synthetic hits | Canned pgvector hits (`file_name`, `text`, `score`, `collection`) |
+| `testMode.lightragMockReferences` | string[] | synthetic paths | Canned LightRAG source `file_path`s, surfaced through provenance (v3.2.9) |
 
 ### LightRAG query modes
 
@@ -233,7 +234,8 @@ no LightRAG query, and **no pg pool is created**.
             "pgvectorMockResults": [
               { "file_name": "guide-helios.md", "text": "Hélios rollout: prep, switch, validation. Ref HX-2026-0042.", "score": 0.87 },
               { "file_name": "faq-helios.md", "text": "Hélios is piloted by équipe Plateforme since 2026-02-14.", "score": 0.72 }
-            ]
+            ],
+            "lightragMockReferences": ["guide-helios.md", "faq-helios.md"]
           }
         }
       }
@@ -254,6 +256,11 @@ Notes:
   injection worked straight from the agent's reply.
 - **`{{query}}`** in `lightragMockResponse` is replaced with the user's query
   at runtime, proving the query travels through the source.
+- **`lightragMockReferences`** (v3.2.9) feed the LightRAG **source-attribution
+  panel** through provenance — the mock equivalent of real LightRAG
+  `references`. On a TEST deployment with `provenanceReport` enabled, users see
+  these as the "Sources" behind a LightRAG-grounded answer. Defaults to a small
+  synthetic set; set `[]` for no attribution.
 - **Mock fidelity divergences** (intentional — the mock path has no DB/Jina):
   - Mock pgvector results **always inject regardless of `scoreThreshold`**
     (the real path filters `score >= scoreThreshold`).

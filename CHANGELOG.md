@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.2.9] - 2026-06-20
+
+### Added — TEST mode can mock LightRAG source references
+
+TEST mode (3.2.7) mocked the LightRAG context blob but always returned an
+EMPTY reference list, so a TEST deployment could not exercise the LightRAG
+"Sources" provenance panel added in 3.2.8 — an asymmetry with
+`pgvectorMockResults`, which already lets pgvector source attribution be
+observed under the mock. New `testMode.lightragMockReferences` (a list of
+source `file_path` strings, normalized to `LightRAGReference` objects) flows
+through the exact same provenance path as real references, so a TEST
+deployment on a live gateway now surfaces mocked LightRAG sources too. It
+defaults to a small synthetic set aligned with the default mock context;
+set it to `[]` to mock LightRAG with no source attribution. The truncation
+filter is a no-op for the (small) mock blob, so all configured references are
+surfaced. The `lightrag` tracing event's `referenceCount` now reflects the
+mocked references in TEST mode.
+
 ## [3.2.8] - 2026-06-20
 
 ### Added — LightRAG source references surfaced in provenance (provenance/v1)

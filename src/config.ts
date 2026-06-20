@@ -11,6 +11,7 @@ import type {
   JinaPluginConfig,
   KnowledgePluginConfig,
   LightRAGQueryMode,
+  LightRAGReference,
   PgvectorMockResult,
   PgvectorRerankerPluginConfig,
   PgvectorResult,
@@ -108,6 +109,14 @@ const DEFAULT_PGVECTOR_MOCK_RESULTS: PgvectorMockResult[] = [
 
 const DEFAULT_MOCK_SCORE = 0.8;
 const DEFAULT_MOCK_COLLECTION = "knowledge_test";
+
+// 3.2.9 — default LightRAG mock source references. Aligned with the default
+// mock context (which names guide-deploiement-helios.md) so a TEST deployment
+// surfaces a realistic "Sources" panel for the graph path.
+const DEFAULT_LIGHTRAG_MOCK_REFERENCES = [
+  "guide-deploiement-helios.md",
+  "faq-helios.md",
+];
 
 /**
  * Apply defaults and env substitution to the raw plugin config. A source is
@@ -209,7 +218,24 @@ export function resolveConfig(
       test.pgvectorMockResults ?? DEFAULT_PGVECTOR_MOCK_RESULTS,
       collections[0] ?? DEFAULT_MOCK_COLLECTION,
     ),
+    lightragMockReferences: toLightRAGMockReferences(
+      test.lightragMockReferences ?? DEFAULT_LIGHTRAG_MOCK_REFERENCES,
+    ),
   };
+}
+
+/**
+ * Normalize a list of mock source file paths into {@link LightRAGReference}
+ * objects, dropping non-string / empty entries (defense-in-depth against a
+ * malformed config that slips past the JSON schema).
+ */
+function toLightRAGMockReferences(paths: string[]): LightRAGReference[] {
+  if (!Array.isArray(paths)) return [];
+  const out: LightRAGReference[] = [];
+  for (const p of paths) {
+    if (typeof p === "string" && p.length > 0) out.push({ file_path: p });
+  }
+  return out;
 }
 
 /**

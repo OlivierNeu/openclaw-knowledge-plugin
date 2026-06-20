@@ -355,4 +355,48 @@ describe("resolveConfig — TEST mode (v3.2.7)", () => {
     const scores = cfg.pgvectorMockResults.map((r) => r.score);
     assert.ok(scores.every((s) => s >= 0 && s <= 1));
   });
+
+  it("resolves default LightRAG mock references (v3.2.9)", () => {
+    const cfg = resolveConfig({});
+    assert.ok(cfg.lightragMockReferences.length >= 2);
+    assert.ok(
+      cfg.lightragMockReferences.every(
+        (r) => typeof r.file_path === "string" && r.file_path.length > 0,
+      ),
+    );
+  });
+
+  it("maps custom lightragMockReferences (string[]) to {file_path} objects", () => {
+    const cfg = resolveConfig({
+      testMode: {
+        enabled: true,
+        lightragMockReferences: ["secret-plan.md", "roadmap.md"],
+      },
+    });
+    assert.deepEqual(cfg.lightragMockReferences, [
+      { file_path: "secret-plan.md" },
+      { file_path: "roadmap.md" },
+    ]);
+  });
+
+  it("drops empty / non-string mock reference entries (defense-in-depth)", () => {
+    const cfg = resolveConfig({
+      testMode: {
+        enabled: true,
+        // @ts-expect-error — exercise the runtime guard against bad input
+        lightragMockReferences: ["ok.md", "", 42, null, "also-ok.md"],
+      },
+    });
+    assert.deepEqual(cfg.lightragMockReferences, [
+      { file_path: "ok.md" },
+      { file_path: "also-ok.md" },
+    ]);
+  });
+
+  it("honors an explicit empty lightragMockReferences list (no attribution)", () => {
+    const cfg = resolveConfig({
+      testMode: { enabled: true, lightragMockReferences: [] },
+    });
+    assert.deepEqual(cfg.lightragMockReferences, []);
+  });
 });
