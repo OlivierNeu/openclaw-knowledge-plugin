@@ -899,64 +899,21 @@ async function runLightRAGMock(
     data,
     // Synthetic source references so a TEST deployment on a live gateway can
     // exercise the LightRAG "Sources" provenance panel (3.2.9). They flow
-    // through the same provenance path as real references; the truncation
-    // filter is a no-op here since the mock blob fits the budget.
+    // through the same provenance path as real references.
     references: config.lightragMockReferences,
     durationMs: Date.now() - startedAt,
     mock: true,
   };
 }
 
-/**
- * Restrict LightRAG source references to those that actually survived
- * injection, mirroring the pgvector "emit what was injected, not what was
- * retrieved" invariant for the graph path.
- *
- * LightRAG's assembled context embeds source markers (file names /
- * `[Source: …]`) inline. When the context is truncated to `lightragMaxChars`,
- * keeping the FULL reference list would attribute the answer to documents
- * whose content was cut before reaching the LLM. So on truncation we keep
- * only references whose `file_path` still appears in the injected text. When
- * NO truncation occurred (`injectedText` covers the whole context) every
- * reference was injected and all are kept regardless of marker format.
- *
- * Best-effort by construction: if a LightRAG build does not embed file paths
- * in the context, truncation drops references it cannot confirm — UNDER-
- * attributing (safe) rather than over-attributing.
- *
- * @internal exported for unit testing
- */
-export function referencesInInjectedContext(
-  references: LightRAGReference[],
-  injectedText: string,
-  originalLength: number,
-): LightRAGReference[] {
-  // `injectedText` is the post-truncation body; when it covers the whole
-  // (trimmed) context there was no truncation, so everything was injected.
-  if (injectedText.length >= originalLength) return references;
-  return references.filter((ref) =>
-    referenceMarkerPresent(ref.file_path, injectedText),
-  );
-}
-
-// Characters that can appear inside a file path/name. A reference is only
-// considered "present" when its path is bounded by something OUTSIDE this set
-// (or a string edge) on both sides — so a bare-substring match like
-// `plan.md` inside `old-plan.md` (or `a/plan.md`) does NOT over-attribute.
-const PATH_CHARS = "A-Za-z0-9._/-";
-
-/**
- * True when `filePath` appears in `injectedText` as a whole token — i.e.
- * delimited by a non-path character (or string edge) on each side. Linear
- * time (literal needle + single-char boundary classes, no nested
- * quantifiers), so no ReDoS exposure.
- */
-function referenceMarkerPresent(filePath: string, injectedText: string): boolean {
-  if (filePath.length === 0) return false;
-  const escaped = filePath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const re = new RegExp(`(?:^|[^${PATH_CHARS}])${escaped}(?:[^${PATH_CHARS}]|$)`);
-  return re.test(injectedText);
-}
+// NOTE (3.2.10): the former `referencesInInjectedContext` / `referenceMarkerPresent`
+// truncation filter was REMOVED. It kept only references whose `file_path` still
+// appeared in the truncated injected text — a per-chunk rule that does not fit
+// LightRAG's SYNTHESIS model and, under a small `lightragMaxChars`, dropped EVERY
+// reference (so the chat frontend showed only an opaque context blob). LightRAG's
+// `references` are the doc-level attribution of the synthesized result and are
+// surfaced in full, metadata-only (file_path, never chunk text — no leak). See the
+// provenance-emission call site in `renderKnowledge`.
 
 async function runPgvectorMock(
   config: ResolvedKnowledgeConfig,
@@ -1092,14 +1049,18 @@ function renderSection(
         config.lightragQueryMode,
         config.provenanceReport,
         text.length,
-        // Only references whose content actually survived truncation — keeps
-        // provenance attribution to "what was injected", not what was
-        // retrieved (mirrors the pgvector slice-to-injectedCount rule).
-        referencesInInjectedContext(
-          result.references,
-          formatted.truncated,
-          formatted.originalLength,
-        ),
+        // Surface LightRAG's FULL source attribution (metadata-only file_path —
+        // never chunk text). `references` is LightRAG's doc-level attribution of
+        // the SYNTHESIZED result: the injected entities/relations are DERIVED from
+        // these documents, so they fed the context even when a given chunk's text
+        // was truncated past `lightragMaxChars`. The previous "keep only references
+        // whose file_path still appears in the injected text" filter mis-applied
+        // the pgvector PER-CHUNK rule to LightRAG's SYNTHESIS model: under a small
+        // cap (observed 3.8k/42k) it dropped EVERY reference, so the chat frontend
+        // saw only an opaque context blob and none of the real sources. Semantic
+        // shift (see the provenance contract): LightRAG provenance attributes
+        // "sources that fed the graph", not "sources whose text was injected".
+        result.references,
       ),
     };
   }

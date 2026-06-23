@@ -11,8 +11,8 @@ import assert from "node:assert/strict";
 import plugin, {
   registerKnowledgePlugin,
   renderMockResponse,
-  referencesInInjectedContext,
 } from "../src/index.js";
+import { buildLightRAGProvenance } from "../src/provenance.js";
 import type {
   BeforePromptBuildEvent,
   BeforePromptBuildResult,
@@ -1311,65 +1311,57 @@ describe("renderMockResponse", () => {
   });
 });
 
-describe("referencesInInjectedContext", () => {
+describe("LightRAG provenance surfaces sources despite truncation (3.2.10)", () => {
+  // REGRESSION (prod bug): a heavily-truncated entity context dropped EVERY
+  // reference (the old marker filter), so the chat frontend saw only the opaque
+  // context blob and none of the real sources. The marker filter is GONE — the
+  // render path passes LightRAG's full `references` list (its doc-level
+  // attribution of the synthesized result) straight through.
   const refs = [
-    { file_path: "alpha.md" },
-    { file_path: "beta.md" },
-    { file_path: "gamma.md" },
+    { file_path: "ataraxis/notes.md" },
+    { file_path: "crm/contacts.md" },
   ];
 
-  it("keeps ALL references when there was no truncation", () => {
-    // injectedText covers the whole context (length >= originalLength).
-    const text = "short context, no markers at all";
-    const kept = referencesInInjectedContext(refs, text, text.length);
-    assert.deepEqual(kept, refs);
-  });
-
-  it("keeps only references whose file_path survived truncation", () => {
-    // Simulate a long context truncated to a body that mentions only alpha+gamma.
-    const injected = "… [Source: alpha.md] … and also gamma.md appears here …";
-    const originalLength = injected.length + 5000; // pretend much was cut
-    const kept = referencesInInjectedContext(refs, injected, originalLength);
-    assert.deepEqual(kept.map((r) => r.file_path), ["alpha.md", "gamma.md"]);
-  });
-
-  it("drops all references on truncation when none appear (safe under-attribution)", () => {
-    const injected = "a synthesized blob with no source markers";
-    const kept = referencesInInjectedContext(refs, injected, injected.length + 1000);
-    assert.deepEqual(kept, []);
-  });
-
-  it("does NOT match a path as a substring of a longer path", () => {
-    // `plan.md` must not be kept just because `old-plan.md` (a DIFFERENT
-    // file) survived truncation — boundary-aware matching, not bare includes.
-    const twoRefs = [{ file_path: "plan.md" }, { file_path: "old-plan.md" }];
-    const injected = "context … [Source: old-plan.md] …";
-    const kept = referencesInInjectedContext(twoRefs, injected, injected.length + 500);
-    assert.deepEqual(kept.map((r) => r.file_path), ["old-plan.md"]);
-  });
-
-  it("does NOT match a filename inside a deeper path of another file", () => {
-    // ref `plan.md` vs an injected `archive/plan.md` (different file): the
-    // leading `/` is a path char, so it must not match.
-    const kept = referencesInInjectedContext(
-      [{ file_path: "plan.md" }],
-      "see archive/plan.md for details",
-      9999_999, // force the truncation branch
+  it("emits a metadata-only document item per reference even when ~9% was injected", () => {
+    const report = buildLightRAGProvenance(
+      "Knowledge Graph Data (Entity): { entities only, no file paths inline }",
+      "hybrid",
+      "full",
+      3818, // injectedChars: a 3.8k/42k truncation, like prod
+      refs,
     );
-    assert.deepEqual(kept, []);
-  });
-
-  it("matches a genuine path containing slashes", () => {
-    const kept = referencesInInjectedContext(
-      [{ file_path: "archive/plan.md" }],
-      "[Source: archive/plan.md]",
-      9999_999,
+    assert.ok(report, "a report is emitted");
+    const fileItems = report.items.filter((i) => i.file_name);
+    assert.deepEqual(
+      fileItems.map((i) => i.file_name),
+      ["ataraxis/notes.md", "crm/contacts.md"],
+      "the real sources are surfaced, not dropped by truncation",
     );
-    assert.deepEqual(kept.map((r) => r.file_path), ["archive/plan.md"]);
+    // References are METADATA-ONLY — the retrieved chunk text is never copied
+    // (no "report what was retrieved" leak; the file_name is the whole attribution).
+    assert.ok(fileItems.every((i) => i.text === undefined));
+    // The injected-context blob is still present, with its distinct sentinel id AND
+    // the explicit `context:true` discriminator (provenance/v1) so Atrium classifies
+    // it as a context excerpt, not a findable document — see PROVENANCE_CONTRACT.md.
+    const blob = report.items.find((i) => i.id === "lightrag-context");
+    assert.ok(blob, "the context blob item is emitted");
+    assert.equal(blob.context, true);
+    assert.equal(blob.file_name, undefined); // a context excerpt has no source file
   });
 
-  it("returns [] unchanged for an empty reference list", () => {
-    assert.deepEqual(referencesInInjectedContext([], "ctx", 9999), []);
+  it("dedupes references by file_path and never drops the context blob to the cap", () => {
+    const dup = [
+      { file_path: "a.md" },
+      { file_path: "a.md" },
+      { file_path: "b.md" },
+    ];
+    const report = buildLightRAGProvenance("ctx", "mix", "metadata", 100, dup);
+    assert.ok(report);
+    assert.deepEqual(
+      report.items.filter((i) => i.file_name).map((i) => i.file_name),
+      ["a.md", "b.md"],
+    );
+    assert.ok(report.items.some((i) => i.id === "lightrag-context"));
   });
 });
 

@@ -231,7 +231,9 @@ describe("buildLightRAGProvenance", () => {
 
   it("metadata: one mode-typed item without text; full adds the excerpt", () => {
     const meta = buildLightRAGProvenance("the injected graph context", "mix", "metadata");
-    assert.deepEqual(meta?.items, [{ id: "lightrag-context", type: "mix" }]);
+    assert.deepEqual(meta?.items, [
+      { id: "lightrag-context", type: "mix", context: true },
+    ]);
     assert.equal(meta?.injected?.chars, "the injected graph context".length);
     assert.deepEqual(meta?.retrieval, { route: "lightrag", lightrag: { mode: "mix" } });
 
@@ -260,7 +262,9 @@ describe("buildLightRAGProvenance", () => {
 
   it("no references -> identical single opaque item (no regression)", () => {
     const report = buildLightRAGProvenance("ctx", "mix", "metadata", undefined, []);
-    assert.deepEqual(report?.items, [{ id: "lightrag-context", type: "mix" }]);
+    assert.deepEqual(report?.items, [
+      { id: "lightrag-context", type: "mix", context: true },
+    ]);
   });
 
   it("metadata: emits one file_name item per reference + the context item last", () => {
@@ -273,7 +277,7 @@ describe("buildLightRAGProvenance", () => {
     assert.deepEqual(report?.items, [
       { file_name: "a.md", type: "hybrid" },
       { file_name: "b.md", type: "hybrid" },
-      { id: "lightrag-context", type: "hybrid" },
+      { id: "lightrag-context", type: "hybrid", context: true },
     ]);
   });
 

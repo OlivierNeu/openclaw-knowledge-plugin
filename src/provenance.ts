@@ -46,6 +46,10 @@ export interface ProvenanceItemV1 {
   text?: string;
   file_name?: string;
   collection?: string;
+  /** provenance/v1 (additive): declares a SYNTHESIZED context excerpt (no openable
+   *  source file) within a `documents` report — see Atrium's PROVENANCE_CONTRACT.md.
+   *  Atrium renders it under "Context", never as a findable/attachable document. */
+  context?: boolean;
 }
 
 export interface ProvenanceReportV1 {
@@ -184,9 +188,15 @@ export function buildLightRAGProvenance(
     refItems.push({ file_name: ref.file_path, type: mode });
   }
 
-  // The single blob item is the ONLY carrier of injected (post-truncation)
-  // text, gated on `full` exactly as before.
-  const contextItem: ProvenanceItemV1 = { id: "lightrag-context", type: mode };
+  // The single blob item is the ONLY carrier of injected (post-truncation) text,
+  // gated on `full` exactly as before. `context: true` declares it a synthesized
+  // excerpt so Atrium renders it under "Context", NOT as a findable document (its
+  // `id` is a sentinel, not a real file).
+  const contextItem: ProvenanceItemV1 = {
+    id: "lightrag-context",
+    type: mode,
+    context: true,
+  };
   if (level === "full") {
     contextItem.text = injectedText.slice(0, PROVENANCE_EXCERPT_MAX_CHARS);
   }
