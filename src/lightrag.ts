@@ -52,6 +52,41 @@ export function normalizeReferenceContent(raw: unknown): string | undefined {
   return chunks.join("\n\n");
 }
 
+/**
+ * Extract the human document NAME from a reference's content.
+ *
+ * The knowledge ingestion pipeline (n8n `knowledge-process-changes-jerome`) prepends a
+ * metadata header to every document before LightRAG ingestion, with the line
+ * `File Name: <name>` on its own line — VERIFIED IDENTICAL in both prepare nodes
+ * ("Prepare LightRAG (md)" and "Code (Prepare for LightRAG)"). That name is the readable
+ * title (e.g. "2026 03 30 — CR — réunion.docx"), whereas LightRAG's `file_path`
+ * (= the pipeline's `file_source`, e.g. `gdrive/<hash>`) is the stable retrieval key.
+ * We surface the name as the item's `title` while `file_name` keeps the retrieval key.
+ *
+ * Returns undefined when no header line is present (the item falls back to file_name) —
+ * defensive against a retrieved chunk that does not start at the document head.
+ */
+const METADATA_HEADER_MARKER = "--- Document Metadata ---";
+
+export function extractDocumentTitle(content: string | undefined): string | undefined {
+  if (!content) return undefined;
+  // Trust ONLY the ingestion metadata header preamble — and ONLY when it is at the
+  // very START of the content. The pipeline builds `enrichedText = header + body`, so a
+  // real header is the first thing in the first retrieved chunk. Anchoring at the start
+  // rejects a body line (or a chunk that merely CONTAINS the marker) being read as a
+  // title — no document-content leak, especially in `metadata` mode.
+  const trimmed = content.trimStart();
+  if (!trimmed.startsWith(METADATA_HEADER_MARKER)) return undefined;
+  const afterMarker = trimmed.slice(METADATA_HEADER_MARKER.length);
+  // The header ends at the next line that is exactly `---` (closing) or a sub-section
+  // (`--- Frontmatter ---`, …); `File Name:` precedes any of these.
+  const endRel = afterMarker.indexOf("\n---");
+  const header = endRel === -1 ? afterMarker : afterMarker.slice(0, endRel);
+  const m = header.match(/^File Name:[ \t]*(.+?)[ \t]*$/m);
+  const name = m?.[1]?.trim();
+  return name && name.length > 0 ? name : undefined;
+}
+
 export function parseLightRAGReferences(raw: unknown): LightRAGReference[] {
   if (!Array.isArray(raw)) return [];
   const out: LightRAGReference[] = [];

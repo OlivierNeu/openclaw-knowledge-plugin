@@ -112,26 +112,27 @@ const DEFAULT_PGVECTOR_MOCK_RESULTS: PgvectorMockResult[] = [
 const DEFAULT_MOCK_SCORE = 0.8;
 const DEFAULT_MOCK_COLLECTION = "knowledge_test";
 
-// 3.2.9 — default LightRAG mock source references. Aligned with the default mock
-// context (which names guide-deploiement-helios.md) so a TEST deployment surfaces a
-// realistic "Sources" panel for the graph path. Since 3.2.12 each carries `content`
-// as a string[] of retrieved chunks — EXACTLY the shape real LightRAG returns with
-// `include_chunk_content: true` — so a TEST deployment exercises the per-document
-// excerpt path end-to-end (documents show their retrieved text, not just an id).
+// 3.2.9 — default LightRAG mock source references. MIRRORS the REAL production shape:
+// `file_path` is the gdrive retrieval key (`gdrive/<hash>`, NOT a readable name), and the
+// chunk `content` begins with the ingestion pipeline's `--- Document Metadata --- File
+// Name: <name> …` header — so a TEST deployment exercises the full path end-to-end: the
+// per-document excerpt (3.2.12) AND the readable `title` extracted from the header while
+// `file_name` stays the gdrive id (3.2.13). content is a string[] like real LightRAG with
+// `include_chunk_content: true`.
 const DEFAULT_LIGHTRAG_MOCK_REFERENCES: LightRAGMockReference[] = [
   {
-    file_path: "guide-deploiement-helios.md",
+    file_path: "gdrive/a1b2c3d4e5f600112233445566778899",
     reference_id: "1",
     content: [
-      "Le deploiement d'Helios se fait en trois etapes : preparation de l'environnement, application des migrations, puis bascule du trafic.",
+      "--- Document Metadata ---\nFile Name: Guide de deploiement Helios.md\nSource: Google Drive\nFile ID: 1AbCdEfGhIjKlMnOpQrStUvWxYz\n---\n\nLe deploiement d'Helios se fait en trois etapes : preparation de l'environnement, application des migrations, puis bascule du trafic.",
       "Chaque etape est reversible ; un rollback restaure l'etat precedent sans perte de donnees.",
     ],
   },
   {
-    file_path: "faq-helios.md",
+    file_path: "gdrive/99887766554433221100ffeeddccbbaa",
     reference_id: "2",
     content: [
-      "Q : Helios supporte-t-il le multi-tenant ? R : Oui, chaque tenant est isole par schema, sans partage de donnees.",
+      "--- Document Metadata ---\nFile Name: FAQ Helios.md\nSource: Google Drive\nFile ID: 2ZyXwVuTsRqPoNmLkJiHgFeDcBa\n---\n\nQ : Helios supporte-t-il le multi-tenant ? R : Oui, chaque tenant est isole par schema, sans partage de donnees.",
     ],
   },
 ];

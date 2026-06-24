@@ -856,10 +856,12 @@ async function runLightRAGSource(
     config.lightragApiKey,
     query,
     config.lightragQueryMode,
-    // Only ask LightRAG for the (potentially large, untruncated) per-chunk content
-    // when provenance is at `full` — the ONLY level that emits it. At off/metadata
-    // (the default) the content is never used, so requesting it is pure waste.
-    config.provenanceReport === "full",
+    // Ask LightRAG for the per-chunk content whenever provenance emits items
+    // (metadata OR full) — NOT only full. `metadata` emits the per-document `title`,
+    // which is parsed from that content's `File Name:` header (so without it the
+    // sources keep their opaque gdrive ids). `full` additionally emits the excerpt
+    // text. Only `off` (no emission) skips the fetch.
+    config.provenanceReport !== "off",
   );
   return {
     source: "lightrag",

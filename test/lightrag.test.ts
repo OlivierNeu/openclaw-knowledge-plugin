@@ -8,6 +8,7 @@ import {
   truncateLightRAG,
   parseLightRAGReferences,
   normalizeReferenceContent,
+  extractDocumentTitle,
 } from "../src/lightrag.js";
 
 describe("queryLightRAG", () => {
@@ -118,6 +119,37 @@ describe("queryLightRAG", () => {
       },
       { file_path: "offre-2.md", reference_id: "2" },
     ]);
+  });
+});
+
+describe("extractDocumentTitle", () => {
+  it("reads the n8n `File Name:` metadata header line (the readable name)", () => {
+    const content =
+      "--- Document Metadata ---\nFile Name: 2026 03 30 — Antoine Delcampe — CR.docx\nSource: Google Drive\nFile ID: 1AbC\n---\n\nCorps du document...";
+    assert.equal(
+      extractDocumentTitle(content),
+      "2026 03 30 — Antoine Delcampe — CR.docx",
+    );
+  });
+  it("returns undefined with no header / empty name (item falls back to file_name)", () => {
+    assert.equal(extractDocumentTitle("a mid-document chunk, no header"), undefined);
+    assert.equal(extractDocumentTitle(undefined), undefined);
+    assert.equal(extractDocumentTitle("File Name:   "), undefined);
+  });
+  it("ignores a `File Name:` line OUTSIDE the metadata header (no body-content leak)", () => {
+    // A mid-document chunk with a business line — must NOT be surfaced as a title.
+    assert.equal(
+      extractDocumentTitle("Voici le tableau.\nFile Name: facture-client.pdf\n(suite)"),
+      undefined,
+    );
+    // The header's File Name wins; a stray body line after the header is ignored.
+    const both =
+      "--- Document Metadata ---\nFile Name: Vrai Titre.docx\n---\n\nFile Name: piege-du-corps.txt";
+    assert.equal(extractDocumentTitle(both), "Vrai Titre.docx");
+    // The marker must be at the START — a mid-chunk that merely CONTAINS it is ignored.
+    const midChunk =
+      "Texte du corps...\n--- Document Metadata ---\nFile Name: faux-titre.docx\n---";
+    assert.equal(extractDocumentTitle(midChunk), undefined);
   });
 });
 

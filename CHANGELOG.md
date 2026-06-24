@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.2.13] - 2026-06-24
+
+### Added — readable document NAME as the source title (keeping the retrieval id)
+
+A LightRAG source document showed an opaque id as its title (`gdrive/<hash>`) because
+LightRAG's `references[].file_path` is the ingestion pipeline's `file_source` (a stable
+retrieval key, not a human name). The readable name was only inside the chunk content,
+as the ingestion pipeline's `--- Document Metadata --- File Name: <name>` header
+(identical in both n8n prepare nodes).
+
+- New `extractDocumentTitle` reads that `File Name:` header from a reference's retrieved
+  content and surfaces it as the provenance item's `title` (provenance/v1, additive).
+  The frontend shows `title` as the heading while `file_name` stays the gdrive retrieval
+  key — kept visible underneath and still searchable. Falls back to `file_name` when no
+  header is present (e.g. a mid-document chunk). The header is only trusted at the START
+  of the content (the ingestion pipeline puts it there), so a stray `File Name:` line in
+  a document body is never mistaken for a title.
+- The title is a metadata signal, so it is emitted at BOTH `metadata` and `full` levels.
+  To fill it, the per-chunk content is now fetched whenever provenance emits items
+  (`metadata` or `full`), not only `full`; `off` still skips the fetch entirely.
+- TEST mode mock references now mirror the REAL production shape: `file_path` is a
+  `gdrive/<hash>` id and the chunk content begins with the `File Name:` metadata header,
+  so a TEST deployment exercises the name-vs-id split end-to-end.
+
+Requires Atrium ≥ 0.10.4 with the `title` field rendered (the Sources card prefers
+`title`, shows the id as a searchable sub-line, and keeps `file_name` as the attach key).
+
 ## [3.2.12] - 2026-06-24
 
 ### Fixed — each LightRAG source document now shows its retrieved content

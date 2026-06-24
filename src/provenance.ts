@@ -19,6 +19,7 @@
 // The tracing invariant is untouched: NOTHING here goes through logs.
 
 import type { PluginLogger } from "openclaw/plugin-sdk/plugin-entry";
+import { extractDocumentTitle } from "./lightrag.js";
 import type { LightRAGReference, PgvectorResult } from "./types.js";
 
 export type ProvenanceReportLevel = "off" | "metadata" | "full";
@@ -45,6 +46,10 @@ export interface ProvenanceItemV1 {
   score?: number;
   text?: string;
   file_name?: string;
+  /** provenance/v1 (additive): a human DISPLAY name for a document item. When present
+   *  the UI shows it as the title instead of `file_name`; `file_name` remains the stable
+   *  retrieval/attach key (for LightRAG, the gdrive `file_source`). */
+  title?: string;
   collection?: string;
   /** provenance/v1 (additive): declares a SYNTHESIZED context excerpt (no openable
    *  source file) within a `documents` report — see Atrium's PROVENANCE_CONTRACT.md.
@@ -188,6 +193,12 @@ export function buildLightRAGProvenance(
     // ordinal ("1", "2", …) — unstable and collision-prone as an item key —
     // so it is intentionally NOT surfaced here. `file_path` is the key.
     const item: ProvenanceItemV1 = { file_name: ref.file_path, type: mode };
+    // The readable document NAME (the ingestion pipeline's `File Name:` metadata header,
+    // embedded in the retrieved content) becomes the display `title`; `file_name` stays
+    // LightRAG's `file_path` (the stable gdrive retrieval/attach/search key). Falls back
+    // to file_name when no header is present.
+    const title = extractDocumentTitle(ref.content);
+    if (title) item.title = title;
     // Since 3.2.12: surface the per-document RETRIEVED content + score so the user
     // sees the source material the RAG pulled for each document. `text` is gated on
     // `full` (operator opt-in) and bounded like every excerpt. This is the retrieved

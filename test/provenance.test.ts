@@ -308,6 +308,22 @@ describe("buildLightRAGProvenance", () => {
     assert.equal(a?.score, 0.7);
   });
 
+  it("3.2.13: a doc's `File Name:` header becomes item.title; file_name stays the gdrive key", () => {
+    const report = buildLightRAGProvenance("blob", "hybrid", "metadata", undefined, [
+      {
+        file_path: "gdrive/abc123def456",
+        content:
+          "--- Document Metadata ---\nFile Name: Rapport Q3.docx\nFile ID: x\n---\nCorps",
+      },
+      { file_path: "gdrive/no-header-chunk", content: "mid-document, no header" },
+    ]);
+    const withName = report!.items.find((i) => i.file_name === "gdrive/abc123def456");
+    assert.equal(withName?.title, "Rapport Q3.docx"); // readable name surfaced
+    assert.equal(withName?.file_name, "gdrive/abc123def456"); // retrieval key unchanged
+    const noName = report!.items.find((i) => i.file_name === "gdrive/no-header-chunk");
+    assert.equal(noName?.title, undefined); // no header → falls back to file_name
+  });
+
   it("full: bounds a reference excerpt to PROVENANCE_EXCERPT_MAX_CHARS", () => {
     const long = "x".repeat(5000);
     const report = buildLightRAGProvenance("blob", "hybrid", "full", undefined, [

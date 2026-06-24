@@ -2,7 +2,7 @@
   "id": "openclaw-knowledge",
   "name": "Knowledge Base",
   "description": "Multi-source knowledge search (pgvector + LightRAG) with optional Jina-powered router & reranker — injects relevant documents and knowledge graph context before each turn via the before_prompt_build hook",
-  "version": "3.2.12",
+  "version": "3.2.13",
   "activation": {
     "onStartup": true
   },
