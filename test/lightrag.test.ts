@@ -77,7 +77,12 @@ describe("queryLightRAG", () => {
       json: async () => ({
         response: "Context with two sources.",
         references: [
-          { reference_id: "1", file_path: "offre-1.md", content: "ignored body" },
+          {
+            reference_id: "1",
+            file_path: "offre-1.md",
+            content: "Retrieved body for offre 1.",
+            score: 0.83,
+          },
           { reference_id: "2", file_path: "offre-2.md" },
         ],
       }),
@@ -85,8 +90,15 @@ describe("queryLightRAG", () => {
 
     const result = await queryLightRAG("http://lightrag:9621", "", "q", "hybrid");
     assert.equal(result.context, "Context with two sources.");
+    // 3.2.11: the per-document retrieved content + score are now captured (the user
+    // must see the source material the RAG pulled), not dropped.
     assert.deepEqual(result.references, [
-      { file_path: "offre-1.md", reference_id: "1" },
+      {
+        file_path: "offre-1.md",
+        reference_id: "1",
+        content: "Retrieved body for offre 1.",
+        score: 0.83,
+      },
       { file_path: "offre-2.md", reference_id: "2" },
     ]);
   });
@@ -119,6 +131,25 @@ describe("parseLightRAGReferences", () => {
   it("omits a non-string reference_id", () => {
     const refs = parseLightRAGReferences([{ reference_id: 5, file_path: "a.md" }]);
     assert.deepEqual(refs, [{ file_path: "a.md" }]);
+  });
+
+  it("captures per-document content + score when present (3.2.11)", () => {
+    const refs = parseLightRAGReferences([
+      { file_path: "a.md", content: "the retrieved chunk", score: 0.91 },
+      { file_path: "b.md" }, // neither → both omitted
+    ]);
+    assert.deepEqual(refs, [
+      { file_path: "a.md", content: "the retrieved chunk", score: 0.91 },
+      { file_path: "b.md" },
+    ]);
+  });
+
+  it("defensively omits a non-string content / non-number score", () => {
+    const refs = parseLightRAGReferences([
+      { file_path: "a.md", content: 42, score: "high" },
+      { file_path: "b.md", content: "", score: Number.NaN }, // empty / NaN → omitted
+    ]);
+    assert.deepEqual(refs, [{ file_path: "a.md" }, { file_path: "b.md" }]);
   });
 
   it("omits X-API-Key header when no API key", async () => {

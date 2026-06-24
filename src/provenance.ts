@@ -149,19 +149,21 @@ export function buildPgvectorProvenance(
  *                      `injectedText.length` to keep the report
  *                      well-formed even on caller mistakes.
  * @param references    source documents LightRAG attributed this context to
- *                      (since 3.2.8). Surfaced as metadata-only items
- *                      (`file_name` = path) so the chat frontend can show
- *                      WHICH sources fed the answer. CRITICAL: a reference's
- *                      `content` is the RETRIEVED text, NOT the injected
- *                      text — it is deliberately never copied to `item.text`,
- *                      because the injected blob is truncated to
- *                      `lightragMaxChars` and a reference may have been
- *                      truncated out. Mapping content→text would re-introduce
- *                      the exact "report what was retrieved, not injected"
- *                      leak fixed for pgvector. The ONLY item carrying
- *                      injected text remains the single `lightrag-context`
- *                      blob item below. The empty-context guard still wins:
- *                      no injected text → no report, even with references.
+ *                      (since 3.2.8). Each becomes a findable document item
+ *                      (`file_name` = path) AND, since 3.2.11, carries its
+ *                      RETRIEVED `content` as the item's `text` (gated on
+ *                      `full`) plus a `score` when LightRAG provides one — so
+ *                      the user sees the source material the RAG pulled per
+ *                      document. This is a DELIBERATE semantic choice for the
+ *                      user's own Sources panel: unlike pgvector (whose
+ *                      `item.text` is the verbatim injected chunk), a LightRAG
+ *                      reference's `content` is the RETRIEVED source text, which
+ *                      is richer than the synthesized injection (it is not
+ *                      subject to the `lightragMaxChars` truncation). The
+ *                      verbatim, truncated injection stays the separate
+ *                      `lightrag-context` blob item below; the two are
+ *                      complementary, never conflated. The empty-context guard
+ *                      still wins: no injected text → no report, even with refs.
  */
 export function buildLightRAGProvenance(
   injectedText: string,
@@ -174,7 +176,7 @@ export function buildLightRAGProvenance(
 
   // Source-attribution items: one per UNIQUE file_path, order preserved
   // (LightRAG returns them ranked). Reserve one slot for the context blob
-  // item so it is never dropped by the cap. NEVER set `text` here.
+  // item so it is never dropped by the cap.
   const refItems: ProvenanceItemV1[] = [];
   const seen = new Set<string>();
   for (const ref of references) {
@@ -185,7 +187,20 @@ export function buildLightRAGProvenance(
     // (only memory items use `id`). LightRAG's `reference_id` is a per-query
     // ordinal ("1", "2", …) — unstable and collision-prone as an item key —
     // so it is intentionally NOT surfaced here. `file_path` is the key.
-    refItems.push({ file_name: ref.file_path, type: mode });
+    const item: ProvenanceItemV1 = { file_name: ref.file_path, type: mode };
+    // Since 3.2.11: surface the per-document RETRIEVED content + score so the user
+    // sees the source material the RAG pulled for each document. `text` is gated on
+    // `full` (operator opt-in) and bounded like every excerpt. This is the retrieved
+    // source content per document — complementary to, NOT a copy of, the synthesized
+    // `lightrag-context` blob (the verbatim, truncated injection). Because LightRAG's
+    // per-reference content is a SEPARATE field, it is not subject to the
+    // `lightragMaxChars` truncation, so the user sees each document's relevant content
+    // even when the injected blob was heavily truncated.
+    if (typeof ref.score === "number") item.score = ref.score;
+    if (level === "full" && ref.content) {
+      item.text = ref.content.slice(0, PROVENANCE_EXCERPT_MAX_CHARS);
+    }
+    refItems.push(item);
   }
 
   // The single blob item is the ONLY carrier of injected (post-truncation) text,

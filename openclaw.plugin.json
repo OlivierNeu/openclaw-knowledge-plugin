@@ -182,7 +182,7 @@
           "full"
         ],
         "default": "off",
-        "description": "Provenance reporting toward chat frontends (provenance/v1): off = no emission; metadata = file names/collections/scores; full = plus the exact injected excerpts. Reports ride the gateway agent-event bus and land under the chat's own ACL — never in logs."
+        "description": "Provenance reporting toward chat frontends (provenance/v1): off = no emission; metadata = file names/collections/scores; full = plus source excerpts (the injected pgvector chunks, the injected LightRAG context blob, AND each LightRAG source document's retrieved content so the user sees the material the RAG pulled per document). Reports ride the gateway agent-event bus and land under the chat's own ACL — never in logs."
       },
       "testMode": {
         "type": "object",

@@ -281,18 +281,40 @@ describe("buildLightRAGProvenance", () => {
     ]);
   });
 
-  it("full: reference items NEVER carry text; only the context item does", () => {
-    // The trap: a reference's `content` is RETRIEVED, not INJECTED. Mapping
-    // it to item.text would leak excerpts the LLM never saw. Lock it shut.
+  it("full: a reference's RETRIEVED content becomes its item.text + score (3.2.11)", () => {
+    // The user must see the source material the RAG pulled per document. A reference's
+    // retrieved `content` is surfaced as item.text at `full`; a reference without
+    // content carries none. The verbatim injection stays the separate context blob.
     const report = buildLightRAGProvenance("injected blob", "hybrid", "full", undefined, [
-      { file_path: "a.md" },
-      { file_path: "b.md" },
+      { file_path: "a.md", content: "retrieved chunk A", score: 0.9 },
+      { file_path: "b.md" }, // no content → no text
     ]);
-    const refItems = report!.items.filter((i) => i.file_name);
-    assert.equal(refItems.length, 2);
-    assert.ok(refItems.every((i) => i.text === undefined), "reference items must have no text");
+    const a = report!.items.find((i) => i.file_name === "a.md");
+    assert.equal(a?.text, "retrieved chunk A");
+    assert.equal(a?.score, 0.9);
+    const b = report!.items.find((i) => i.file_name === "b.md");
+    assert.equal(b?.text, undefined);
     const ctxItem = report!.items.find((i) => i.id === "lightrag-context");
     assert.equal(ctxItem?.text, "injected blob");
+  });
+
+  it("metadata: a reference's content is NOT emitted as text, but its score IS", () => {
+    // Excerpts are gated on `full` (operator opt-in); scores are metadata-level.
+    const report = buildLightRAGProvenance("ctx", "hybrid", "metadata", undefined, [
+      { file_path: "a.md", content: "retrieved chunk A", score: 0.7 },
+    ]);
+    const a = report!.items.find((i) => i.file_name === "a.md");
+    assert.equal(a?.text, undefined);
+    assert.equal(a?.score, 0.7);
+  });
+
+  it("full: bounds a reference excerpt to PROVENANCE_EXCERPT_MAX_CHARS", () => {
+    const long = "x".repeat(5000);
+    const report = buildLightRAGProvenance("blob", "hybrid", "full", undefined, [
+      { file_path: "a.md", content: long },
+    ]);
+    const a = report!.items.find((i) => i.file_name === "a.md");
+    assert.equal(a?.text?.length, PROVENANCE_EXCERPT_MAX_CHARS);
   });
 
   it("dedups references by file_path, preserving first-seen order", () => {

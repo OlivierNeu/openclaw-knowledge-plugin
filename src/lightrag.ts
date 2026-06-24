@@ -22,11 +22,15 @@ interface LightRAGResponsePayload {
 /**
  * Parse the `references` field of a LightRAG response into a clean list.
  *
- * Mirrors the production gold-eval extractor: keep only dict entries with a
- * non-empty string `file_path`; anything malformed is silently dropped (the
- * references are a best-effort enrichment, never a hard dependency). Returns
- * `[]` for older servers that omit the field entirely, which preserves the
+ * Keeps entries with a non-empty string `file_path`; anything malformed is silently
+ * dropped (the references are a best-effort enrichment, never a hard dependency).
+ * Returns `[]` for older servers that omit the field entirely, which preserves the
  * pre-3.2.8 behavior end-to-end.
+ *
+ * Since 3.2.11 the per-document `content` (the retrieved source text) and a per-
+ * reference `score` are captured too, when LightRAG provides them, so the chat
+ * frontend can show the user the source material per document. Both are optional and
+ * defensive: a non-string `content` or non-number `score` is simply omitted.
  *
  * @internal exported for unit testing
  */
@@ -41,6 +45,12 @@ export function parseLightRAGReferences(raw: unknown): LightRAGReference[] {
     const ref: LightRAGReference = { file_path: fp };
     if (typeof rec.reference_id === "string" && rec.reference_id.length > 0) {
       ref.reference_id = rec.reference_id;
+    }
+    if (typeof rec.content === "string" && rec.content.length > 0) {
+      ref.content = rec.content;
+    }
+    if (typeof rec.score === "number" && Number.isFinite(rec.score)) {
+      ref.score = rec.score;
     }
     out.push(ref);
   }

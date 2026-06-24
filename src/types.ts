@@ -217,19 +217,30 @@ export type LightRAGQueryMode = "naive" | "local" | "global" | "hybrid";
 /**
  * One source reference from a LightRAG `/query` response. LightRAG (≥ 1.4.5)
  * returns a structured `references` array alongside the assembled `response`
- * context, each entry pointing at a source document. We capture ONLY the
- * source-attribution fields (`reference_id`, `file_path`) — never the
- * reference's `content`, which is the RETRIEVED text, not the INJECTED text
- * (see `buildLightRAGProvenance` for why mixing the two would leak excerpts
- * the LLM never saw).
+ * context, each entry pointing at a source document, often with the per-document
+ * `content` LightRAG retrieved for it.
  *
- * @since 3.2.8
+ * We capture the attribution (`reference_id`, `file_path`) AND, since 3.2.11, the
+ * retrieved `content` (and `score` when present) so the chat frontend can show the
+ * user the SOURCE MATERIAL the RAG pulled per document. Note the distinction: this
+ * `content` is the RETRIEVED text per source — NOT the verbatim injected prompt (that
+ * is the synthesized, `lightragMaxChars`-truncated `lightrag-context` blob). It is in
+ * fact richer than the injection (it is not subject to that truncation), which is the
+ * point — the user sees each document's relevant content even when the injected blob
+ * was heavily truncated.
+ *
+ * @since 3.2.8 (content/score: 3.2.11)
  */
 export interface LightRAGReference {
   /** LightRAG's opaque reference identifier (e.g. "5"), when provided. */
   reference_id?: string;
   /** Source document path/name LightRAG attributes this context to. */
   file_path: string;
+  /** The retrieved source content for this document, when LightRAG provides it. */
+  content?: string;
+  /** A per-reference relevance score in [0, 1], when LightRAG provides it (not all
+   *  versions do — surfaced defensively, never fabricated). */
+  score?: number;
 }
 
 /**
