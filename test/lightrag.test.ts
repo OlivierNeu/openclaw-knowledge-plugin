@@ -7,6 +7,7 @@ import {
   queryLightRAG,
   truncateLightRAG,
   parseLightRAGReferences,
+  normalizeReferenceContent,
 } from "../src/lightrag.js";
 
 describe("queryLightRAG", () => {
@@ -28,6 +29,10 @@ describe("queryLightRAG", () => {
       assert.equal(body.mode, "hybrid");
       assert.equal(body.only_need_context, true);
       assert.equal(body.stream, false);
+      // 3.2.12: when requested (provenance=full), LightRAG returns per-reference
+      // chunk content; without it, references are id+path only — which is exactly
+      // why the Sources panel showed no per-doc text.
+      assert.equal(body.include_chunk_content, true);
 
       return {
         ok: true,
@@ -40,9 +45,21 @@ describe("queryLightRAG", () => {
       "my-api-key",
       "find my contracts",
       "hybrid",
+      true, // includeChunkContent (caller enables only at provenance=full)
     );
     assert.equal(result.context, "Contract A signed on 2025-01-01.");
     assert.deepEqual(result.references, []);
+  });
+
+  it("does NOT request chunk content by default (gated on provenance=full)", async () => {
+    let sentFlag: unknown = "unset";
+    mock.method(globalThis, "fetch", async (_u: unknown, opts?: RequestInit) => {
+      sentFlag = JSON.parse(opts?.body as string).include_chunk_content;
+      return { ok: true, json: async () => ({ response: "ctx" }) } as unknown as Response;
+    });
+    // No 5th arg → off/metadata path: must NOT pay for chunk content.
+    await queryLightRAG("http://lightrag:9621", "", "q", "hybrid");
+    assert.equal(sentFlag, false);
   });
 
   it("returns empty context when response field is missing", async () => {
@@ -76,12 +93,13 @@ describe("queryLightRAG", () => {
       ok: true,
       json: async () => ({
         response: "Context with two sources.",
+        // Real shape with include_chunk_content:true — content is a string[] of
+        // chunks (HKUDS/LightRAG >= 1.4.9), no per-reference score.
         references: [
           {
             reference_id: "1",
             file_path: "offre-1.md",
-            content: "Retrieved body for offre 1.",
-            score: 0.83,
+            content: ["Retrieved chunk one.", "Retrieved chunk two."],
           },
           { reference_id: "2", file_path: "offre-2.md" },
         ],
@@ -90,17 +108,35 @@ describe("queryLightRAG", () => {
 
     const result = await queryLightRAG("http://lightrag:9621", "", "q", "hybrid");
     assert.equal(result.context, "Context with two sources.");
-    // 3.2.11: the per-document retrieved content + score are now captured (the user
-    // must see the source material the RAG pulled), not dropped.
+    // 3.2.12: the per-document retrieved chunks are captured + joined (the user must
+    // see the source material the RAG pulled), not dropped.
     assert.deepEqual(result.references, [
       {
         file_path: "offre-1.md",
         reference_id: "1",
-        content: "Retrieved body for offre 1.",
-        score: 0.83,
+        content: "Retrieved chunk one.\n\nRetrieved chunk two.",
       },
       { file_path: "offre-2.md", reference_id: "2" },
     ]);
+  });
+});
+
+describe("normalizeReferenceContent", () => {
+  it("joins a string[] of chunks (the real include_chunk_content shape)", () => {
+    assert.equal(
+      normalizeReferenceContent(["chunk A", "chunk B"]),
+      "chunk A\n\nchunk B",
+    );
+  });
+  it("accepts a bare string defensively, drops empties", () => {
+    assert.equal(normalizeReferenceContent("solo"), "solo");
+    assert.equal(normalizeReferenceContent(["", "kept", ""]), "kept");
+  });
+  it("returns undefined for empty / non-string input", () => {
+    assert.equal(normalizeReferenceContent([]), undefined);
+    assert.equal(normalizeReferenceContent(undefined), undefined);
+    assert.equal(normalizeReferenceContent([1, 2]), undefined);
+    assert.equal(normalizeReferenceContent(42), undefined);
   });
 });
 
@@ -133,21 +169,21 @@ describe("parseLightRAGReferences", () => {
     assert.deepEqual(refs, [{ file_path: "a.md" }]);
   });
 
-  it("captures per-document content + score when present (3.2.11)", () => {
+  it("captures + joins the per-document chunk content array (3.2.12)", () => {
     const refs = parseLightRAGReferences([
-      { file_path: "a.md", content: "the retrieved chunk", score: 0.91 },
-      { file_path: "b.md" }, // neither → both omitted
+      { file_path: "a.md", content: ["chunk one", "chunk two"] },
+      { file_path: "b.md" }, // no content → omitted
     ]);
     assert.deepEqual(refs, [
-      { file_path: "a.md", content: "the retrieved chunk", score: 0.91 },
+      { file_path: "a.md", content: "chunk one\n\nchunk two" },
       { file_path: "b.md" },
     ]);
   });
 
-  it("defensively omits a non-string content / non-number score", () => {
+  it("defensively omits malformed content (non-string array entries, empties)", () => {
     const refs = parseLightRAGReferences([
-      { file_path: "a.md", content: 42, score: "high" },
-      { file_path: "b.md", content: "", score: Number.NaN }, // empty / NaN → omitted
+      { file_path: "a.md", content: [1, 2] }, // non-string entries → omitted
+      { file_path: "b.md", content: [] }, // empty → omitted
     ]);
     assert.deepEqual(refs, [{ file_path: "a.md" }, { file_path: "b.md" }]);
   });

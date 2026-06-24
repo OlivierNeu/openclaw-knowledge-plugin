@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.2.12] - 2026-06-24
+
+### Fixed — each LightRAG source document now shows its retrieved content
+
+A LightRAG reply's Sources panel listed each source document by id only, with no
+excerpt: the per-document text never reached the chat frontend. Root cause: the plugin
+queried LightRAG WITHOUT `include_chunk_content`, so the `references` field came back as
+`reference_id` + `file_path` only (LightRAG returns chunk text in `references` ONLY when
+that flag is set — HKUDS/LightRAG ≥ 1.4.9), and the chunk `content` (a `string[]`) was
+not parsed.
+
+- `queryLightRAG` now sends `include_chunk_content: true` — but ONLY when
+  `provenanceReport` is `full` (the sole level that emits excerpts); at `off`/`metadata`
+  the flag stays off so a query never pays to fetch chunk text it won't use.
+- `parseLightRAGReferences` captures the per-reference chunk content, joining the
+  `string[]` of chunks (new `normalizeReferenceContent` helper). `buildLightRAGProvenance`
+  surfaces it as each document item's `text` at `full`. The chunk content is the FULL
+  retrieved text — NOT subject to the `lightragMaxChars` truncation of the assembled
+  context blob — so a user sees each document's relevant content even when the injected
+  blob was heavily truncated. (LightRAG references carry no per-reference score, so
+  documents show text without a relevance bar — never fabricated.)
+
+### Changed — TEST mode is now a faithful proxy for the real reference shape
+
+`testMode.lightragMockReferences` entries may now be rich objects
+(`{ file_path, content: string[], reference_id? }`) — the exact shape real LightRAG
+returns with `include_chunk_content: true`, normalized through the same helper as the
+live path. The default mock references now carry `content`, so a TEST deployment exercises
+the per-document excerpt end-to-end. Bare path strings still work.
+
 ## [3.2.9] - 2026-06-20
 
 ### Added — TEST mode can mock LightRAG source references

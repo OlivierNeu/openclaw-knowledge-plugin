@@ -856,6 +856,10 @@ async function runLightRAGSource(
     config.lightragApiKey,
     query,
     config.lightragQueryMode,
+    // Only ask LightRAG for the (potentially large, untruncated) per-chunk content
+    // when provenance is at `full` — the ONLY level that emits it. At off/metadata
+    // (the default) the content is never used, so requesting it is pure waste.
+    config.provenanceReport === "full",
   );
   return {
     source: "lightrag",

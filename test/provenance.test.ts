@@ -281,7 +281,7 @@ describe("buildLightRAGProvenance", () => {
     ]);
   });
 
-  it("full: a reference's RETRIEVED content becomes its item.text + score (3.2.11)", () => {
+  it("full: a reference's RETRIEVED content becomes its item.text + score (3.2.12)", () => {
     // The user must see the source material the RAG pulled per document. A reference's
     // retrieved `content` is surfaced as item.text at `full`; a reference without
     // content carries none. The verbatim injection stays the separate context blob.

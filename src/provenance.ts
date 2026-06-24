@@ -150,7 +150,7 @@ export function buildPgvectorProvenance(
  *                      well-formed even on caller mistakes.
  * @param references    source documents LightRAG attributed this context to
  *                      (since 3.2.8). Each becomes a findable document item
- *                      (`file_name` = path) AND, since 3.2.11, carries its
+ *                      (`file_name` = path) AND, since 3.2.12, carries its
  *                      RETRIEVED `content` as the item's `text` (gated on
  *                      `full`) plus a `score` when LightRAG provides one — so
  *                      the user sees the source material the RAG pulled per
@@ -188,7 +188,7 @@ export function buildLightRAGProvenance(
     // ordinal ("1", "2", …) — unstable and collision-prone as an item key —
     // so it is intentionally NOT surfaced here. `file_path` is the key.
     const item: ProvenanceItemV1 = { file_name: ref.file_path, type: mode };
-    // Since 3.2.11: surface the per-document RETRIEVED content + score so the user
+    // Since 3.2.12: surface the per-document RETRIEVED content + score so the user
     // sees the source material the RAG pulled for each document. `text` is gated on
     // `full` (operator opt-in) and bounded like every excerpt. This is the retrieved
     // source content per document — complementary to, NOT a copy of, the synthesized

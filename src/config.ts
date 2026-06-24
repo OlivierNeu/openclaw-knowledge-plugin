@@ -5,11 +5,13 @@
 
 import { DEFAULT_RPM_BUDGET } from "./jina/rate-limit.js";
 import type { RerankerModel } from "./jina/types.js";
+import { normalizeReferenceContent } from "./lightrag.js";
 import { resolveProvenanceLevel } from "./provenance.js";
 import { DEFAULT_MIN_CONFIDENCE } from "./router/index.js";
 import type {
   JinaPluginConfig,
   KnowledgePluginConfig,
+  LightRAGMockReference,
   LightRAGQueryMode,
   LightRAGReference,
   PgvectorMockResult,
@@ -110,12 +112,28 @@ const DEFAULT_PGVECTOR_MOCK_RESULTS: PgvectorMockResult[] = [
 const DEFAULT_MOCK_SCORE = 0.8;
 const DEFAULT_MOCK_COLLECTION = "knowledge_test";
 
-// 3.2.9 — default LightRAG mock source references. Aligned with the default
-// mock context (which names guide-deploiement-helios.md) so a TEST deployment
-// surfaces a realistic "Sources" panel for the graph path.
-const DEFAULT_LIGHTRAG_MOCK_REFERENCES = [
-  "guide-deploiement-helios.md",
-  "faq-helios.md",
+// 3.2.9 — default LightRAG mock source references. Aligned with the default mock
+// context (which names guide-deploiement-helios.md) so a TEST deployment surfaces a
+// realistic "Sources" panel for the graph path. Since 3.2.12 each carries `content`
+// as a string[] of retrieved chunks — EXACTLY the shape real LightRAG returns with
+// `include_chunk_content: true` — so a TEST deployment exercises the per-document
+// excerpt path end-to-end (documents show their retrieved text, not just an id).
+const DEFAULT_LIGHTRAG_MOCK_REFERENCES: LightRAGMockReference[] = [
+  {
+    file_path: "guide-deploiement-helios.md",
+    reference_id: "1",
+    content: [
+      "Le deploiement d'Helios se fait en trois etapes : preparation de l'environnement, application des migrations, puis bascule du trafic.",
+      "Chaque etape est reversible ; un rollback restaure l'etat precedent sans perte de donnees.",
+    ],
+  },
+  {
+    file_path: "faq-helios.md",
+    reference_id: "2",
+    content: [
+      "Q : Helios supporte-t-il le multi-tenant ? R : Oui, chaque tenant est isole par schema, sans partage de donnees.",
+    ],
+  },
 ];
 
 /**
@@ -225,15 +243,31 @@ export function resolveConfig(
 }
 
 /**
- * Normalize a list of mock source file paths into {@link LightRAGReference}
- * objects, dropping non-string / empty entries (defense-in-depth against a
- * malformed config that slips past the JSON schema).
+ * Normalize mock source references into {@link LightRAGReference} objects. Accepts
+ * either a bare path string (no content) or a rich `{ file_path, content[], reference_id }`
+ * entry whose `content` (a string[] of chunks, like real LightRAG with
+ * `include_chunk_content: true`) is joined through the SAME {@link normalizeReferenceContent}
+ * the live parser uses — so TEST mode is a faithful proxy. Malformed / empty entries are
+ * dropped (defense-in-depth against a config that slips past the JSON schema).
  */
-function toLightRAGMockReferences(paths: string[]): LightRAGReference[] {
-  if (!Array.isArray(paths)) return [];
+function toLightRAGMockReferences(
+  entries: Array<string | LightRAGMockReference>,
+): LightRAGReference[] {
+  if (!Array.isArray(entries)) return [];
   const out: LightRAGReference[] = [];
-  for (const p of paths) {
-    if (typeof p === "string" && p.length > 0) out.push({ file_path: p });
+  for (const e of entries) {
+    if (typeof e === "string") {
+      if (e.length > 0) out.push({ file_path: e });
+      continue;
+    }
+    if (!e || typeof e.file_path !== "string" || e.file_path.length === 0) continue;
+    const ref: LightRAGReference = { file_path: e.file_path };
+    if (typeof e.reference_id === "string" && e.reference_id.length > 0) {
+      ref.reference_id = e.reference_id;
+    }
+    const content = normalizeReferenceContent(e.content);
+    if (content) ref.content = content;
+    out.push(ref);
   }
   return out;
 }

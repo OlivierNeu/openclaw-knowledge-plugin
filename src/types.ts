@@ -118,17 +118,28 @@ export interface TestModePluginConfig {
    */
   pgvectorMockResults?: PgvectorMockResult[];
   /**
-   * Canned LightRAG source references returned in test mode — a list of
-   * source document `file_path`s. These flow through provenance exactly like
-   * real references (since 3.2.8), so a TEST deployment on a live gateway can
-   * exercise the "which sources fed this answer" panel for LightRAG, mirroring
-   * what {@link pgvectorMockResults} already enables for pgvector. Defaults to
-   * a small synthetic set aligned with the default mock context. Set to `[]`
-   * to mock LightRAG with no source attribution.
+   * Canned LightRAG source references returned in test mode. Each entry is either
+   * a bare `file_path` string OR a rich `{ file_path, content[], reference_id? }`
+   * object whose `content` is the list of retrieved chunks for that document — the
+   * SAME shape real LightRAG returns with `include_chunk_content: true`. These flow
+   * through provenance exactly like real references (since 3.2.8; per-document
+   * `content` since 3.2.12), so a TEST deployment on a live gateway exercises the
+   * full "which sources fed this answer + their content" panel for LightRAG,
+   * mirroring what {@link pgvectorMockResults} enables for pgvector. Defaults to a
+   * small synthetic set (with content) aligned with the default mock context. Set
+   * to `[]` to mock LightRAG with no source attribution.
    *
-   * @since 3.2.9
+   * @since 3.2.9 (rich content entries: 3.2.12)
    */
-  lightragMockReferences?: string[];
+  lightragMockReferences?: Array<string | LightRAGMockReference>;
+}
+
+/** A rich mock LightRAG reference for test mode — mirrors the real response shape
+ *  (file_path + the retrieved chunk `content` as a string[]). @since 3.2.12 */
+export interface LightRAGMockReference {
+  file_path: string;
+  reference_id?: string;
+  content?: string[];
 }
 
 /**
@@ -220,7 +231,7 @@ export type LightRAGQueryMode = "naive" | "local" | "global" | "hybrid";
  * context, each entry pointing at a source document, often with the per-document
  * `content` LightRAG retrieved for it.
  *
- * We capture the attribution (`reference_id`, `file_path`) AND, since 3.2.11, the
+ * We capture the attribution (`reference_id`, `file_path`) AND, since 3.2.12, the
  * retrieved `content` (and `score` when present) so the chat frontend can show the
  * user the SOURCE MATERIAL the RAG pulled per document. Note the distinction: this
  * `content` is the RETRIEVED text per source — NOT the verbatim injected prompt (that
@@ -229,7 +240,7 @@ export type LightRAGQueryMode = "naive" | "local" | "global" | "hybrid";
  * point — the user sees each document's relevant content even when the injected blob
  * was heavily truncated.
  *
- * @since 3.2.8 (content/score: 3.2.11)
+ * @since 3.2.8 (content/score: 3.2.12)
  */
 export interface LightRAGReference {
   /** LightRAG's opaque reference identifier (e.g. "5"), when provided. */
