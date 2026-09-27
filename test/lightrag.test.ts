@@ -315,7 +315,17 @@ describe("queryLightRAG — 4.0 options", () => {
       "fetch",
       (_u: unknown, i?: RequestInit) =>
         new Promise<Response>((_resolve, reject) => {
-          i?.signal?.addEventListener("abort", () => reject(i.signal!.reason), { once: true });
+          // AbortSignal.timeout() is unref'd: without a pending ref'd timer the
+          // event loop drains first and the runner cancels the test (Node 22).
+          const keepAlive = setTimeout(() => undefined, 5_000);
+          i?.signal?.addEventListener(
+            "abort",
+            () => {
+              clearTimeout(keepAlive);
+              reject(i.signal!.reason);
+            },
+            { once: true },
+          );
         }),
     );
     await assert.rejects(
@@ -330,7 +340,17 @@ describe("queryLightRAG — 4.0 options", () => {
       "fetch",
       (_u: unknown, i?: RequestInit) =>
         new Promise<Response>((_resolve, reject) => {
-          i?.signal?.addEventListener("abort", () => reject(i.signal!.reason), { once: true });
+          // AbortSignal.timeout() is unref'd: without a pending ref'd timer the
+          // event loop drains first and the runner cancels the test (Node 22).
+          const keepAlive = setTimeout(() => undefined, 5_000);
+          i?.signal?.addEventListener(
+            "abort",
+            () => {
+              clearTimeout(keepAlive);
+              reject(i.signal!.reason);
+            },
+            { once: true },
+          );
         }),
     );
     const controller = new AbortController();

@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.0.1] - 2026-09-27
+
+No runtime change: same behavior as 4.0.0.
+
+### Fixed
+
+- CI (Node 22): the `queryLightRAG — 4.0 options` timeout / caller-abort tests
+  were cancelled by the test runner. `AbortSignal.timeout()` does not keep the
+  event loop alive, so a mocked `fetch` that only waits for the abort let the loop
+  drain before the timeout fired. The mocks now hold a ref'd timer until the
+  abort; production is unaffected (the gateway always keeps the loop alive).
+
 ## [4.0.0] - 2026-09-27
 
 Latency, prompt-cache friendliness and an Atrium / user-driven control plane.
