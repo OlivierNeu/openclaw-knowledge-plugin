@@ -28,8 +28,14 @@ import type { Route, RouterDecision } from "./types.js";
 export interface RouterConfig {
   /** Master switch. When false, every call returns `{route: "ALL"}`. */
   enabled: boolean;
-  /** Which engine fills the gap when heuristics are ambiguous. */
-  mode: "heuristic" | "jina-classifier";
+  /**
+   * Which engine fills the gap when heuristics are ambiguous.
+   * `jina-classifier-parallel` classifies exactly like `jina-classifier`;
+   * the parallelism (speculative source launch) lives in the hook handler.
+   */
+  mode: "heuristic" | "jina-classifier" | "jina-classifier-parallel";
+  /** Timeout for the classify HTTP call in ms (client default 8000). @since 4.0.0 */
+  timeoutMs?: number;
   /** Jina API key — required when mode === "jina-classifier". */
   jinaApiKey: string;
   /**
@@ -111,11 +117,24 @@ export async function decideRoute(
   cfg: RouterConfig,
   ctx: RouterRuntimeContext,
 ): Promise<RouterDecision> {
-  // Normalize the confidence threshold once at function entry so the
-  // low-confidence guard applies uniformly to every caller, including
-  // external JS plugins that may pass an undefined / out-of-range value.
-  const minConfidence = clampConfidence(cfg.minConfidence ?? DEFAULT_MIN_CONFIDENCE);
+  const early = decideRouteWithoutClassifier(cfg, ctx);
+  if (early !== null) return early;
+  return classifyRoute(cfg, ctx);
+}
 
+/**
+ * Synchronous first half of {@link decideRoute}: returns the decision when
+ * it can be made without the network (router disabled, heuristic hit,
+ * heuristic-only mode, missing key), or `null` when the Jina classifier must
+ * be consulted. Lets the hook launch sources speculatively in parallel with
+ * the classifier (`jina-classifier-parallel`).
+ *
+ * @since 4.0.0
+ */
+export function decideRouteWithoutClassifier(
+  cfg: RouterConfig,
+  ctx: RouterRuntimeContext,
+): RouterDecision | null {
   // 0. Disabled → preserve legacy behavior.
   if (!cfg.enabled) {
     return { route: "ALL", reason: "router_disabled", score: null };
@@ -141,7 +160,24 @@ export async function decideRoute(
     // Misconfiguration safety net — never crash, just fall back.
     return { route: FALLBACK, reason: "classifier_fallback", score: null };
   }
+  return null;
+}
 
+/**
+ * Network half of {@link decideRoute}: consult the Jina classifier. Callers
+ * must only invoke it when {@link decideRouteWithoutClassifier} returned
+ * `null`. Fails open to `ALL` on every Jina error.
+ *
+ * @since 4.0.0
+ */
+export async function classifyRoute(
+  cfg: RouterConfig,
+  ctx: RouterRuntimeContext,
+): Promise<RouterDecision> {
+  // Normalize the confidence threshold once at function entry so the
+  // low-confidence guard applies uniformly to every caller, including
+  // external JS plugins that may pass an undefined / out-of-range value.
+  const minConfidence = clampConfidence(cfg.minConfidence ?? DEFAULT_MIN_CONFIDENCE);
   try {
     const startedAt = Date.now();
     const outcome = cfg.classifierId
@@ -150,6 +186,7 @@ export async function decideRoute(
           text: ctx.query,
           classifierId: cfg.classifierId,
           expectedLabels: ROUTER_LABEL_NAMES as string[],
+          timeoutMs: cfg.timeoutMs,
           signal: ctx.signal,
           rpmMonitor: cfg.rpmMonitor,
         })
@@ -157,6 +194,7 @@ export async function decideRoute(
           apiKey: cfg.jinaApiKey,
           text: ctx.query,
           labels: (cfg.labels ?? DEFAULT_ROUTER_LABELS) as string[],
+          timeoutMs: cfg.timeoutMs,
           signal: ctx.signal,
           rpmMonitor: cfg.rpmMonitor,
         });

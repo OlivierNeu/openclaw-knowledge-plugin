@@ -7,6 +7,155 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.0.0] - 2026-09-27
+
+Latency, prompt-cache friendliness and an Atrium / user-driven control plane.
+Every existing configuration loads unchanged (validated against the 3.2.13 live
+configs), but the default runtime behavior changes — hence the major version. See
+**Migration** below.
+
+### Changed — knowledge is injected on the user turn (cache-friendly)
+
+- The block is returned as `prependContext` (current user message, model submission
+  only; the transcript keeps the raw text) instead of `appendSystemContext`, so the
+  system prompt and the whole history prefix stay byte-stable and provider prompt
+  caching works again. New `injectionTarget`: `prependContext` (default) |
+  `appendContext` | `appendSystemContext` (pre-4.0). User-side blocks are fenced in
+  `<relevant-documents source="openclaw-knowledge">` and flagged as reference
+  material, not instructions.
+- Provenance reports keep their shape; `injected.position` now states where the block
+  landed (`user_prepend`, `user_append`, `system_append`, `tool_result`).
+
+### Added — non-human turns are skipped before any network call
+
+- New pre-router skip stage, active with the router on or off: sessions matching
+  `skip.sessionPatterns` (default `:subagent:`, `:active-memory:`), triggers in
+  `skip.triggers` (default heartbeat, cron, memory, **manual** — the active-memory
+  recall sub-agent and other host-initiated runs), typed non-human input
+  (`ctx.inputProvenance.kind` = `inter_session` / `internal_system`:
+  sessions_send, subagent announce / settle, exec completions, background wakes;
+  `skip.nonHumanInput`, `skip.allowSourceTools`) and whole-message
+  acknowledgements on every channel (`skip.acknowledgements`: "merci", "ok parfait",
+  "oui vas-y 👍", "thanks!" — FR+EN, anchored, ≤ 48 chars). Each skip emits a `router`
+  event (`skip_subagent_session`, `heuristic_trigger`, `skip_non_human_input`,
+  `heuristic_ack`) with a content-free `detail`.
+- The query now comes from `event.currentUserMessage` when the host supplies it
+  (OpenClaw ≥ 2026.9); an explicit empty string means "no textual request".
+
+### Added — time budgets and partial success
+
+- `AbortSignal` timeouts on LightRAG (`lightragTimeoutMs`, default 3500), on the
+  Gemini embedding + SQL path (`pgvectorTimeoutMs`, default 3000, also PostgreSQL
+  `statement_timeout`) and on the Jina classifier (`jina.router.timeoutMs`, default
+  1500), plus a global `retrievalBudgetMs` (default 4500): when it elapses the hook
+  injects whatever finished and logs a warning. The hook is registered with an
+  explicit `timeoutMs` (`hookTimeoutMs`, default budget + 1500) instead of the host's
+  15 s default, and checks `ctx.hookInvocation.assertActive()` before emitting
+  provenance / returning.
+- A turn where every source only timed out no longer counts toward the 3-errors →
+  5-minute global cooldown (a slow backend is bounded by the budget, not broken);
+  real errors still do. A classifier that exhausts the budget skips the sources
+  (`skipped: "budget_exhausted"`).
+- pg pools are shared per URL across the per-run plugin re-registrations.
+
+### Added — cheaper LightRAG queries
+
+- Per-route query modes (`lightragQueryModeByRoute`: `PGVECTOR_ONLY`,
+  `LIGHTRAG_ONLY`, `ALL`, `fallback`, `tool`). Defaults: `naive` (no LLM keyword
+  extraction) for simple lookups and tool calls, `hybrid` for graph questions. An
+  explicitly set legacy `lightragQueryMode` still overrides every route default.
+  `mix` is now accepted.
+- `lightragLocalKeywords` (default false): FR+EN stopword-based `hl_keywords` /
+  `ll_keywords` sent with graph-mode queries so LightRAG skips its LLM keyword
+  extraction (verified against HKUDS/LightRAG v1.5.7 `QueryRequest` and
+  `get_keywords_from_query`).
+
+### Added — routing
+
+- New router mode `jina-classifier-parallel`: sources start speculatively (with the
+  `fallback` mode) while the Jina classifier runs; the decision keeps, trims,
+  re-plans or discards them (`speculativeDiscarded` in the timing event). Existing
+  modes are unchanged.
+
+### Added — per-session cache and timing
+
+- Bounded per-session LRU result cache (`cache.enabled`, `ttlMs` 10 min,
+  `maxEntries` 200, `maxBytes` 8 MiB) keyed by agent, session, normalized query,
+  source and retrieval variant; purged on policy changes and session reset / delete.
+- One `timing` event per eligible turn: `filterMs`, `routerMs`, `pgvectorMs`,
+  `lightragMs`, `totalMs`, `route`, `reason`, `skipped`, `cacheHit`,
+  `budgetExceeded`, `injected`, resolved `policy` (injection, sources, origin).
+
+### Added — named sources, policies, tool and control plane
+
+- `sources` registry (`id → {type, label, description, enabled, url, apiKey,
+  collections, queryMode, maxChars}`), synthesized from the legacy keys as ids
+  `pgvector` / `lightrag` when absent.
+- `defaults` + `agents.<agentId>` policies: `injection` (`auto` | `hybrid` | `tool` |
+  `off`), `sources`, `allowedSources`, `topK`, `lightragQueryMode`,
+  `allowSessionOverrides`; `hybridMinScore` (0.45).
+- Optional agent tool `knowledge_search` (`query`, `sources`, `collection`, `mode`,
+  `topK`) sharing the allowlist, cache and renderers; declared in the manifest
+  (`contracts.tools`, `toolMetadata.knowledge_search.optional`).
+- Session extension `openclaw-knowledge/policy` (session override + one-shot),
+  session actions `policy.get` / `policy.set` / `policy.reset`
+  (`plugins.sessionAction`), Gateway methods `knowledge.sources` /
+  `knowledge.policy.get` (`operator.read`), and the `/knowledge` chat command.
+  Resolution order: one-shot > session > agent > default; selections are clamped to
+  the agent allowlist on every read. Contract: `docs/atrium-integration.md`.
+
+### Migration from 3.x
+
+1. Injection moves to the user turn — set `injectionTarget: "appendSystemContext"`
+   to keep the 3.x placement.
+2. Heartbeat / cron / memory / manual turns, sub-agent sessions, non-human input and
+   acknowledgements are now skipped even with the router disabled — use
+   `skip.triggers: []`, `skip.sessionPatterns: []`, `skip.nonHumanInput: false`,
+   `skip.acknowledgements: false` to restore 3.x behavior.
+3. Without an explicit `lightragQueryMode`, lookups and tool calls use `naive`; set
+   `lightragQueryMode: "hybrid"` to keep a single mode.
+4. Sources are now aborted after 3.5 s (LightRAG) / 3 s (pgvector) and the turn after
+   4.5 s — raise `lightragTimeoutMs` / `pgvectorTimeoutMs` / `retrievalBudgetMs` for
+   slower backends.
+5. `knowledge_search` is optional: add it to `tools.alsoAllow` to expose it.
+
+### Added — Opik export of retrieval timings
+
+- New `opik` block (`enabled`, `apiUrl`, `apiKey` / `OPIK_API_KEY`, `workspace`,
+  `projectName`, `includeSkipped`, `flushIntervalMs`, `maxQueue`). Each retrieval
+  becomes an Opik trace — `knowledge.retrieval` (hook) or `knowledge.search`
+  (tool) — with `router` and per-source spans (`lightrag:<id>`, `pgvector:<id>`,
+  status ok / error / timeout / discarded) and metadata (runId, agent, route,
+  reason, injected, cache hits, budget, policy).
+- Content-free by construction: never the query, retrieved text, document paths
+  or session key. Batched through the Opik REST API (`/v1/private/traces|spans/batch`),
+  bounded queue, never awaited on the turn path, status-only warnings.
+- Turns skipped before routing (heartbeat, sub-agent, acknowledgement, policy
+  off / tool) are not exported unless `includeSkipped`.
+- Complements OpenClaw's `diagnostics-otel` (run / model call / tool spans), which
+  does not export plugin hook durations and whose span ids are private to its
+  tracer — these traces are separate and correlated by `runId`.
+
+### Fixed — review before release
+
+- Session policy writes (`policy.set`, `/knowledge`, one-shot consumption) are now
+  computed inside the host's exclusive session write from the row it just read: a
+  turn consuming a one-shot no longer overwrites a concurrent `policy.set`, and a
+  retry whose one-shot was already consumed is a no-op.
+- The session row is read with `readConsistency: "latest"`, so a one-shot stored
+  right before `chat.send` is visible to that turn.
+- A retry of the same run no longer consumes a second turn of a multi-turn one-shot.
+- An undated one-shot (raw `sessions.pluginPatch` without `setAt`) is ignored.
+- `hybrid` agents no longer launch speculative retrievals in
+  `jina-classifier-parallel` mode.
+- `knowledge_search` provenance is attached to the current run for every run
+  (heartbeat, cron, sub-agent), not to the last human turn.
+- Source failures are logged as error class + HTTP status only (a LightRAG error
+  body can echo the query).
+- Circuit breakers are process-wide, like the cache: they survive the host's
+  per-run plugin re-registration.
+- `hookTimeoutMs` below `retrievalBudgetMs` + 1.5 s is raised, with a config warning.
+
 ## [3.2.13] - 2026-06-24
 
 ### Added — readable document NAME as the source title (keeping the retrieval id)

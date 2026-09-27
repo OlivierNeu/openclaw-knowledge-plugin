@@ -97,6 +97,100 @@ const CLI_TRIVIAL_PATTERN =
   /^\s*(?:test|test\s+de\s+(?:bon\s+)?fonctionnement|ping|hello|hi|salut|coucou|ok|yes|no|oui|non)\W*\s*$/i;
 
 // ---------------------------------------------------------------------------
+// Acknowledgements — whole-message greetings / thanks / confirmations (4.0.0)
+// ---------------------------------------------------------------------------
+
+// One acknowledgement token (FR + EN). Multi-word entries are listed before
+// their prefixes so the alternation prefers the longest match.
+const ACK_TOKENS: readonly string[] = [
+  // thanks
+  String.raw`merci(?:\s+(?:beaucoup|bien|infiniment|encore|à\s+toi|a\s+toi|à\s+vous|a\s+vous))?`,
+  String.raw`thank\s+you(?:\s+(?:so\s+much|very\s+much))?`,
+  String.raw`thanks(?:\s+a\s+lot)?`,
+  "thx",
+  // confirmations
+  String.raw`d['’]\s?accord`,
+  "dac",
+  "okok",
+  "oki",
+  "ok(?:ay|ey)?",
+  "oui",
+  "ouais",
+  "yes",
+  "yep",
+  "yup",
+  "yeah",
+  "non",
+  "nope",
+  "no",
+  String.raw`vas[\s-]?y`,
+  String.raw`allez[\s-]?y`,
+  String.raw`go(?:\s+ahead)?`,
+  String.raw`c['’]\s?est\s+(?:bon|parfait|top|noté|note|ok|clair)`,
+  String.raw`[çc]a\s+marche`,
+  String.raw`bien\s+re[çc]u`,
+  "parfait",
+  "super",
+  "g[ée]nial",
+  "top",
+  "cool",
+  "nickel",
+  "impeccable",
+  "excellent",
+  "bravo",
+  "great",
+  "nice",
+  "perfect",
+  "awesome",
+  "sure",
+  "noted",
+  "compris",
+  "entendu",
+  "not[ée]",
+  "re[çc]u",
+  String.raw`sounds\s+good`,
+  String.raw`got\s+it`,
+  // greetings
+  "bonjour",
+  "bonsoir",
+  "salut",
+  "coucou",
+  "hello",
+  "hi",
+  "hey",
+  String.raw`good\s+(?:morning|evening|afternoon)`,
+];
+
+const ACK_TOKEN = `(?:${ACK_TOKENS.join("|")})`;
+
+// Trailing decoration: punctuation, whitespace and a few emoji
+// (Extended_Pictographic + variation selector / ZWJ / skin tones). Bounded
+// repetition keeps the regex linear on any input.
+const ACK_TAIL = String.raw`[\s!.?…,;:)(~*-]*(?:[\p{Extended_Pictographic}\u{FE0F}\u{200D}\u{1F3FB}-\u{1F3FF}][\s!.?…]*){0,8}`;
+
+const ACK_PATTERN = new RegExp(
+  String.raw`^${ACK_TOKEN}(?:[\s,!.]+${ACK_TOKEN}){0,3}${ACK_TAIL}$`,
+  "iu",
+);
+
+/** Upper bound on the length of a message considered for ack matching. */
+export const ACK_MAX_LENGTH = 48;
+
+/**
+ * True when the WHOLE message is a greeting, thanks or short confirmation
+ * ("merci", "ok parfait", "oui vas-y 👍", "thanks!"). Anchored on both ends
+ * and length-bounded: any real question that merely contains these words is
+ * NOT an acknowledgement.
+ *
+ * @since 4.0.0
+ */
+export function isAcknowledgement(query: string): boolean {
+  const trimmed = query.trim();
+  if (trimmed.length === 0 || trimmed.length > ACK_MAX_LENGTH) return false;
+  return ACK_PATTERN.test(trimmed);
+}
+
+// ---------------------------------------------------------------------------
 // Keyword fast-paths
 // ---------------------------------------------------------------------------
 

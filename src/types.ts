@@ -21,7 +21,7 @@ import type { RerankerModel } from "./jina/types.js";
  */
 export interface PluginHookAgentContext {
   /** What initiated this agent run. */
-  trigger?: "user" | "heartbeat" | "cron" | "memory" | string;
+  trigger?: "user" | "heartbeat" | "cron" | "memory" | "manual" | string;
   /** Channel-derived sender id. The plugin currently only uses `"cli"`. */
   messageProvider?: string;
   channelId?: string;
@@ -29,6 +29,38 @@ export interface PluginHookAgentContext {
   sessionId?: string;
   sessionKey?: string;
   runId?: string;
+  /**
+   * Host-classified origin of the turn's user-role input (OpenClaw >= 2026.9).
+   * Absent when the producer did not classify it — absence does NOT prove a
+   * human origin, but it is treated as "human" to preserve legacy behavior.
+   * See upstream `src/sessions/input-provenance.ts`.
+   *
+   * @since 4.0.0
+   */
+  inputProvenance?: InputProvenanceLike;
+  /**
+   * Result-acceptance lifetime of THIS handler invocation (before_prompt_build
+   * only, OpenClaw >= 2026.9). `assertActive()` throws once the runner stopped
+   * awaiting the handler (timeout, error). Optional for SDK compatibility.
+   *
+   * @since 4.0.0
+   */
+  readonly hookInvocation?: Readonly<{ assertActive(): void }>;
+}
+
+/**
+ * Structural subset of the upstream `InputProvenance` type. `kind` is one of
+ * `external_user` | `inter_session` | `internal_system` on current hosts; the
+ * type stays open (`string`) so an unknown future kind is handled explicitly.
+ *
+ * @since 4.0.0
+ */
+export interface InputProvenanceLike {
+  kind?: string;
+  sourceTool?: string;
+  sourceChannel?: string;
+  sourceSessionKey?: string;
+  sourceRole?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -84,6 +116,218 @@ export interface KnowledgePluginConfig {
    * @since 3.2.7
    */
   testMode?: TestModePluginConfig;
+
+  // -------------------------------------------------------------------------
+  // 4.0.0 — latency, cache-friendliness and control plane
+  // -------------------------------------------------------------------------
+
+  /** Where the knowledge block is injected. Default `prependContext`. @since 4.0.0 */
+  injectionTarget?: InjectionTarget;
+  /** Abort a LightRAG `/query` call after this many ms. Default 3500. @since 4.0.0 */
+  lightragTimeoutMs?: number;
+  /** Abort the pgvector path (Gemini embed + SQL) after this many ms. Default 3000. @since 4.0.0 */
+  pgvectorTimeoutMs?: number;
+  /**
+   * Global per-turn retrieval budget (router + sources), in ms. When it
+   * elapses the hook returns whatever sources already finished (partial
+   * success, logged). Default 4500. @since 4.0.0
+   */
+  retrievalBudgetMs?: number;
+  /**
+   * Explicit `before_prompt_build` handler timeout registered with the host
+   * (`api.on(..., { timeoutMs })`). Default `retrievalBudgetMs + 1500`.
+   * @since 4.0.0
+   */
+  hookTimeoutMs?: number;
+  /**
+   * Per-route LightRAG query mode. Keys: `PGVECTOR_ONLY`, `LIGHTRAG_ONLY`,
+   * `ALL`, `fallback` (ALL reached through a classifier fallback / low
+   * confidence / error) and `tool` (on-demand `knowledge_search` calls).
+   * @since 4.0.0
+   */
+  lightragQueryModeByRoute?: Partial<Record<LightRAGRouteKey, LightRAGQueryMode>>;
+  /**
+   * Compute `hl_keywords` / `ll_keywords` locally (FR+EN stopword filter) and
+   * send them to LightRAG so it skips its own LLM keyword-extraction call on
+   * `local` / `global` / `hybrid` / `mix` queries. Default false. @since 4.0.0
+   */
+  lightragLocalKeywords?: boolean;
+  /** Non-human turn filters applied BEFORE any routing. @since 4.0.0 */
+  skip?: SkipPluginConfig;
+  /** Per-session result cache. @since 4.0.0 */
+  cache?: CachePluginConfig;
+  /** Export retrieval timings to Opik as traces. @since 4.0.0 */
+  opik?: OpikPluginConfig;
+  /**
+   * Named knowledge sources. When omitted, sources are synthesized from the
+   * legacy flat keys (`lightragUrl` → id `lightrag`, `collections` → id
+   * `pgvector`). @since 4.0.0
+   */
+  sources?: Record<string, KnowledgeSourcePluginConfig>;
+  /** Global default policy applied to every agent without its own entry. @since 4.0.0 */
+  defaults?: KnowledgeAgentPolicyPluginConfig;
+  /** Per-agent policy keyed by OpenClaw agent id. @since 4.0.0 */
+  agents?: Record<string, KnowledgeAgentPolicyPluginConfig>;
+  /**
+   * `hybrid` injection only injects automatically when the router is
+   * confident: a heuristic keyword hit, or a classifier hit whose score is
+   * at least this value. Default 0.45. @since 4.0.0
+   */
+  hybridMinScore?: number;
+  /** On-demand `knowledge_search` agent tool. @since 4.0.0 */
+  tool?: ToolPluginConfig;
+  /** Session overrides, `/knowledge` command and Gateway methods. @since 4.0.0 */
+  controlPlane?: ControlPlanePluginConfig;
+}
+
+/** Route keys accepted by `lightragQueryModeByRoute`. @since 4.0.0 */
+export type LightRAGRouteKey = "PGVECTOR_ONLY" | "LIGHTRAG_ONLY" | "ALL" | "fallback" | "tool";
+
+/**
+ * Injection policy:
+ *   - `auto`   — retrieve and inject on every eligible turn (pre-4.0 behavior);
+ *   - `tool`   — never inject automatically; the model uses `knowledge_search`;
+ *   - `hybrid` — inject only when the router is confident the turn is a
+ *                knowledge-base question, otherwise tool only;
+ *   - `off`    — no injection and the tool refuses.
+ *
+ * @since 4.0.0
+ */
+export type InjectionPolicy = "auto" | "tool" | "hybrid" | "off";
+
+/** @since 4.0.0 */
+export interface SkipPluginConfig {
+  /**
+   * Substrings matched against `ctx.sessionKey`; a match skips retrieval.
+   * Default `[":subagent:", ":active-memory:"]` (sessions_spawn children and
+   * the active-memory recall sub-agent).
+   */
+  sessionPatterns?: string[];
+  /** `ctx.trigger` values that skip retrieval. Default heartbeat, cron, memory, manual. */
+  triggers?: string[];
+  /**
+   * Skip when `ctx.inputProvenance.kind` is present and is not
+   * `external_user` (inter-session messages, subagent announce/settle,
+   * internal system wakes). Default true.
+   */
+  nonHumanInput?: boolean;
+  /**
+   * `inputProvenance.sourceTool` values that are still retrieved even when
+   * `nonHumanInput` would skip them. Default `[]`.
+   */
+  allowSourceTools?: string[];
+  /**
+   * Skip whole-message greetings / thanks / short acknowledgements (FR+EN,
+   * anchored, bounded length) on every channel. Default true.
+   */
+  acknowledgements?: boolean;
+}
+
+/** @since 4.0.0 */
+export interface CachePluginConfig {
+  /** Default true. */
+  enabled?: boolean;
+  /** Entry time-to-live in ms. Default 600000 (10 min). */
+  ttlMs?: number;
+  /** Maximum number of cached source results. Default 200. */
+  maxEntries?: number;
+  /** Approximate maximum cache size in bytes (UTF-16 estimate). Default 8 MiB. */
+  maxBytes?: number;
+}
+
+/**
+ * Opik trace export (REST batch API). Content-free: durations, route and
+ * policy metadata only — never the query, the retrieved text or the session key.
+ * @since 4.0.0
+ */
+export interface OpikPluginConfig {
+  /** Default false. */
+  enabled?: boolean;
+  /** Opik API base. Default `https://www.comet.com/opik/api` (Opik Cloud). */
+  apiUrl?: string;
+  /** API key; `${VAR}` supported. Default: the `OPIK_API_KEY` environment variable. */
+  apiKey?: string;
+  /** Opik Cloud workspace (`Comet-Workspace` header). */
+  workspace?: string;
+  /** Opik project receiving the traces. Default `openclaw-knowledge`. */
+  projectName?: string;
+  /** Also export turns skipped before routing (heartbeat, sub-agent, ack, policy). Default false. */
+  includeSkipped?: boolean;
+  /** Batch flush interval in ms. Default 5000. */
+  flushIntervalMs?: number;
+  /** Maximum traces buffered while Opik is unreachable (oldest dropped). Default 500. */
+  maxQueue?: number;
+}
+
+/** @since 4.0.0 */
+export interface ResolvedOpikConfig {
+  enabled: boolean;
+  apiUrl: string;
+  apiKey: string;
+  workspace: string;
+  projectName: string;
+  includeSkipped: boolean;
+  flushIntervalMs: number;
+  maxQueue: number;
+}
+
+/** @since 4.0.0 */
+export interface KnowledgeSourcePluginConfig {
+  type: "lightrag" | "pgvector";
+  label?: string;
+  description?: string;
+  /** Default true. */
+  enabled?: boolean;
+  /** LightRAG base URL (falls back to the legacy `lightragUrl`). */
+  url?: string;
+  /** LightRAG API key (falls back to the legacy `lightragApiKey`). */
+  apiKey?: string;
+  /** pgvector collections (falls back to the legacy `collections`). */
+  collections?: string[];
+  /** Per-source LightRAG query mode (see precedence in the README). */
+  queryMode?: LightRAGQueryMode;
+  /** Per-source character budget (falls back to lightragMaxChars / maxInjectChars). */
+  maxChars?: number;
+}
+
+/** @since 4.0.0 */
+export interface KnowledgeAgentPolicyPluginConfig {
+  injection?: InjectionPolicy;
+  /** Source ids used by default for this agent. */
+  sources?: string[];
+  /**
+   * Source ids a session / one-shot / tool call MAY select for this agent.
+   * Defaults to `sources`. Clients can never reach a source outside this list.
+   */
+  allowedSources?: string[];
+  /** pgvector top-K override. */
+  topK?: number;
+  /** LightRAG query mode override (wins over every route default). */
+  lightragQueryMode?: LightRAGQueryMode;
+  /** Whether session / one-shot overrides are honoured. Default true. */
+  allowSessionOverrides?: boolean;
+}
+
+/** @since 4.0.0 */
+export interface ToolPluginConfig {
+  /** Register the `knowledge_search` tool. Default true (the tool is optional: allowlist it). */
+  enabled?: boolean;
+  /** Default top-K for tool calls. Default: the policy / global topK. */
+  defaultTopK?: number;
+  /** Upper bound on the `topK` argument. Default 20. */
+  maxTopK?: number;
+}
+
+/** @since 4.0.0 */
+export interface ControlPlanePluginConfig {
+  /** Honour per-session overrides (session extension). Default true. */
+  sessionOverrides?: boolean;
+  /** A one-shot choice not consumed within this many ms is ignored. Default 600000. */
+  oneShotTtlMs?: number;
+  /** Register the `/knowledge` chat command. Default true. */
+  command?: boolean;
+  /** Register the Gateway methods and session actions. Default true. */
+  gatewayMethods?: boolean;
 }
 
 /**
@@ -178,9 +422,17 @@ export interface JinaPluginConfig {
   rpmBudget?: number;
 }
 
+/** Router engines. `jina-classifier-parallel` @since 4.0.0. */
+export type RouterMode = "heuristic" | "jina-classifier" | "jina-classifier-parallel";
+
 export interface RouterPluginConfig {
   enabled?: boolean;
-  mode?: "heuristic" | "jina-classifier";
+  mode?: RouterMode;
+  /**
+   * Timeout for the Jina classify call, in ms (also bounded by the global
+   * retrieval budget). Default 1500. @since 4.0.0
+   */
+  timeoutMs?: number;
   /**
    * Optional pre-trained Jina classifier_id. When set, the router calls
    * `/v1/classify` with this ID (few-shot mode). Train it out-of-band via
@@ -223,7 +475,8 @@ export interface PgvectorRerankerPluginConfig {
   maxCharsPerDoc?: number;
 }
 
-export type LightRAGQueryMode = "naive" | "local" | "global" | "hybrid";
+/** LightRAG query modes accepted by `/query` (`mix` since LightRAG 1.3; `bypass` is excluded on purpose — it skips retrieval). */
+export type LightRAGQueryMode = "naive" | "local" | "global" | "hybrid" | "mix";
 
 /**
  * One source reference from a LightRAG `/query` response. LightRAG (≥ 1.4.5)
@@ -306,7 +559,9 @@ export interface ResolvedKnowledgeConfig {
 
   // Router
   routerEnabled: boolean;
-  routerMode: "heuristic" | "jina-classifier";
+  routerMode: RouterMode;
+  /** Classifier call timeout in ms. @since 4.0.0 */
+  routerTimeoutMs: number;
   routerClassifierId: string;
   /**
    * Minimum classifier confidence (cosine similarity in `[0, 1]`) required
@@ -369,6 +624,94 @@ export interface ResolvedKnowledgeConfig {
    * @since 3.2.9
    */
   lightragMockReferences: LightRAGReference[];
+
+  // 4.0.0 --------------------------------------------------------------------
+  injectionTarget: InjectionTarget;
+  lightragTimeoutMs: number;
+  pgvectorTimeoutMs: number;
+  retrievalBudgetMs: number;
+  hookTimeoutMs: number;
+  /** Fully resolved per-route LightRAG mode map (explicit entries + defaults). */
+  lightragQueryModeByRoute: Record<LightRAGRouteKey, LightRAGQueryMode>;
+  /** Route keys explicitly configured by the operator (they beat per-source modes). */
+  lightragQueryModeByRouteExplicit: LightRAGRouteKey[];
+  /** True when the operator set the legacy `lightragQueryMode` explicitly. */
+  lightragQueryModeExplicit: boolean;
+  lightragLocalKeywords: boolean;
+  skip: ResolvedSkipConfig;
+  cache: ResolvedCacheConfig;
+  opik: ResolvedOpikConfig;
+  /** Enabled AND disabled named sources, in declaration order. */
+  sources: ResolvedKnowledgeSource[];
+  defaultPolicy: ResolvedAgentPolicy;
+  agentPolicies: Record<string, ResolvedAgentPolicy>;
+  hybridMinScore: number;
+  tool: ResolvedToolConfig;
+  controlPlane: ResolvedControlPlaneConfig;
+  /** Non-fatal config problems (unknown source ids, invalid entries). */
+  configWarnings: string[];
+}
+
+/** @since 4.0.0 */
+export interface ResolvedSkipConfig {
+  sessionPatterns: string[];
+  triggers: string[];
+  nonHumanInput: boolean;
+  allowSourceTools: string[];
+  acknowledgements: boolean;
+}
+
+/** @since 4.0.0 */
+export interface ResolvedCacheConfig {
+  enabled: boolean;
+  ttlMs: number;
+  maxEntries: number;
+  maxBytes: number;
+}
+
+/** @since 4.0.0 */
+export interface ResolvedKnowledgeSource {
+  id: string;
+  type: "lightrag" | "pgvector";
+  label: string;
+  description: string;
+  /** Configured AND usable (credentials / URL present, or TEST mode). */
+  enabled: boolean;
+  /** LightRAG only. */
+  url: string;
+  /** LightRAG only. Never exposed through the control plane. */
+  apiKey: string;
+  /** pgvector only. */
+  collections: string[];
+  queryMode?: LightRAGQueryMode;
+  maxChars: number;
+  /** Synthesized from the legacy flat keys (keeps pre-4.0 section headers). */
+  legacy: boolean;
+}
+
+/** @since 4.0.0 */
+export interface ResolvedAgentPolicy {
+  injection: InjectionPolicy;
+  sources: string[];
+  allowedSources: string[];
+  topK?: number;
+  lightragQueryMode?: LightRAGQueryMode;
+  allowSessionOverrides: boolean;
+}
+
+/** @since 4.0.0 */
+export interface ResolvedToolConfig {
+  enabled: boolean;
+  defaultTopK?: number;
+  maxTopK: number;
+}
+
+/** @since 4.0.0 */
+export interface ResolvedControlPlaneConfig {
+  sessionOverrides: boolean;
+  oneShotTtlMs: number;
+  command: boolean;
+  gatewayMethods: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -438,6 +781,16 @@ export interface PgvectorRow {
 export interface BeforePromptBuildEvent {
   /** Raw user prompt for this turn. SDK >= 2026.5.0. */
   prompt?: string;
+  /**
+   * Current request before history/context projection (OpenClaw >= 2026.9).
+   * An explicit empty string means "no textual request" and must NOT fall
+   * back to the history. Omitted on older harnesses.
+   *
+   * @since 4.0.0
+   */
+  currentUserMessage?: string;
+  /** Stable native admission identity of the current request. @since 4.0.0 */
+  currentUserMessageId?: string;
   messages?: PromptMessage[];
 }
 
@@ -452,9 +805,24 @@ export interface PromptContentPart {
 }
 
 /**
+ * Where the knowledge block is injected. `prependContext` / `appendContext`
+ * land on the CURRENT user message only (model submission; the transcript
+ * keeps the raw user text), which keeps the system prompt and the whole
+ * history prefix byte-stable across turns so provider prompt caching works.
+ * `appendSystemContext` is the pre-4.0 behavior (system prompt suffix — the
+ * system prompt changes every turn, which invalidates the cached prefix).
+ *
+ * @since 4.0.0
+ */
+export type InjectionTarget = "prependContext" | "appendContext" | "appendSystemContext";
+
+/**
  * Return value honoured by OpenClaw when a `before_prompt_build` handler wants
- * to append extra text to the agent's system prompt.
+ * to add the knowledge block to the turn. Exactly ONE of the three fields is
+ * set, according to {@link InjectionTarget}.
  */
 export interface BeforePromptBuildResult {
-  appendSystemContext: string;
+  prependContext?: string;
+  appendContext?: string;
+  appendSystemContext?: string;
 }

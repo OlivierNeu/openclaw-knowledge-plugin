@@ -1,25 +1,29 @@
 // openclaw-knowledge — Multi-source knowledge plugin for OpenClaw
 //
-// Queries two knowledge sources in parallel and injects relevant context
-// into the agent's system prompt via `appendSystemContext`:
-//   1. PostgreSQL pgvector — semantic vector search on document embeddings
-//      (optionally re-ordered by a Jina cross-encoder reranker)
-//   2. LightRAG — knowledge graph with entity/relation multi-hop search
+// Queries named knowledge sources (PostgreSQL pgvector collections and
+// LightRAG knowledge graphs) and injects the relevant context into the turn.
 //
-// As of v3.2.0:
-//   - An optional Jina-powered ROUTER decides which source(s) to call
-//     (or to skip retrieval entirely on heartbeats and meta-questions).
-//   - An optional Jina RERANKER re-orders pgvector results by relevance.
-// Both features are opt-in via the `jina.*` config block and preserve
-// pre-3.2.0 behavior when omitted.
+// As of v4.0.0:
+//   - the knowledge block is injected on the CURRENT USER MESSAGE
+//     (`prependContext`, configurable) instead of the system prompt, so the
+//     system prompt and the history prefix stay byte-stable and provider
+//     prompt caching keeps working across turns;
+//   - non-human turns (sub-agents, heartbeat / cron / memory / manual runs,
+//     inter-session and internal-system input, bare acknowledgements) are
+//     skipped before any network call;
+//   - every source runs under an AbortSignal timeout and a global per-turn
+//     budget; the hook returns whatever finished (partial success);
+//   - LightRAG query modes are chosen per route (`naive` for simple lookups
+//     and tool calls), optionally with locally extracted keywords;
+//   - `jina-classifier-parallel` routes speculatively in parallel;
+//   - a bounded per-session cache, a `timing` event per turn, an on-demand
+//     `knowledge_search` tool, per-agent injection policies and a control
+//     plane (session extension, session actions, Gateway methods,
+//     `/knowledge` command) for Atrium and chat users.
 //
-// Hook: before_prompt_build (requires OpenClaw >= v2026.5.0)
+// Hook: before_prompt_build (requires OpenClaw >= v2026.5.0; 4.0 surfaces
+// are feature-detected and degrade silently on older hosts).
 // Depends on: pg (node-postgres)
-//
-// This is the canonical entry point for the plugin. Helpers live in sibling
-// modules (`config.ts`, `embeddings.ts`, `pgvector.ts`, `lightrag.ts`,
-// `jina/*`, `router/*`, `tracing/*`) so the business logic can be
-// unit-tested without instantiating the full SDK.
 
 import pg from "pg";
 
@@ -30,41 +34,70 @@ import type {
   PluginLogger,
 } from "openclaw/plugin-sdk/plugin-entry";
 
+import { KnowledgeResultCache, sessionScopeKey } from "./cache.js";
 import { resolveConfig } from "./config.js";
 import {
-  buildLightRAGProvenance,
-  buildPgvectorProvenance,
+  PLUGIN_ID,
+  agentIdFromSessionKey,
+  createRuntimeSessionPolicyStore,
+  registerControlPlane,
+  type SessionPolicyStore,
+} from "./control-plane.js";
+import {
+  isInCooldown,
+  maybeResetCooldown,
+  newCooldown,
+  registerError,
+  type CooldownScope,
+  type CooldownState,
+} from "./cooldown.js";
+import { summarizeJinaError } from "./jina/errors.js";
+import { RpmMonitor } from "./jina/rate-limit.js";
+import {
+  applyOneShotConsumption,
+  hasPersistedPolicy,
+  resolveEffectivePolicy,
+  type EffectivePolicy,
+} from "./policy.js";
+import {
   emitProvenanceReports,
   resolveEmitAgentEvent,
   type EmitAgentEventFn,
   type ProvenanceReportV1,
 } from "./provenance.js";
-import { embedQuery } from "./embeddings.js";
 import {
-  searchCollection,
-  formatPgvectorResultsDetailed,
-  rerankPgvectorResults,
-} from "./pgvector.js";
-import { queryLightRAG, formatLightRAGResults } from "./lightrag.js";
-import { decideRoute } from "./router/index.js";
-import type { Route, RouterDecision } from "./router/types.js";
-import { JinaError, summarizeJinaError } from "./jina/errors.js";
-import { RpmMonitor } from "./jina/rate-limit.js";
+  buildKnowledgeBlock,
+  createVectorProvider,
+  planRequests,
+  positionForTarget,
+  renderSection,
+  routeKeyFor,
+  runSource,
+  settleWithDeadline,
+  type SettledSource,
+  type SourceRequest,
+  type SourceResult,
+} from "./retrieval.js";
 import {
-  emitEvent,
-  emitTurnMetadata,
-  LIGHTRAG_SPARSE_THRESHOLD_CHARS,
-} from "./tracing/events.js";
+  classifyRoute,
+  decideRouteWithoutClassifier,
+  type RouterConfig,
+} from "./router/index.js";
+import { heuristicRoute } from "./router/heuristic.js";
+import type { Route, RouterDecision, RouterReason } from "./router/types.js";
+import { evaluateSkip } from "./skip.js";
+import { KNOWLEDGE_SEARCH_TOOL, createKnowledgeSearchTool } from "./tool.js";
+import { OpikExporter, type OpikSpanInput } from "./tracing/opik.js";
+import { emitEvent, emitTurnMetadata, type TimingEvent } from "./tracing/events.js";
 import type {
   BeforePromptBuildEvent,
   BeforePromptBuildResult,
   KnowledgePluginConfig,
-  LightRAGReference,
   PgPoolLike,
-  PgvectorResult,
   PluginHookAgentContext,
   PromptMessage,
   ResolvedKnowledgeConfig,
+  ResolvedKnowledgeSource,
 } from "./types.js";
 
 // Re-export helpers so the test suite can import them directly without
@@ -78,9 +111,14 @@ export {
 } from "./pgvector.js";
 export { queryLightRAG, truncateLightRAG, formatLightRAGResults } from "./lightrag.js";
 export { decideRoute } from "./router/index.js";
+export { renderMockResponse } from "./retrieval.js";
+export { extractKeywords } from "./keywords.js";
+export { isAcknowledgement } from "./router/heuristic.js";
 export type {
   BeforePromptBuildEvent,
   BeforePromptBuildResult,
+  InjectionPolicy,
+  InjectionTarget,
   JinaPluginConfig,
   KnowledgePluginConfig,
   LightRAGQueryMode,
@@ -103,31 +141,12 @@ export type {
 // Hook handler factory
 // ---------------------------------------------------------------------------
 
-const MAX_CONSECUTIVE_ERRORS = 3;
-const COOLDOWN_MS = 5 * 60 * 1000;
 const MIN_QUERY_LENGTH = 3;
 
-/**
- * Independent error counters for each Jina-powered subsystem.
- *
- * The pre-existing "global" counter remains shared between pgvector and
- * LightRAG (a database-AND-knowledge-graph outage already cripples the
- * plugin). Router and reranker each get their own counter so a Jina
- * outage on the router does NOT trip the reranker's cooldown, and vice
- * versa — fail-open is the whole point.
- */
-type CooldownScope = "global" | "router" | "pgvector_reranker";
+/** Bounded map sessionKey → latest runId (tool provenance correlation). */
+const RUN_ID_MAP_MAX = 500;
 
-interface CooldownState {
-  consecutiveErrors: number;
-  cooldownUntil: number;
-}
-
-function newCooldown(): CooldownState {
-  return { consecutiveErrors: 0, cooldownUntil: 0 };
-}
-
-interface HookHandlerDeps {
+export interface HookHandlerDeps {
   config: ResolvedKnowledgeConfig;
   pool: PgPoolLike | null;
   logger: PluginLogger;
@@ -138,6 +157,185 @@ interface HookHandlerDeps {
    * (gateway re-registration quirk; see registerKnowledgePlugin).
    */
   emitAgentEvent?: EmitAgentEventFn;
+  /** Per-session result cache (shared with the tool). @since 4.0.0 */
+  cache?: KnowledgeResultCache<SourceResult>;
+  /** Session-extension store (policy overrides). @since 4.0.0 */
+  store?: SessionPolicyStore;
+  /** Records the latest runId per session for the tool. @since 4.0.0 */
+  recordRunId?: (sessionKey: string, runId: string) => void;
+  /** Shared circuit-breaker state (hook + tool). @since 4.0.0 */
+  cooldowns?: Record<CooldownScope, CooldownState>;
+  rpmMonitor?: RpmMonitor;
+  /** Opik trace exporter for retrieval timings. @since 4.0.0 */
+  opik?: OpikExporter;
+}
+
+/** Create the per-instance cooldown record. */
+export function createCooldowns(): Record<CooldownScope, CooldownState> {
+  return {
+    global: newCooldown(),
+    router: newCooldown(),
+    pgvector_reranker: newCooldown(),
+  };
+}
+
+/** Build the soft Jina RPM monitor (undefined when the budget is 0). */
+export function createRpmMonitor(
+  config: ResolvedKnowledgeConfig,
+  logger: PluginLogger,
+): RpmMonitor | undefined {
+  // When `config.jinaRpmBudget === 0`, the monitor is fully disabled.
+  return config.jinaRpmBudget > 0
+    ? new RpmMonitor({
+        budget: config.jinaRpmBudget,
+        onExceeded: ({ count, budget }) => {
+          logger.warn(
+            `openclaw-knowledge: Jina RPM budget exceeded — ${count}/${budget} requests in the last 60s`,
+          );
+          emitEvent(logger, { type: "jina_rpm_exceeded", count, budget });
+        },
+      })
+    : undefined;
+}
+
+/** Per-turn timing accumulator → one `timing` event. */
+interface TurnTiming {
+  startedAt: number;
+  filterMs: number;
+  routerMs: number;
+  pgvectorMs: number | null;
+  lightragMs: number | null;
+  route: Route | null;
+  reason: RouterReason | string;
+  skipped: string | null;
+  cacheHit: number;
+  budgetExceeded: boolean;
+  speculativeDiscarded: number;
+  injected: boolean;
+  policy?: EffectivePolicy;
+  /** Router window (epoch ms); undefined when the router did not run. */
+  routerStartedAt?: number;
+  routerScore?: number | null;
+  /** Every source launched this turn, discarded speculative ones included. */
+  sources: SourceSpan[];
+}
+
+/** One source launch, as exported to Opik (content-free). */
+interface SourceSpan {
+  id: string;
+  type: "lightrag" | "pgvector";
+  mode?: string;
+  startedAt: number;
+  endedAt: number;
+  status: "ok" | "error" | "timeout" | "discarded";
+  cached?: boolean;
+}
+
+/** Export one hook invocation to Opik (no-op when disabled / skipped early). */
+function exportTurnToOpik(
+  opik: OpikExporter | undefined,
+  config: ResolvedKnowledgeConfig,
+  ctx: PluginHookAgentContext | undefined,
+  agentId: string | undefined,
+  t: TurnTiming,
+  endedAt: number,
+): void {
+  if (!opik) return;
+  // Turns skipped before routing cost ~0 ms; exporting them would flood Opik.
+  const ranRetrievalStage = t.routerStartedAt !== undefined || t.sources.length > 0;
+  if (!ranRetrievalStage && !config.opik.includeSkipped) return;
+  const spans: OpikSpanInput[] = [];
+  if (t.routerStartedAt !== undefined) {
+    spans.push({
+      name: "router",
+      startedAt: t.routerStartedAt,
+      endedAt: t.routerStartedAt + t.routerMs,
+      metadata: { reason: String(t.reason), route: t.route, score: t.routerScore ?? null },
+    });
+  }
+  for (const src of t.sources) {
+    spans.push({
+      name: `${src.type}:${src.id}`,
+      startedAt: src.startedAt,
+      endedAt: src.endedAt,
+      metadata: { sourceId: src.id, type: src.type, mode: src.mode, status: src.status, cached: src.cached ?? false },
+      tags: [src.status],
+    });
+  }
+  const tags = ["knowledge", t.injected ? "injected" : "not-injected"];
+  if (agentId) tags.push(`agent:${agentId}`);
+  if (t.route) tags.push(`route:${t.route}`);
+  if (t.budgetExceeded) tags.push("budget-exceeded");
+  opik.record({
+    name: "knowledge.retrieval",
+    startedAt: t.startedAt,
+    endedAt,
+    tags,
+    spans,
+    metadata: {
+      runId: ctx?.runId,
+      agentId,
+      trigger: ctx?.trigger,
+      route: t.route,
+      reason: String(t.reason),
+      skipped: t.skipped,
+      injected: t.injected,
+      injectionTarget: t.injected ? config.injectionTarget : undefined,
+      totalMs: endedAt - t.startedAt,
+      filterMs: t.filterMs,
+      routerMs: t.routerMs,
+      lightragMs: t.lightragMs,
+      pgvectorMs: t.pgvectorMs,
+      cacheHit: t.cacheHit,
+      budgetExceeded: t.budgetExceeded,
+      speculativeDiscarded: t.speculativeDiscarded,
+      routerMode: config.routerMode,
+      policyInjection: t.policy?.injection,
+      policySources: t.policy ? [...t.policy.sources] : undefined,
+      policyOrigin: t.policy ? `${t.policy.origin.injection}/${t.policy.origin.sources}` : undefined,
+      policyForced: t.policy?.force ?? false,
+    },
+  });
+}
+
+function emitTiming(
+  logger: PluginLogger,
+  config: ResolvedKnowledgeConfig,
+  ctx: PluginHookAgentContext | undefined,
+  agentId: string | undefined,
+  t: TurnTiming,
+  opik?: OpikExporter,
+): void {
+  exportTurnToOpik(opik, config, ctx, agentId, t, Date.now());
+  const event: TimingEvent = {
+    type: "timing",
+    ...(ctx?.runId ? { runId: ctx.runId } : {}),
+    ...(agentId ? { agentId } : {}),
+    filterMs: t.filterMs,
+    routerMs: t.routerMs,
+    pgvectorMs: t.pgvectorMs,
+    lightragMs: t.lightragMs,
+    totalMs: Date.now() - t.startedAt,
+    route: t.route,
+    reason: t.reason,
+    skipped: t.skipped,
+    cacheHit: t.cacheHit,
+    budgetExceeded: t.budgetExceeded,
+    ...(t.speculativeDiscarded > 0 ? { speculativeDiscarded: t.speculativeDiscarded } : {}),
+    injected: t.injected,
+    ...(t.injected ? { injectionTarget: config.injectionTarget } : {}),
+    ...(t.policy
+      ? {
+          policy: {
+            injection: t.policy.injection,
+            sources: [...t.policy.sources],
+            origin: { ...t.policy.origin },
+            ...(t.policy.force ? { force: true } : {}),
+          },
+        }
+      : {}),
+  };
+  emitEvent(logger, event);
 }
 
 /**
@@ -152,38 +350,17 @@ export function createBeforePromptBuildHandler(
 ) => Promise<BeforePromptBuildResult | undefined> {
   const { config, pool, logger } = deps;
 
-  // Per-instance cooldown state. Closed-over so two registrations of the
-  // hook never share counters.
-  const cooldowns: Record<CooldownScope, CooldownState> = {
-    global: newCooldown(),
-    router: newCooldown(),
-    pgvector_reranker: newCooldown(),
+  // Per-instance cooldown state unless the registration shares one.
+  const cooldowns = deps.cooldowns ?? createCooldowns();
+  const rpmMonitor = deps.rpmMonitor ?? createRpmMonitor(config, logger);
+  const retrievalDeps = {
+    config,
+    pool,
+    logger,
+    rerankerCooldown: cooldowns.pgvector_reranker,
+    ...(rpmMonitor ? { rpmMonitor } : {}),
+    ...(deps.cache ? { cache: deps.cache } : {}),
   };
-
-  // Per-instance RPM monitor — one sliding window per plugin runtime.
-  // The `onExceeded` callback emits a structured event the FIRST time the
-  // budget is overshot in any given 60-second window, so dashboards alert
-  // BEFORE the operator sees billing surprises (especially relevant when
-  // the Jina key is shared with another service like Hindsight).
-  //
-  // When `config.jinaRpmBudget === 0`, the monitor is fully disabled
-  // (no instance constructed, no timestamps tracked, no callback ever
-  // fires). This matches the contract documented on
-  // `JinaPluginConfig.rpmBudget`. Defense-in-depth: even if a caller
-  // bypasses this gate and constructs `RpmMonitor` with budget=0
-  // directly, the `record()` method itself short-circuits to a no-op.
-  const rpmMonitor =
-    config.jinaRpmBudget > 0
-      ? new RpmMonitor({
-          budget: config.jinaRpmBudget,
-          onExceeded: ({ count, budget }) => {
-            logger.warn(
-              `openclaw-knowledge: Jina RPM budget exceeded — ${count}/${budget} requests in the last 60s`,
-            );
-            emitEvent(logger, { type: "jina_rpm_exceeded", count, budget });
-          },
-        })
-      : undefined;
 
   return async function beforePromptBuild(
     event: BeforePromptBuildEvent,
@@ -191,116 +368,380 @@ export function createBeforePromptBuildHandler(
   ): Promise<BeforePromptBuildResult | undefined> {
     if (!config.enabled) return undefined;
 
+    // Remember the current run of EVERY turn (heartbeat, cron and sub-agent
+    // runs included) so a `knowledge_search` call — whose tool context has no
+    // runId — attaches provenance to its own run, never to an older one.
+    if (ctx?.sessionKey && ctx.runId) deps.recordRunId?.(ctx.sessionKey, ctx.runId);
+
     if (isInCooldown(cooldowns.global)) {
       maybeResetCooldown(cooldowns.global, "global", logger);
       if (isInCooldown(cooldowns.global)) return undefined;
     }
 
+    const startedAt = Date.now();
     const query = extractUserQuery(event);
     if (!query || query.trim().length < MIN_QUERY_LENGTH) return undefined;
 
     emitTurnMetadata(logger, ctx?.runId, query.length);
 
+    const agentId = ctx?.agentId ?? agentIdFromSessionKey(ctx?.sessionKey);
+    const timing: TurnTiming = {
+      startedAt,
+      filterMs: 0,
+      routerMs: 0,
+      pgvectorMs: null,
+      lightragMs: null,
+      route: null,
+      reason: "router_disabled",
+      skipped: null,
+      cacheHit: 0,
+      budgetExceeded: false,
+      speculativeDiscarded: 0,
+      injected: false,
+      sources: [],
+    };
+    const finish = (): undefined => {
+      emitTiming(logger, config, ctx, agentId, timing, deps.opik);
+      return undefined;
+    };
+    const emitRouter = (route: Route, reason: RouterReason, score: number | null, detail?: string): void => {
+      timing.route = route;
+      timing.reason = reason;
+      emitEvent(logger, {
+        type: "router",
+        route,
+        reason,
+        score,
+        queryLength: query.length,
+        trigger: ctx?.trigger,
+        ...(detail ? { detail } : {}),
+      });
+    };
+
     // -----------------------------------------------------------------
-    // Router gate — decide which sources (if any) to consult.
+    // 1. Skip stage — non-human turns never reach a source.
     // -----------------------------------------------------------------
-    const decision = await runRouterWithCooldown(
+    const skip = evaluateSkip(config.skip, ctx, query);
+    if (skip && skip.reason !== "heuristic_ack") {
+      timing.filterMs = Date.now() - startedAt;
+      timing.skipped = skip.reason;
+      emitRouter("NONE", skip.reason, null, skip.detail);
+      return finish();
+    }
+
+    // -----------------------------------------------------------------
+    // 2. Effective policy (one-shot > session > agent > default).
+    // -----------------------------------------------------------------
+    const sessionState =
+      ctx?.sessionKey && deps.store ? deps.store.read(agentId, ctx.sessionKey) : undefined;
+    const policyParams = {
       config,
-      ctx,
+      agentId,
+      sessionState,
+      now: startedAt,
+      ...(ctx?.runId ? { runId: ctx.runId } : {}),
+    };
+    // An acknowledgement only consumes a pending one-shot that FORCES
+    // retrieval; otherwise "merci" would silently burn the user's
+    // per-prompt choice without using it.
+    let resolution = resolveEffectivePolicy({ ...policyParams, consumeOneShot: !skip });
+    if (skip) {
+      const forced = resolveEffectivePolicy({ ...policyParams, consumeOneShot: true });
+      if (forced.policy.force) resolution = forced;
+    }
+    const policy = resolution.policy;
+    timing.policy = policy;
+    if (policy.warnings.length > 0) {
+      logger.warn(`openclaw-knowledge: policy — ${policy.warnings.join("; ")}`);
+    }
+    const consumption = resolution.consumption;
+    if (consumption && ctx?.sessionKey && deps.store) {
+      // Consume the one-shot against the row as it is NOW (a concurrent
+      // `policy.set` is kept; an already-consumed one-shot is a no-op).
+      // Fire-and-forget: a failed write only means the selection may apply
+      // once more; it must never delay the turn.
+      void deps.store
+        .update(agentId, ctx.sessionKey, (raw) => {
+          const next = applyOneShotConsumption(raw, consumption);
+          if (next === undefined) return undefined;
+          return hasPersistedPolicy(next) ? next : null;
+        })
+        .then(
+          (ok) => {
+            if (!ok) logger.warn("openclaw-knowledge: one-shot consumption was not persisted");
+          },
+          () => logger.warn("openclaw-knowledge: one-shot consumption was not persisted"),
+        );
+    }
+
+    if (skip && !policy.force) {
+      // Acknowledgement ("merci", "ok parfait") — unless a one-shot forces it.
+      timing.filterMs = Date.now() - startedAt;
+      timing.skipped = skip.reason;
+      emitRouter("NONE", skip.reason, null);
+      return finish();
+    }
+    if (policy.injection === "off" || policy.injection === "tool") {
+      timing.filterMs = Date.now() - startedAt;
+      const reason: RouterReason = policy.injection === "off" ? "policy_off" : "policy_tool";
+      timing.skipped = reason;
+      emitRouter("NONE", reason, null);
+      return finish();
+    }
+    const selected = config.sources.filter((src) => src.enabled && policy.sources.includes(src.id));
+    if (selected.length === 0) {
+      timing.filterMs = Date.now() - startedAt;
+      timing.skipped = "policy_no_sources";
+      emitRouter("NONE", "policy_no_sources", null);
+      return finish();
+    }
+    const hasPgvector = selected.some((s) => s.type === "pgvector");
+    const hasLightRAG = selected.some((s) => s.type === "lightrag");
+    timing.filterMs = Date.now() - startedAt;
+
+    // -----------------------------------------------------------------
+    // 3. Budget + router (optionally in parallel with the sources).
+    // -----------------------------------------------------------------
+    const deadline = startedAt + config.retrievalBudgetMs;
+    const budget = new AbortController();
+    const budgetTimer = setTimeout(
+      () => budget.abort(new DOMException("retrieval budget exceeded", "TimeoutError")),
+      Math.max(0, deadline - Date.now()),
+    );
+    const cacheScope =
+      config.cache.enabled && deps.cache && ctx?.sessionKey
+        ? sessionScopeKey(agentId, ctx.sessionKey)
+        : undefined;
+    const vector =
+      hasPgvector && !config.testModeEnabled
+        ? createVectorProvider(query, config.geminiApiKey, budget.signal)
+        : undefined;
+    const runCtx = {
       query,
-      cooldowns.router,
-      logger,
-      rpmMonitor,
-    );
+      signal: budget.signal,
+      ...(cacheScope ? { cacheScope } : {}),
+      ...(vector ? { vector } : {}),
+    };
+    const topK = policy.topK ?? config.topK;
 
-    // Project the abstract router decision onto the sources actually
-    // configured in this deployment. Without this projection, an
-    // exclusive route (e.g. LIGHTRAG_ONLY) on a single-source deployment
-    // (e.g. pgvector only) would produce zero tasks and strip context
-    // the deployment could otherwise have provided.
-    const effectiveRoute = projectRouteOnEnabledSources(
-      decision.route,
-      config.pgvectorEnabled,
-      config.lightragEnabled,
-    );
-
-    emitEvent(logger, {
-      type: "router",
-      route: effectiveRoute,
-      reason: decision.reason,
-      score: decision.score,
-      queryLength: query.length,
-      trigger: ctx?.trigger,
+    // Launched sources keyed by source id; each has its own controller so a
+    // speculative launch can be cancelled individually.
+    interface Launch {
+      request: SourceRequest;
+      promise: Promise<SourceResult>;
+      controller: AbortController;
+      startedAt: number;
+      endedAt?: number;
+    }
+    const launches = new Map<string, Launch>();
+    const sourceSpan = (entry: Launch, status: SourceSpan["status"], cached?: boolean): SourceSpan => ({
+      id: entry.request.source.id,
+      type: entry.request.source.type,
+      ...(entry.request.source.type === "lightrag" ? { mode: entry.request.mode } : {}),
+      startedAt: entry.startedAt,
+      endedAt: entry.endedAt ?? Date.now(),
+      status,
+      ...(cached ? { cached: true } : {}),
     });
+    /** Abort a speculative launch the final plan does not keep. */
+    const discard = (entry: Launch): void => {
+      entry.controller.abort();
+      entry.promise.catch(() => undefined);
+      launches.delete(entry.request.source.id);
+      timing.speculativeDiscarded++;
+      timing.sources.push(sourceSpan(entry, "discarded"));
+    };
+    const discardAll = (): void => {
+      for (const entry of [...launches.values()]) discard(entry);
+    };
+    const launch = (request: SourceRequest): void => {
+      const existing = launches.get(request.source.id);
+      if (existing) {
+        // Same source already in flight (speculative). Keep it unless the
+        // final plan needs a different LightRAG mode.
+        if (existing.request.mode === request.mode || request.source.type !== "lightrag") return;
+        discard(existing);
+      }
+      const controller = new AbortController();
+      const signal = AbortSignal.any([budget.signal, controller.signal]);
+      const entry: Launch = {
+        request,
+        controller,
+        startedAt: Date.now(),
+        promise: runSource(retrievalDeps, request, { ...runCtx, signal }),
+      };
+      entry.promise.then(
+        () => (entry.endedAt = Date.now()),
+        () => (entry.endedAt = Date.now()),
+      );
+      launches.set(request.source.id, entry);
+    };
 
-    if (effectiveRoute === "NONE") return undefined;
-
-    // -----------------------------------------------------------------
-    // Source execution — guided by the route.
-    // -----------------------------------------------------------------
     try {
-      const tasks: Promise<SourceResult>[] = [];
-
-      if (shouldUsePgvector(effectiveRoute) && config.pgvectorEnabled) {
-        if (config.testModeEnabled) {
-          // TEST mode: canned hits, no embedding call, no pg pool.
-          tasks.push(runPgvectorMock(config));
-        } else if (pool) {
-          tasks.push(
-            runPgvectorSource(pool, query, config, cooldowns.pgvector_reranker, logger, rpmMonitor),
+      const routerStartedAt = Date.now();
+      if (!policy.force) timing.routerStartedAt = routerStartedAt;
+      let decision: RouterDecision;
+      if (policy.force) {
+        decision = { route: "ALL", reason: "policy_forced", score: null };
+      } else {
+        const routerCfg = buildRouterConfig(config, cooldowns.router, logger, rpmMonitor);
+        const rctx = {
+          query,
+          trigger: ctx?.trigger,
+          isCli: ctx?.messageProvider === "cli",
+          signal: budget.signal,
+        };
+        const early = decideRouteWithoutClassifier(routerCfg, rctx);
+        if (early) {
+          decision = early;
+        } else {
+          // `hybrid` injects only on a confident hit, and a confident ALL /
+          // LIGHTRAG_ONLY plan rarely matches the speculative `fallback` plan:
+          // speculating there would mostly pay for discarded retrievals.
+          if (config.routerMode === "jina-classifier-parallel" && policy.injection !== "hybrid") {
+            // Speculative: start every selected source now with the
+            // `fallback` plan (what an ambiguous turn most often resolves
+            // to); the classifier result then keeps, trims, re-plans (other
+            // LightRAG mode) or discards them.
+            for (const request of planRequests({
+              config,
+              selected,
+              route: "ALL",
+              routeKey: "fallback",
+              ...(policy.lightragQueryMode ? { policyMode: policy.lightragQueryMode } : {}),
+              topK,
+            })) {
+              launch(request);
+            }
+          }
+          decision = await runClassifierWithCooldown(
+            routerCfg,
+            rctx,
+            cooldowns.router,
+            logger,
+            budget.signal,
           );
         }
       }
+      timing.routerMs = Date.now() - routerStartedAt;
+      timing.routerScore = decision.score;
 
-      if (shouldUseLightRAG(effectiveRoute) && config.lightragEnabled) {
-        if (config.testModeEnabled) {
-          // TEST mode: canned context, no LightRAG server call.
-          tasks.push(runLightRAGMock(query, config));
-        } else {
-          tasks.push(runLightRAGSource(query, config));
-        }
+      // Project the router decision onto the sources selected for this turn.
+      const effectiveRoute = projectRouteOnEnabledSources(decision.route, hasPgvector, hasLightRAG);
+      emitRouter(effectiveRoute, decision.reason, decision.score);
+
+      // `hybrid` policy: inject only when the router is confident.
+      if (
+        policy.injection === "hybrid" &&
+        !policy.force &&
+        !isConfidentKnowledgeDecision(config, decision, query, ctx)
+      ) {
+        timing.skipped = "policy_hybrid_not_confident";
+        discardAll();
+        return finish();
       }
 
-      if (tasks.length === 0) return undefined;
+      if (effectiveRoute === "NONE") {
+        timing.skipped = decision.reason;
+        discardAll();
+        return finish();
+      }
 
-      const settled = await Promise.allSettled(tasks);
+      // The classifier consumed the whole budget: nothing can finish in time.
+      if (budget.signal.aborted && launches.size === 0) {
+        timing.skipped = "budget_exhausted";
+        timing.budgetExceeded = true;
+        return finish();
+      }
 
+      const requests = planRequests({
+        config,
+        selected,
+        route: effectiveRoute,
+        routeKey: routeKeyFor(decision.route, decision.reason),
+        ...(policy.lightragQueryMode ? { policyMode: policy.lightragQueryMode } : {}),
+        topK,
+      });
+      const wanted = new Set(requests.map((r) => r.source.id));
+      for (const [id, entry] of [...launches]) {
+        if (!wanted.has(id)) discard(entry);
+      }
+      for (const request of requests) launch(request);
+      if (launches.size === 0) return finish();
+
+      const launched = [...launches.values()];
+      launched.forEach((l) => l.promise.catch(() => undefined));
+      const { settled, budgetExceeded } = await settleWithDeadline(
+        launched.map((l) => ({ request: l.request, promise: l.promise })),
+        deadline,
+      );
+      // The budget timer aborts in-flight sources a hair before the settle
+      // deadline fires, so an aborted budget signal is the reliable marker.
+      timing.budgetExceeded = budgetExceeded || budget.signal.aborted;
+      budget.abort(); // cancel whatever is still running
+      recordSourceTimings(timing, launched, settled);
+      settled.forEach((result, i) => {
+        const entry = launched[i]!;
+        if (result.status === "fulfilled") {
+          timing.sources.push(sourceSpan(entry, "ok", result.value.cached));
+        } else {
+          const timedOut = result.status === "pending" || isTimeoutLike(result.reason);
+          timing.sources.push(sourceSpan(entry, timedOut ? "timeout" : "error"));
+        }
+      });
+
+      const position = positionForTarget(config.injectionTarget);
       const sections: string[] = [];
       const provenanceReports: (ProvenanceReportV1 | null)[] = [];
       let failedSources = 0;
-
+      let hardFailures = 0;
       for (const result of settled) {
-        if (result.status === "rejected") {
+        if (result.status !== "fulfilled") {
           failedSources++;
-          const reason = result.reason as { message?: string } | undefined;
-          logger.error(
-            `openclaw-knowledge: source failed — ${reason?.message ?? String(result.reason)}`,
-          );
+          if (result.status === "rejected" && !isTimeoutLike(result.reason)) hardFailures++;
+          if (result.status === "rejected") {
+            const reason = result.reason as { message?: string; name?: string } | undefined;
+            logger.error(
+              `openclaw-knowledge: source failed — ${sanitizeSourceError(reason)}`,
+            );
+          }
           continue;
         }
-
-        const section = renderSection(result.value, config, logger);
+        if (result.value.cached) timing.cacheHit++;
+        const section = renderSection(result.value, config, logger, position);
         if (section) {
           sections.push(section.text);
           provenanceReports.push(section.provenance);
         }
       }
-
-      // If every source we launched failed, treat the turn as a failure for
-      // cooldown tracking. A partial failure is fine — the other source's
-      // context is better than nothing.
-      if (failedSources > 0 && failedSources === tasks.length) {
-        registerError(cooldowns.global, "global", logger);
-        return undefined;
+      if (timing.budgetExceeded) {
+        const unfinished = settled
+          .filter((s) => s.status !== "fulfilled")
+          .map((s) => s.request.source.id);
+        logger.warn(
+          `openclaw-knowledge: retrieval budget ${config.retrievalBudgetMs}ms exceeded — returning partial results (unfinished: ${unfinished.join(", ") || "none"})`,
+        );
       }
 
+      // Every launched source failed → cooldown tracking. Partial failure is
+      // fine: the other source's context is better than nothing. Pure
+      // timeouts (a slow but healthy backend) do not trip the breaker: the
+      // budget already bounds their latency cost.
+      if (failedSources > 0 && failedSources === settled.length) {
+        if (hardFailures > 0) registerError(cooldowns.global, "global", logger);
+        return finish();
+      }
       cooldowns.global.consecutiveErrors = 0;
 
-      if (sections.length === 0) return undefined;
+      if (sections.length === 0) return finish();
 
-      // Provenance reports describe EXACTLY the sections returned below —
-      // emitted just before the injection is handed to the gateway, so a
-      // dropped turn can never have reported sources it did not use.
+      // The host stops accepting this handler's result after its timeout;
+      // never emit provenance for an injection that will be discarded.
+      if (!isInvocationActive(ctx)) {
+        timing.skipped = "hook_inactive";
+        return finish();
+      }
+
       emitProvenanceReports(
         deps.emitAgentEvent,
         logger,
@@ -308,38 +749,108 @@ export function createBeforePromptBuildHandler(
         ctx?.sessionKey,
         provenanceReports,
       );
-
+      timing.injected = true;
+      emitTiming(logger, config, ctx, agentId, timing, deps.opik);
       return {
-        appendSystemContext: [
-          "",
-          "## Relevant Knowledge Base",
-          "Use this information to answer the user's question accurately.",
-          "Always cite the source document name when using this information.",
-          "",
-          ...sections,
-        ].join("\n"),
-      };
+        [config.injectionTarget]: buildKnowledgeBlock(sections, config.injectionTarget),
+      } as BeforePromptBuildResult;
     } catch (err) {
       // Catch-all: an unexpected crash must never propagate to the agent.
       const message = err instanceof Error ? err.message : String(err);
       logger.error(`openclaw-knowledge: ${message}`);
       registerError(cooldowns.global, "global", logger);
-      return undefined;
+      return finish();
+    } finally {
+      clearTimeout(budgetTimer);
+      if (!budget.signal.aborted) budget.abort();
     }
   };
+}
+
+function recordSourceTimings(
+  timing: TurnTiming,
+  launched: Array<{ request: SourceRequest; startedAt: number; endedAt?: number }>,
+  settled: SettledSource[],
+): void {
+  const now = Date.now();
+  settled.forEach((s, i) => {
+    const l = launched[i]!;
+    const ms =
+      s.status === "fulfilled" ? s.value.durationMs : (l.endedAt ?? now) - l.startedAt;
+    if (s.request.source.type === "pgvector") {
+      timing.pgvectorMs = Math.max(timing.pgvectorMs ?? 0, ms);
+    } else {
+      timing.lightragMs = Math.max(timing.lightragMs ?? 0, ms);
+    }
+  });
+}
+
+/**
+ * Error summary safe for logs. Only the error class and, for HTTP failures,
+ * the status code: LightRAG / Gemini error bodies can echo the query text.
+ */
+export function sanitizeSourceError(reason: { message?: string; name?: string } | undefined): string {
+  if (!reason) return "Error";
+  const name = reason.name ?? "Error";
+  if (name === "LightRAGTimeoutError" || name === "SourceAbortedError") {
+    return reason.message ?? name;
+  }
+  const status = /\((\d{3})\)/.exec(reason.message ?? "")?.[1];
+  return status ? `${name} (HTTP ${status})` : name;
+}
+
+/** Timeout / abort failures (budget, per-source timeout) vs real errors. */
+function isTimeoutLike(reason: unknown): boolean {
+  const name = (reason as { name?: string } | undefined)?.name;
+  return (
+    name === "LightRAGTimeoutError" ||
+    name === "SourceAbortedError" ||
+    name === "AbortError" ||
+    name === "TimeoutError"
+  );
+}
+
+/** `ctx.hookInvocation.assertActive()` without throwing (absent → active). */
+function isInvocationActive(ctx: PluginHookAgentContext | undefined): boolean {
+  const invocation = ctx?.hookInvocation;
+  if (!invocation || typeof invocation.assertActive !== "function") return true;
+  try {
+    invocation.assertActive();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * `hybrid` injection confidence: a heuristic keyword hit, or a classifier
+ * hit at or above `hybridMinScore`. With the router disabled the keyword
+ * heuristics are still evaluated so `hybrid` keeps a meaning.
+ */
+function isConfidentKnowledgeDecision(
+  config: ResolvedKnowledgeConfig,
+  decision: RouterDecision,
+  query: string,
+  ctx: PluginHookAgentContext | undefined,
+): boolean {
+  if (decision.reason === "heuristic_keyword") return true;
+  if (decision.reason === "classifier_hit") {
+    return decision.score !== null && decision.score >= config.hybridMinScore;
+  }
+  if (decision.reason === "router_disabled") {
+    const verdict = heuristicRoute({
+      query,
+      trigger: ctx?.trigger,
+      isCli: ctx?.messageProvider === "cli",
+    });
+    return verdict.reason === "heuristic_keyword";
+  }
+  return false;
 }
 
 // ---------------------------------------------------------------------------
 // Route gating helpers
 // ---------------------------------------------------------------------------
-
-function shouldUsePgvector(route: Route): boolean {
-  return route === "PGVECTOR_ONLY" || route === "ALL";
-}
-
-function shouldUseLightRAG(route: Route): boolean {
-  return route === "LIGHTRAG_ONLY" || route === "ALL";
-}
 
 /**
  * Project a router decision onto the set of sources that are actually
@@ -351,7 +862,7 @@ function shouldUseLightRAG(route: Route): boolean {
  *
  * Rules:
  *   - `NONE` → `NONE` (the router deliberately wants no retrieval).
- *   - `ALL` → `ALL` (downstream `shouldUseX` already skips disabled sources).
+ *   - `ALL` → `ALL` (downstream planning already skips disabled sources).
  *   - `PGVECTOR_ONLY` + pgvector disabled:
  *       - LightRAG available → `LIGHTRAG_ONLY` (best effort)
  *       - neither available → `NONE` (caller short-circuits)
@@ -376,90 +887,70 @@ export function projectRouteOnEnabledSources(
   return pgvectorEnabled ? "PGVECTOR_ONLY" : "NONE";
 }
 
-/**
- * Run `decideRoute` with isolated cooldown tracking. The router fails open
- * by contract (returns ALL on any Jina error) — the cooldown here is only
- * meant to suppress repeated log spam during a sustained outage, not to
- * stop retrieval.
- */
-async function runRouterWithCooldown(
+function buildRouterConfig(
   config: ResolvedKnowledgeConfig,
-  ctx: PluginHookAgentContext | undefined,
-  query: string,
   cooldown: CooldownState,
   logger: PluginLogger,
   rpmMonitor: RpmMonitor | undefined,
-): Promise<RouterDecision> {
-  // Reset stale cooldown FIRST so we don't keep the classifier circuit
-  // open longer than necessary (the first turn after expiry must be
-  // able to attempt the classifier again).
+): RouterConfig {
+  // Reset a stale cooldown FIRST so the first turn after expiry can try the
+  // classifier again.
   maybeResetCooldown(cooldown, "router", logger);
+  // While the classifier circuit is open, DOWNGRADE to heuristic mode rather
+  // than short-circuiting to ALL: the cheap local rules must keep running
+  // during a Jina outage.
+  const mode = isInCooldown(cooldown) ? "heuristic" : config.routerMode;
+  return {
+    enabled: config.routerEnabled,
+    mode,
+    jinaApiKey: config.jinaApiKey,
+    classifierId: config.routerClassifierId || undefined,
+    minConfidence: config.routerMinConfidence,
+    timeoutMs: config.routerTimeoutMs,
+    onClassifierUsage: (usage) =>
+      emitEvent(logger, {
+        type: "jina",
+        endpoint: "classify",
+        model: usage.model,
+        durationMs: usage.durationMs,
+        // 1 query item per call. Few-shot adds no labels in the body.
+        inputCount: 1,
+      }),
+    ...(rpmMonitor ? { rpmMonitor } : {}),
+  };
+}
 
-  // When the classifier circuit is open, we DOWNGRADE the mode to
-  // "heuristic" rather than short-circuiting to `ALL`. The cheap local
-  // rules (heartbeat / cron / memory trigger gating, meta-agent regex,
-  // CLI-trivial guard, keyword fast-paths) MUST still run during a Jina
-  // outage — otherwise a 5-min outage re-enables retrieval for every
-  // heartbeat, which is the exact waste the router is meant to prevent.
-  const classifierCircuitOpen = isInCooldown(cooldown);
-  const effectiveMode: "heuristic" | "jina-classifier" = classifierCircuitOpen
-    ? "heuristic"
-    : config.routerMode;
-
+/**
+ * Run the classifier with isolated cooldown tracking. The router fails open
+ * by contract (ALL on any Jina error); the cooldown only suppresses log spam
+ * during a sustained outage. A budget abort is not counted as a Jina error.
+ */
+async function runClassifierWithCooldown(
+  routerCfg: RouterConfig,
+  rctx: { query: string; trigger?: string; isCli?: boolean; signal?: AbortSignal },
+  cooldown: CooldownState,
+  logger: PluginLogger,
+  budgetSignal: AbortSignal,
+): Promise<RouterDecision> {
   try {
-    const d = await decideRoute(
-      {
-        enabled: config.routerEnabled,
-        mode: effectiveMode,
-        jinaApiKey: config.jinaApiKey,
-        classifierId: config.routerClassifierId || undefined,
-        minConfidence: config.routerMinConfidence,
-        onClassifierUsage: (usage) =>
-          emitEvent(logger, {
-            type: "jina",
-            endpoint: "classify",
-            model: usage.model,
-            durationMs: usage.durationMs,
-            // 1 query item per call. Few-shot adds no labels in the
-            // body, so inputCount = 1 covers both paths.
-            inputCount: 1,
-          }),
-        rpmMonitor,
-      },
-      {
-        query,
-        trigger: ctx?.trigger,
-        isCli: ctx?.messageProvider === "cli",
-      },
-    );
-
+    const d = await classifyRoute(routerCfg, rctx);
     if (d.reason === "classifier_error") {
-      registerError(cooldown, "router", logger);
-    } else if (!classifierCircuitOpen) {
-      // Only reset the error counter when we actually exercised the
-      // classifier path. While the circuit is open, heuristic-only
-      // successes must NOT prematurely declare the classifier healthy.
+      if (!budgetSignal.aborted) registerError(cooldown, "router", logger);
+    } else {
       cooldown.consecutiveErrors = 0;
     }
     return d;
   } catch (err) {
-    // Defense in depth: decideRoute already handles Jina errors internally
-    // but a non-Jina exception (programmer error) lands here. Log only
-    // the error CLASS, never the message — the message could echo
-    // user content for some programmatic errors.
-    logger.error(
-      `openclaw-knowledge: router unexpected error — ${summarizeJinaError(err)}`,
-    );
+    // Non-Jina exception (programmer error). Log only the error CLASS.
+    logger.error(`openclaw-knowledge: router unexpected error — ${summarizeJinaError(err)}`);
     registerError(cooldown, "router", logger);
     return { route: "ALL", reason: "classifier_error", score: null };
   }
 }
 
 // ---------------------------------------------------------------------------
-// Sources
+// Query extraction
 // ---------------------------------------------------------------------------
-
-type SourceResult = PgvectorSourceResult | LightRAGSourceResult;
 
 // OpenClaw envelope on `event.prompt`:
 //
@@ -630,6 +1121,13 @@ export function stripOpenClawHeaders(prompt: string): string {
  * @internal exported for unit testing
  */
 export function extractUserQuery(event: BeforePromptBuildEvent): string {
+  // 4.0.0 — hosts >= 2026.9 supply the current request before history /
+  // context projection; `prompt` may contain reconstructed history there.
+  // An explicit empty string means "no textual request" (image-only input,
+  // continuation) and must NOT fall back to `prompt` / `messages`.
+  if (typeof event.currentUserMessage === "string") {
+    return stripOpenClawHeaders(event.currentUserMessage);
+  }
   if (typeof event.prompt === "string") {
     return stripOpenClawHeaders(event.prompt);
   }
@@ -667,466 +1165,95 @@ export function extractQueryFromMessages(
   return "";
 }
 
-interface PgvectorSourceResult {
-  source: "pgvector";
-  /**
-   * Final ordered results to inject into the prompt. When the reranker
-   * is enabled, this is the post-rerank, post-`topN`-truncation list.
-   * Otherwise it is the raw cosine-ordered list. The number of items
-   * here is what reaches the LLM.
-   */
-  data: PgvectorResult[];
-  /**
-   * Number of candidates returned by the vector cosine pass, BEFORE the
-   * optional reranker. Useful for monitoring recall vs. reranker pruning:
-   * `rawCount` is the recall size, `data.length` is the final size.
-   */
-  rawCount: number;
-  reranked: boolean;
-  durationMs: number;
-  /**
-   * `true` when at least one configured collection's SQL search rejected.
-   * Pure observability — the source still returns whatever results the
-   * other collections produced (graceful degradation). Used by
-   * {@link renderSection} to emit `errored:true` on the pgvector event
-   * so dashboards don't confuse "ran and matched nothing" with "the
-   * SQL layer broke".
-   *
-   * @since 3.2.3
-   */
-  errored: boolean;
-  /**
-   * `true` when this result was produced by TEST mode (canned data) rather
-   * than a real vector search. Threaded into the pgvector event so synthetic
-   * turns are distinguishable in observability tooling.
-   *
-   * @since 3.2.7
-   */
-  mock?: boolean;
-}
-
-async function runPgvectorSource(
-  pool: PgPoolLike,
-  query: string,
-  config: ResolvedKnowledgeConfig,
-  rerankerCooldown: CooldownState,
-  logger: PluginLogger,
-  rpmMonitor: RpmMonitor | undefined,
-): Promise<PgvectorSourceResult> {
-  const startedAt = Date.now();
-  const vector = await embedQuery(query, config.geminiApiKey);
-  // Use `Promise.allSettled` so a single failing collection (transient DB
-  // hiccup, bad schema on one shard, etc.) does NOT erase the results
-  // from the others. `errored` is set when ANY settle is rejected so
-  // the downstream event can flag the partial failure.
-  const settled = await Promise.allSettled(
-    config.collections.map((col) =>
-      searchCollection(pool, col, vector, config.topK, config.scoreThreshold),
-    ),
-  );
-  const allResults: PgvectorResult[] = [];
-  let errored = false;
-  for (let i = 0; i < settled.length; i++) {
-    const r = settled[i]!;
-    if (r.status === "fulfilled") {
-      allResults.push(...r.value);
-    } else {
-      errored = true;
-      // SECURITY: never log r.reason directly. pg errors can include
-      // the offending SQL parameter values (the embedding vector and,
-      // historically, the query text in older driver versions). We log
-      // the constructor name only — sufficient to triage without
-      // risking PHI / query leakage.
-      const reasonClass = (r.reason as Error | undefined)?.constructor?.name ?? "Error";
-      logger.error(
-        `openclaw-knowledge: pgvector collection "${config.collections[i]}" failed — ${reasonClass}`,
-      );
-    }
-  }
-  allResults.sort((a, b) => b.score - a.score);
-  // Capture the recall size BEFORE the reranker runs. This is the
-  // number that monitors "how many candidates did pgvector find?"
-  // post-rerank, `data.length` may be smaller (truncated to topN), so
-  // we must not conflate the two in telemetry.
-  const rawCount = allResults.length;
-
-  // Optional cross-encoder rerank, gated on its own cooldown so a Jina
-  // hiccup doesn't poison the rest of the plugin.
-  //
-  // IMPORTANT: reset the cooldown BEFORE computing `rerankerActive`.
-  // Otherwise the first turn after the 5-min window expires would still
-  // see `consecutiveErrors=3`, skip the rerank, and only reset on the
-  // way out — leaving the operator with a "resuming" log message but a
-  // request that did NOT actually use the reranker.
-  maybeResetCooldown(rerankerCooldown, "pgvector_reranker", logger);
-
-  const rerankerActive =
-    config.pgvectorRerankerEnabled &&
-    Boolean(config.jinaApiKey) &&
-    !isInCooldown(rerankerCooldown);
-
-  if (!rerankerActive) {
-    return {
-      source: "pgvector",
-      data: allResults,
-      rawCount,
-      reranked: false,
-      durationMs: Date.now() - startedAt,
-      errored,
-    };
-  }
-
-  try {
-    const reranked = await rerankPgvectorResults(allResults, {
-      apiKey: config.jinaApiKey,
-      query,
-      model: config.pgvectorRerankerModel,
-      topN: config.pgvectorRerankerTopN,
-      candidatePoolMax: config.pgvectorRerankerCandidatePoolMax || undefined,
-      maxCharsPerDoc: config.pgvectorRerankerMaxCharsPerDoc || undefined,
-      rpmMonitor,
-      onUsage: (usage) =>
-        emitEvent(logger, {
-          type: "jina",
-          endpoint: "rerank",
-          model: config.pgvectorRerankerModel,
-          durationMs: usage.durationMs,
-          inputCount: usage.inputCount,
-        }),
-    });
-    rerankerCooldown.consecutiveErrors = 0;
-    return {
-      source: "pgvector",
-      data: reranked,
-      rawCount,
-      reranked: true,
-      durationMs: Date.now() - startedAt,
-      errored,
-    };
-  } catch (err) {
-    // Jina rerank failed → log a SANITIZED summary and fall back to
-    // cosine order. We do NOT log `err.message` because Jina error
-    // bodies (truncated to 200 chars in JinaApiError) may echo the
-    // query or document chunks — that would leak PHI / sensitive
-    // content into log files.
-    //
-    // We also intentionally DO NOT propagate the rejection to
-    // Promise.allSettled: pgvector retrieval itself succeeded, the
-    // reranker is bonus.
-    const isJina = err instanceof JinaError;
-    logger.error(
-      `openclaw-knowledge: pgvector reranker failed — ${summarizeJinaError(err)}`,
-    );
-    if (isJina) registerError(rerankerCooldown, "pgvector_reranker", logger);
-    return {
-      source: "pgvector",
-      data: allResults,
-      rawCount,
-      reranked: false,
-      durationMs: Date.now() - startedAt,
-      errored,
-    };
-  }
-}
-
-interface LightRAGSourceResult {
-  source: "lightrag";
-  data: string;
-  /**
-   * Structured source references LightRAG attributed the context to. Empty
-   * on older servers / in TEST mode. Surfaced through provenance as
-   * metadata-only source attribution. @since 3.2.8
-   */
-  references: LightRAGReference[];
-  durationMs: number;
-  /**
-   * `true` when this context came from TEST mode (canned data) rather than a
-   * live LightRAG server. @since 3.2.7
-   */
-  mock?: boolean;
-}
-
-async function runLightRAGSource(
-  query: string,
-  config: ResolvedKnowledgeConfig,
-): Promise<LightRAGSourceResult> {
-  const startedAt = Date.now();
-  const { context, references } = await queryLightRAG(
-    config.lightragUrl,
-    config.lightragApiKey,
-    query,
-    config.lightragQueryMode,
-    // Ask LightRAG for the per-chunk content whenever provenance emits items
-    // (metadata OR full) — NOT only full. `metadata` emits the per-document `title`,
-    // which is parsed from that content's `File Name:` header (so without it the
-    // sources keep their opaque gdrive ids). `full` additionally emits the excerpt
-    // text. Only `off` (no emission) skips the fetch.
-    config.provenanceReport !== "off",
-  );
-  return {
-    source: "lightrag",
-    data: context,
-    references,
-    durationMs: Date.now() - startedAt,
-  };
-}
-
-// ---------------------------------------------------------------------------
-// TEST mode — mocked sources (no network, no DB).
-//
-// These mirror the real `run*Source` functions EXACTLY: same return shape,
-// same downstream path (renderSection → events → provenance →
-// appendSystemContext). The only difference is the data origin. This is the
-// whole point: the agent receives genuinely-injected context, so a downstream
-// LLM trace (e.g. LiteLLM → Langfuse) reflects the real impact, while the
-// plugin makes ZERO calls to a LightRAG server or PostgreSQL.
-// ---------------------------------------------------------------------------
-
-/**
- * Substitute the `{{query}}` token (whitespace-tolerant) in a mock template.
- *
- * The replacement is passed as a CALLBACK, not a string, so the query is
- * inserted VERBATIM. A string replacement argument would interpret `$&`,
- * `` $` ``, `$'`, `$$` and `$1`-style sequences — common in code/shell
- * questions — and corrupt the very query this feature is meant to reflect.
- */
-export function renderMockResponse(template: string, query: string): string {
-  return template.replace(/\{\{\s*query\s*\}\}/g, () => query);
-}
-
-async function runLightRAGMock(
-  query: string,
-  config: ResolvedKnowledgeConfig,
-): Promise<LightRAGSourceResult> {
-  const startedAt = Date.now();
-  const data = renderMockResponse(config.lightragMockResponse, query);
-  return {
-    source: "lightrag",
-    data,
-    // Synthetic source references so a TEST deployment on a live gateway can
-    // exercise the LightRAG "Sources" provenance panel (3.2.9). They flow
-    // through the same provenance path as real references.
-    references: config.lightragMockReferences,
-    durationMs: Date.now() - startedAt,
-    mock: true,
-  };
-}
-
-// NOTE (3.2.10): the former `referencesInInjectedContext` / `referenceMarkerPresent`
-// truncation filter was REMOVED. It kept only references whose `file_path` still
-// appeared in the truncated injected text — a per-chunk rule that does not fit
-// LightRAG's SYNTHESIS model and, under a small `lightragMaxChars`, dropped EVERY
-// reference (so the chat frontend showed only an opaque context blob). LightRAG's
-// `references` are the doc-level attribution of the synthesized result and are
-// surfaced in full, metadata-only (file_path, never chunk text — no leak). See the
-// provenance-emission call site in `renderKnowledge`.
-
-async function runPgvectorMock(
-  config: ResolvedKnowledgeConfig,
-): Promise<PgvectorSourceResult> {
-  const startedAt = Date.now();
-  // `pgvectorMockResults` is already normalized and score-sorted by
-  // resolveConfig, so it needs no embedding pass and no pool.
-  const data = config.pgvectorMockResults;
-  return {
-    source: "pgvector",
-    data,
-    rawCount: data.length,
-    reranked: false,
-    durationMs: Date.now() - startedAt,
-    errored: false,
-    mock: true,
-  };
-}
-
-/**
- * Render one source's injectable section AND its provenance report (built
- * HERE because this is where the final truncation happens — the report must
- * mirror EXACTLY what reaches the LLM, contract rule "emit what was
- * injected, not what was retrieved").
- */
-interface RenderedSection {
-  text: string;
-  provenance: ProvenanceReportV1 | null;
-}
-
-function renderSection(
-  result: SourceResult,
-  config: ResolvedKnowledgeConfig,
-  logger: PluginLogger,
-): RenderedSection | null {
-  if (result.source === "pgvector") {
-    const formatted = formatPgvectorResultsDetailed(result.data, config.maxInjectChars);
-    const topScore = result.data[0]?.score?.toFixed(2) ?? "n/a";
-    const rerankNote = result.reranked ? " [reranked]" : "";
-    // Emit the event UNCONDITIONALLY — even when pgvector returned no
-    // result above threshold. The previous behavior (silent on empty)
-    // made it impossible to distinguish "pgvector ran and matched
-    // nothing" from "pgvector was never called". Operators need the
-    // former to monitor recall and trigger ingestion when warranted.
-    emitEvent(logger, {
-      type: "pgvector",
-      collections: config.collections,
-      // `rawCount` is the recall size out of the vector index, captured
-      // BEFORE the reranker truncates to topN. `rerankedCount` is the
-      // final size that reaches the LLM (or `null` when the reranker
-      // is inactive). This split lets operators monitor recall vs.
-      // pruning independently.
-      //
-      // When `errored` is set, `rawCount` is reported as `null` rather
-      // than `0` so dashboards do not conflate a partial SQL failure
-      // with a clean 0-hit query. See the `runPgvectorSource` comment
-      // about `Promise.allSettled` for the source of the flag.
-      rawCount: result.errored ? null : result.rawCount,
-      rerankedCount: result.reranked ? result.data.length : null,
-      topScore: result.data[0]?.score ?? null,
-      durationMs: result.durationMs,
-      errored: result.errored,
-      // Only present in TEST mode — production event lines are unchanged.
-      ...(result.mock ? { mock: true as const } : {}),
-    });
-    if (!formatted) {
-      logger.info(
-        `openclaw-knowledge: pgvector — no result above threshold (rawCount=${result.rawCount})`,
-      );
-      return null;
-    }
-    // `injectedCount` is the count of entries that actually fit in
-    // `maxInjectChars`. It is `<= result.data.length` — anything past the
-    // budget was dropped by `formatPgvectorResults`. The provenance
-    // report MUST mirror the injected subset (contract: "emit what was
-    // injected, not what was retrieved"), not the post-rerank candidate
-    // list — otherwise `metadata` mode leaks file names and `full` mode
-    // leaks excerpts of documents that never reached the LLM.
-    const injected = result.data.slice(0, formatted.injectedCount);
-    logger.info(
-      `openclaw-knowledge: pgvector — ${formatted.injectedCount}/${result.data.length} result(s)${rerankNote} (top: ${topScore})`,
-    );
-    const text = "### Document Search Results (pgvector)\n" + formatted.output;
-    return {
-      text,
-      provenance: buildPgvectorProvenance(
-        injected,
-        config.collections,
-        config.provenanceReport,
-        text.length,
-      ),
-    };
-  }
-
-  if (result.source === "lightrag") {
-    const formatted = formatLightRAGResults(result.data, config.lightragMaxChars);
-    // Emit the event UNCONDITIONALLY too — sparse responses are the
-    // single most useful signal for diagnosing KG coverage gaps.
-    const truncatedLen = formatted?.truncated.length ?? 0;
-    const originalLen = formatted?.originalLength ?? result.data.length;
-    emitEvent(logger, {
-      type: "lightrag",
-      mode: config.lightragQueryMode,
-      contextChars: originalLen,
-      truncatedChars: truncatedLen,
-      durationMs: result.durationMs,
-      sparse: truncatedLen < LIGHTRAG_SPARSE_THRESHOLD_CHARS,
-      // Number of source references LightRAG attributed the context to.
-      // 0 on older servers (no `references` field) or in TEST mode.
-      referenceCount: result.references.length,
-      // Only present in TEST mode — production event lines are unchanged.
-      ...(result.mock ? { mock: true as const } : {}),
-    });
-    if (!formatted) {
-      logger.info(
-        `openclaw-knowledge: LightRAG — empty response (${originalLen} chars)`,
-      );
-      return null;
-    }
-    logger.info(
-      `openclaw-knowledge: LightRAG — ${formatted.truncated.length}/${formatted.originalLength} chars (truncated from ${formatted.originalLength})`,
-    );
-    const text = "### Knowledge Graph Context (LightRAG)\n" + formatted.truncated;
-    return {
-      text,
-      // `text.length` (header INCLUDED) is what actually reaches the LLM —
-      // pass it through so the provenance `injected.chars` field matches.
-      // The `formatted.truncated` body is still used for the `full`-level
-      // excerpt because the header is structural noise (no semantic
-      // content worth surfacing to the chat frontend).
-      provenance: buildLightRAGProvenance(
-        formatted.truncated,
-        config.lightragQueryMode,
-        config.provenanceReport,
-        text.length,
-        // Surface LightRAG's FULL source attribution (metadata-only file_path —
-        // never chunk text). `references` is LightRAG's doc-level attribution of
-        // the SYNTHESIZED result: the injected entities/relations are DERIVED from
-        // these documents, so they fed the context even when a given chunk's text
-        // was truncated past `lightragMaxChars`. The previous "keep only references
-        // whose file_path still appears in the injected text" filter mis-applied
-        // the pgvector PER-CHUNK rule to LightRAG's SYNTHESIS model: under a small
-        // cap (observed 3.8k/42k) it dropped EVERY reference, so the chat frontend
-        // saw only an opaque context blob and none of the real sources. Semantic
-        // shift (see the provenance contract): LightRAG provenance attributes
-        // "sources that fed the graph", not "sources whose text was injected".
-        result.references,
-      ),
-    };
-  }
-
-  return null;
-}
-
-// ---------------------------------------------------------------------------
-// Cooldown utilities
-// ---------------------------------------------------------------------------
-
-function isInCooldown(state: CooldownState): boolean {
-  return state.consecutiveErrors >= MAX_CONSECUTIVE_ERRORS;
-}
-
-function maybeResetCooldown(
-  state: CooldownState,
-  scope: CooldownScope,
-  logger: PluginLogger,
-): void {
-  if (!isInCooldown(state)) return;
-  if (Date.now() < state.cooldownUntil) return;
-  state.consecutiveErrors = 0;
-  state.cooldownUntil = 0;
-  logger.info(`openclaw-knowledge: ${scope} — resuming after cooldown`);
-}
-
-function registerError(
-  state: CooldownState,
-  scope: CooldownScope,
-  logger: PluginLogger,
-): void {
-  state.consecutiveErrors++;
-  if (state.consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
-    state.cooldownUntil = Date.now() + COOLDOWN_MS;
-    logger.error(
-      `openclaw-knowledge: ${state.consecutiveErrors} consecutive errors — ${scope} cooling down 5 min`,
-    );
-    emitEvent(logger, {
-      type: "cooldown",
-      scope,
-      consecutiveErrors: state.consecutiveErrors,
-    });
-  }
-}
-
 // ---------------------------------------------------------------------------
 // Plugin registration helper
 // ---------------------------------------------------------------------------
 
-/**
- * Register the plugin against a minimal shape-compatible subset of the
- * OpenClaw plugin API. Returns nothing; side effects are setting a hook and
- * logging the initial status.
- */
 // FIRST registration's api (gateway re-registration quirk — see the handler
 // wiring below). Module-level: the ESM cache is per-process, so every later
 // registration in the same gateway process sees the original, "loaded" api.
 let stableApi: OpenClawPluginApi | null = null;
 
+// Process-wide state that must survive the per-run plugin re-registration:
+// the result cache (per-session entries), the pg pools (one per URL) and the
+// sessionKey → runId map used by the tool for provenance correlation.
+let sharedCache: KnowledgeResultCache<SourceResult> | null = null;
+// Circuit breakers must outlive the per-run re-registration too, otherwise a
+// failing backend starts every run with a closed breaker.
+let sharedCooldowns: Record<CooldownScope, CooldownState> | null = null;
+// One Opik exporter per process: its batch queue must survive re-registration.
+let sharedOpik: OpikExporter | null = null;
+
+function getSharedOpik(config: ResolvedKnowledgeConfig, logger: PluginLogger): OpikExporter | undefined {
+  if (!config.opik.enabled) return undefined;
+  if (sharedOpik && JSON.stringify(sharedOpik.config) === JSON.stringify(config.opik)) return sharedOpik;
+  // Config changed (hot reload): drain the previous queue before replacing it.
+  void sharedOpik?.flush();
+  sharedOpik = new OpikExporter(config.opik, logger);
+  return sharedOpik;
+}
+const sharedPools = new Map<string, PgPoolLike>();
+const latestRunIds = new Map<string, string>();
+
+function recordRunId(sessionKey: string, runId: string): void {
+  latestRunIds.delete(sessionKey);
+  latestRunIds.set(sessionKey, runId);
+  if (latestRunIds.size > RUN_ID_MAP_MAX) {
+    const oldest = latestRunIds.keys().next();
+    if (!oldest.done) latestRunIds.delete(oldest.value);
+  }
+}
+
+function getSharedCache(config: ResolvedKnowledgeConfig): KnowledgeResultCache<SourceResult> | undefined {
+  if (!config.cache.enabled) return undefined;
+  sharedCache ??= new KnowledgeResultCache<SourceResult>({
+    ttlMs: config.cache.ttlMs,
+    maxEntries: config.cache.maxEntries,
+    maxBytes: config.cache.maxBytes,
+  });
+  return sharedCache.enabled ? sharedCache : undefined;
+}
+
+/** @internal test hook — send whatever the shared Opik exporter has queued. */
+export async function flushOpikForTests(): Promise<void> {
+  await sharedOpik?.flush();
+}
+
+/** @internal test hook — drop process-wide caches between test cases. */
+export function resetSharedStateForTests(): void {
+  stableApi = null;
+  sharedCache?.clear();
+  sharedCache = null;
+  sharedCooldowns = null;
+  sharedOpik = null;
+  latestRunIds.clear();
+}
+
+function getSharedPool(
+  config: ResolvedKnowledgeConfig,
+  logger: PluginLogger,
+): PgPoolLike {
+  const existing = sharedPools.get(config.postgresUrl);
+  if (existing) return existing;
+  const realPool = new pg.Pool({
+    connectionString: config.postgresUrl,
+    max: 3,
+    idleTimeoutMillis: 30000,
+    // Server-side bound for a query the client stopped waiting for.
+    statement_timeout: config.pgvectorTimeoutMs,
+  });
+  realPool.on("error", (err: Error) => {
+    logger.error(`openclaw-knowledge: pool error — ${err.message}`);
+  });
+  sharedPools.set(config.postgresUrl, realPool);
+  return realPool;
+}
+
+/**
+ * Register the plugin against a minimal shape-compatible subset of the
+ * OpenClaw plugin API. Returns nothing; side effects are the hook, the
+ * optional tool / control-plane registrations and the initial status log.
+ */
 export function registerKnowledgePlugin(api: OpenClawPluginApi): void {
   if (stableApi === null) stableApi = api;
   const rawConfig = (api.pluginConfig ?? {}) as KnowledgePluginConfig;
@@ -1137,6 +1264,10 @@ export function registerKnowledgePlugin(api: OpenClawPluginApi): void {
       "openclaw-knowledge: neither pgvector nor LightRAG configured — plugin disabled",
     );
     return;
+  }
+
+  for (const warning of config.configWarnings) {
+    api.logger.warn(`openclaw-knowledge: config — ${warning}`);
   }
 
   // Sanity check: when the reranker is on, we want at least ~2× the topN
@@ -1166,32 +1297,25 @@ export function registerKnowledgePlugin(api: OpenClawPluginApi): void {
   }
 
   // Only instantiate the pg pool when pgvector is actually in play AND we are
-  // not in test mode (mocks need no DB). Booting a pool with no valid
-  // connection string would keep the plugin disabled anyway and leak sockets
-  // on hot-reload.
-  let pool: PgPoolLike | null = null;
-  if (config.pgvectorEnabled && !config.testModeEnabled) {
-    const realPool = new pg.Pool({
-      connectionString: config.postgresUrl,
-      max: 3,
-      idleTimeoutMillis: 30000,
-    });
-    realPool.on("error", (err: Error) => {
-      api.logger.error(`openclaw-knowledge: pool error — ${err.message}`);
-    });
-    pool = realPool;
-  }
+  // not in test mode (mocks need no DB). One pool per URL per process.
+  const pool: PgPoolLike | null =
+    config.pgvectorEnabled && !config.testModeEnabled ? getSharedPool(config, api.logger) : null;
 
   const mockNote = config.testModeEnabled ? " [MOCK]" : "";
   const sources: string[] = [];
-  if (config.pgvectorEnabled) {
-    const rerankNote = config.pgvectorRerankerEnabled
-      ? ` + reranker(${config.pgvectorRerankerModel})`
-      : "";
-    sources.push(`pgvector (${config.collections.join(", ")})${rerankNote}${mockNote}`);
-  }
-  if (config.lightragEnabled) {
-    sources.push(`LightRAG (${config.lightragQueryMode})${mockNote}`);
+  for (const src of config.sources.filter((s: ResolvedKnowledgeSource) => s.enabled)) {
+    const idNote = src.legacy ? "" : `${src.id}: `;
+    if (src.type === "pgvector") {
+      const rerankNote = config.pgvectorRerankerEnabled
+        ? ` + reranker(${config.pgvectorRerankerModel})`
+        : "";
+      sources.push(`${idNote}pgvector (${src.collections.join(", ")})${rerankNote}${mockNote}`);
+    } else {
+      const modeNote = config.lightragQueryModeExplicit
+        ? config.lightragQueryMode
+        : `per-route ${config.lightragQueryModeByRoute.LIGHTRAG_ONLY}/${config.lightragQueryModeByRoute.PGVECTOR_ONLY}`;
+      sources.push(`${idNote}LightRAG (${modeNote})${mockNote}`);
+    }
   }
 
   const routerNote = config.routerEnabled
@@ -1199,31 +1323,95 @@ export function registerKnowledgePlugin(api: OpenClawPluginApi): void {
     : "";
 
   api.logger.info(
-    `openclaw-knowledge: ready — sources: ${sources.join(" + ")}${routerNote}`,
+    `openclaw-knowledge: ready — sources: ${sources.join(" + ")}${routerNote} | inject=${config.injectionTarget} budget=${config.retrievalBudgetMs}ms`,
   );
+
+  const pluginId = typeof api.id === "string" && api.id ? api.id : PLUGIN_ID;
+  const cache = getSharedCache(config);
+  // The runtime session accessor is process-level; prefer the current api and
+  // fall back to the first registration's.
+  const store =
+    createRuntimeSessionPolicyStore(api, pluginId, api.logger) ??
+    (stableApi ? createRuntimeSessionPolicyStore(stableApi, pluginId, api.logger) : undefined);
+  // Provenance reports ride the agent-event bus. GATEWAY QUIRK
+  // (bench-verified 2026-06-12): the runtime RE-REGISTERS plugins per run
+  // and emitting through a re-registration's api is rejected "plugin is
+  // not loaded" — only the FIRST registration's api stays loaded, hence
+  // the module-level singleton.
+  const emitAgentEvent = resolveEmitAgentEvent(stableApi ?? api);
+  const cooldowns = (sharedCooldowns ??= createCooldowns());
+  const opik = getSharedOpik(config, api.logger);
+  const rpmMonitor = createRpmMonitor(config, api.logger);
 
   const handler = createBeforePromptBuildHandler({
     config,
     pool,
     logger: api.logger,
-    // Provenance reports ride the agent-event bus. GATEWAY QUIRK
-    // (bench-verified 2026-06-12): the runtime RE-REGISTERS plugins per run
-    // and emitting through a re-registration's api is rejected "plugin is
-    // not loaded" — only the FIRST registration's api stays loaded, hence
-    // the module-level singleton.
-    emitAgentEvent: resolveEmitAgentEvent(stableApi ?? api),
+    ...(emitAgentEvent ? { emitAgentEvent } : {}),
+    ...(cache ? { cache } : {}),
+    ...(store ? { store } : {}),
+    recordRunId,
+    cooldowns,
+    ...(rpmMonitor ? { rpmMonitor } : {}),
+    ...(opik ? { opik } : {}),
   });
 
   // The SDK's `api.on<K>` signature is strongly typed per hook name, so we
-  // use a cast here to bridge our structural handler type with the precise
-  // `PluginHookHandlerMap["before_prompt_build"]` expected signature.
-  // The handler itself is fully type-safe on its own contract (see
-  // {@link createBeforePromptBuildHandler}).
+  // bridge our structural handler type with a cast. The explicit
+  // `timeoutMs` replaces the host's 15 s default for before_prompt_build
+  // (upstream src/plugins/hooks.ts DEFAULT_MODIFYING_HOOK_TIMEOUT_MS_BY_HOOK;
+  // PluginHookRegistrationOptions.timeoutMs in src/plugins/hook-types.ts).
+  // Older hosts ignore the third argument.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  (api.on as (event: string, handler: any) => void)(
+  (api.on as (event: string, handler: any, opts?: { timeoutMs?: number }) => void)(
     "before_prompt_build",
     handler,
+    { timeoutMs: config.hookTimeoutMs },
   );
+
+  // On-demand tool (optional: operators allowlist `knowledge_search`).
+  const registerTool = (api as { registerTool?: unknown }).registerTool;
+  if (config.tool.enabled && typeof registerTool === "function") {
+    try {
+      (registerTool as (tool: unknown, opts?: unknown) => void).call(
+        api,
+        (toolCtx: { agentId?: string; sessionKey?: string }) =>
+          createKnowledgeSearchTool(
+            {
+              config,
+              pool,
+              logger: api.logger,
+              rerankerCooldown: cooldowns.pgvector_reranker,
+              ...(rpmMonitor ? { rpmMonitor } : {}),
+              ...(cache ? { cache } : {}),
+              ...(store ? { store } : {}),
+              ...(emitAgentEvent ? { emitAgentEvent } : {}),
+              lookupRunId: (sessionKey: string) => latestRunIds.get(sessionKey),
+              ...(opik ? { opik } : {}),
+            },
+            {
+              ...(toolCtx?.agentId ? { agentId: toolCtx.agentId } : {}),
+              ...(toolCtx?.sessionKey ? { sessionKey: toolCtx.sessionKey } : {}),
+            },
+          ),
+        { name: KNOWLEDGE_SEARCH_TOOL, optional: true },
+      );
+    } catch (err) {
+      api.logger.warn(
+        `openclaw-knowledge: knowledge_search registration failed — ${(err as Error)?.message ?? String(err)}`,
+      );
+    }
+  }
+
+  const controlPlane = registerControlPlane(api, {
+    config,
+    logger: api.logger,
+    ...(store ? { store } : {}),
+    ...(cache ? { cache } : {}),
+  });
+  if (controlPlane.length > 0) {
+    api.logger.debug?.(`openclaw-knowledge: control plane — ${controlPlane.join(", ")}`);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1236,8 +1424,7 @@ export function registerKnowledgePlugin(api: OpenClawPluginApi): void {
 // the SDK's public surface, so TypeScript has no portable name to write
 // into our emitted `dist/index.d.ts`. Pinning to the publicly-exported
 // supertype `OpenClawPluginDefinition` resolves the diagnostic without
-// loosening type safety (the return type is structurally assignable to
-// it — see `Pick<OpenClawPluginDefinition, …>` in the SDK definition).
+// loosening type safety.
 const knowledgePluginEntry: OpenClawPluginDefinition = definePluginEntry({
   id: "openclaw-knowledge",
   name: "Knowledge Base",

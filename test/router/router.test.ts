@@ -3,7 +3,7 @@
 import { describe, it, afterEach, mock } from "node:test";
 import assert from "node:assert/strict";
 
-import { decideRoute } from "../../src/router/index.js";
+import { decideRoute, decideRouteWithoutClassifier } from "../../src/router/index.js";
 import type { RouterConfig } from "../../src/router/index.js";
 
 const BASE_CFG: RouterConfig = {
@@ -482,5 +482,28 @@ describe("decideRoute — fail-open semantics", () => {
     });
     assert.equal(d.route, "ALL");
     assert.equal(d.reason, "classifier_fallback");
+  });
+});
+
+describe("router split (4.0)", () => {
+  it("decideRouteWithoutClassifier returns null only when the classifier is needed", () => {
+    const base = { enabled: true, mode: "jina-classifier" as const, jinaApiKey: "k" };
+    assert.equal(decideRouteWithoutClassifier(base, { query: "remind me what we discussed" }), null);
+    assert.equal(
+      decideRouteWithoutClassifier({ ...base, mode: "jina-classifier-parallel" }, { query: "remind me what we discussed" }),
+      null,
+    );
+    assert.equal(
+      decideRouteWithoutClassifier(base, { query: "compare the two offers" })?.reason,
+      "heuristic_keyword",
+    );
+    assert.equal(
+      decideRouteWithoutClassifier({ ...base, enabled: false }, { query: "x y z" })?.reason,
+      "router_disabled",
+    );
+    assert.equal(
+      decideRouteWithoutClassifier({ ...base, jinaApiKey: "" }, { query: "remind me" })?.reason,
+      "classifier_fallback",
+    );
   });
 });

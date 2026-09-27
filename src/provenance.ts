@@ -104,11 +104,21 @@ export function resolveEmitAgentEvent(api: unknown): EmitAgentEventFn | undefine
  * (post-rerank, post-topN — exactly what reached the LLM). Returns null when
  * the level is "off" or there is nothing citable.
  */
+/**
+ * `injected.position` values (free-form string in provenance/v1). Pre-4.0
+ * reports always said `system_append`; 4.0 reports say where the block
+ * actually landed.
+ *
+ * @since 4.0.0
+ */
+export type ProvenancePosition = "system_append" | "user_prepend" | "user_append" | "tool_result";
+
 export function buildPgvectorProvenance(
   data: PgvectorResult[],
   collections: string[],
   level: ProvenanceReportLevel,
   injectedChars: number,
+  position: ProvenancePosition = "system_append",
 ): ProvenanceReportV1 | null {
   if (level === "off" || data.length === 0) return null;
   const items: ProvenanceItemV1[] = data
@@ -126,7 +136,7 @@ export function buildPgvectorProvenance(
     v: 1,
     source: "knowledge",
     kind: "documents",
-    injected: { chars: injectedChars, position: "system_append" },
+    injected: { chars: injectedChars, position },
     retrieval: { route: "pgvector", collections },
     items,
   };
@@ -176,6 +186,7 @@ export function buildLightRAGProvenance(
   level: ProvenanceReportLevel,
   injectedChars?: number,
   references: LightRAGReference[] = [],
+  position: ProvenancePosition = "system_append",
 ): ProvenanceReportV1 | null {
   if (level === "off" || injectedText.length === 0) return null;
 
@@ -235,7 +246,7 @@ export function buildLightRAGProvenance(
     v: 1,
     source: "knowledge",
     kind: "documents",
-    injected: { chars: reportedChars, position: "system_append" },
+    injected: { chars: reportedChars, position },
     retrieval: { route: "lightrag", lightrag: { mode } },
     items: [...refItems, contextItem],
   };

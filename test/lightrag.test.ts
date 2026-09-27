@@ -9,6 +9,7 @@ import {
   parseLightRAGReferences,
   normalizeReferenceContent,
   extractDocumentTitle,
+  LightRAGTimeoutError,
 } from "../src/lightrag.js";
 
 describe("queryLightRAG", () => {
@@ -292,5 +293,65 @@ describe("truncateLightRAG", () => {
     const result = truncateLightRAG(text, 100);
     // Should fall back to raw truncation since period is at pos 2 (< 50 = 50%)
     assert.equal(result.length, 100);
+  });
+});
+
+describe("queryLightRAG — 4.0 options", () => {
+  afterEach(() => mock.restoreAll());
+
+  it("does not pass a signal when no timeout / signal is requested (legacy shape)", async () => {
+    let init: RequestInit | undefined;
+    mock.method(globalThis, "fetch", async (_u: unknown, i?: RequestInit) => {
+      init = i;
+      return new Response(JSON.stringify({ response: "ok" }), { status: 200 });
+    });
+    await queryLightRAG("http://lr:9621", "", "q", "hybrid");
+    assert.equal(init?.signal, undefined);
+  });
+
+  it("aborts after timeoutMs with a LightRAGTimeoutError", async () => {
+    mock.method(
+      globalThis,
+      "fetch",
+      (_u: unknown, i?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          i?.signal?.addEventListener("abort", () => reject(i.signal!.reason), { once: true });
+        }),
+    );
+    await assert.rejects(
+      () => queryLightRAG("http://lr:9621", "", "q", "hybrid", false, { timeoutMs: 30 }),
+      (err: unknown) => err instanceof LightRAGTimeoutError && /timed out after 30ms/.test(err.message),
+    );
+  });
+
+  it("reports a caller abort as a budget abort", async () => {
+    mock.method(
+      globalThis,
+      "fetch",
+      (_u: unknown, i?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          i?.signal?.addEventListener("abort", () => reject(i.signal!.reason), { once: true });
+        }),
+    );
+    const controller = new AbortController();
+    const pending = queryLightRAG("http://lr:9621", "", "q", "hybrid", false, { signal: controller.signal });
+    controller.abort();
+    await assert.rejects(pending, (err: unknown) => err instanceof LightRAGTimeoutError && /budget/.test(err.message));
+  });
+
+  it("sends hl/ll keywords for graph modes only", async () => {
+    const bodies: Array<Record<string, unknown>> = [];
+    mock.method(globalThis, "fetch", async (_u: unknown, i?: RequestInit) => {
+      bodies.push(JSON.parse(String(i?.body)) as Record<string, unknown>);
+      return new Response(JSON.stringify({ response: "ok" }), { status: 200 });
+    });
+    const keywords = { hl: ["projet hélios"], ll: ["Hélios", "ACME"] };
+    await queryLightRAG("http://lr:9621", "", "q", "hybrid", false, { keywords });
+    await queryLightRAG("http://lr:9621", "", "q", "naive", false, { keywords });
+    await queryLightRAG("http://lr:9621", "", "q", "mix", false, { keywords: { hl: [], ll: [] } });
+    assert.deepEqual(bodies[0]!.hl_keywords, ["projet hélios"]);
+    assert.deepEqual(bodies[0]!.ll_keywords, ["Hélios", "ACME"]);
+    assert.equal("hl_keywords" in bodies[1]!, false);
+    assert.equal("hl_keywords" in bodies[2]!, false);
   });
 });

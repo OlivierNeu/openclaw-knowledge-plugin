@@ -24,6 +24,7 @@ interface GeminiEmbeddingResponse {
 export async function embedQuery(
   text: string,
   geminiApiKey: string,
+  signal?: AbortSignal,
 ): Promise<number[]> {
   const url = `${GEMINI_EMBED_URL}?key=${geminiApiKey}`;
 
@@ -33,6 +34,10 @@ export async function embedQuery(
     body: JSON.stringify({
       content: { parts: [{ text }] },
     }),
+    // 4.0.0 — optional abort (pgvector timeout / retrieval budget). Omitted
+    // entirely when absent so the request shape is unchanged for callers
+    // (and tests) that predate it.
+    ...(signal ? { signal } : {}),
   });
 
   if (!resp.ok) {

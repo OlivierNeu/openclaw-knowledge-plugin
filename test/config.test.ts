@@ -400,3 +400,88 @@ describe("resolveConfig — TEST mode (v3.2.7)", () => {
     assert.deepEqual(cfg.lightragMockReferences, []);
   });
 });
+
+describe("resolveConfig — 4.0 keys", () => {
+  it("applies 4.0 defaults", () => {
+    const cfg = resolveConfig({ lightragUrl: "http://lr:9621" });
+    assert.equal(cfg.injectionTarget, "prependContext");
+    assert.equal(cfg.lightragTimeoutMs, 3500);
+    assert.equal(cfg.pgvectorTimeoutMs, 3000);
+    assert.equal(cfg.retrievalBudgetMs, 4500);
+    assert.equal(cfg.hookTimeoutMs, 6000);
+    assert.equal(cfg.routerTimeoutMs, 1500);
+    assert.equal(cfg.lightragLocalKeywords, false);
+    assert.equal(cfg.lightragQueryModeExplicit, false);
+    assert.deepEqual(cfg.lightragQueryModeByRoute, {
+      PGVECTOR_ONLY: "naive",
+      LIGHTRAG_ONLY: "hybrid",
+      ALL: "hybrid",
+      fallback: "hybrid",
+      tool: "naive",
+    });
+    assert.deepEqual(cfg.skip, {
+      sessionPatterns: [":subagent:", ":active-memory:"],
+      triggers: ["heartbeat", "cron", "memory", "manual"],
+      nonHumanInput: true,
+      allowSourceTools: [],
+      acknowledgements: true,
+    });
+    assert.deepEqual(cfg.cache, { enabled: true, ttlMs: 600000, maxEntries: 200, maxBytes: 8388608 });
+    assert.equal(cfg.hybridMinScore, 0.45);
+    assert.deepEqual(cfg.tool, { enabled: true, maxTopK: 20 });
+    assert.deepEqual(cfg.controlPlane, {
+      sessionOverrides: true,
+      oneShotTtlMs: 600000,
+      command: true,
+      gatewayMethods: true,
+    });
+    assert.deepEqual(cfg.configWarnings, []);
+  });
+
+  it("an explicit legacy lightragQueryMode overrides every route default", () => {
+    const cfg = resolveConfig({ lightragUrl: "x", lightragQueryMode: "mix" });
+    assert.equal(cfg.lightragQueryModeExplicit, true);
+    assert.equal(cfg.lightragQueryModeByRoute.PGVECTOR_ONLY, "mix");
+    assert.equal(cfg.lightragQueryModeByRoute.tool, "mix");
+  });
+
+  it("lightragQueryModeByRoute entries win and are tracked as explicit", () => {
+    const cfg = resolveConfig({
+      lightragUrl: "x",
+      lightragQueryMode: "hybrid",
+      lightragQueryModeByRoute: { fallback: "naive", ALL: "bogus" as never },
+    });
+    assert.equal(cfg.lightragQueryModeByRoute.fallback, "naive");
+    assert.equal(cfg.lightragQueryModeByRoute.ALL, "hybrid");
+    assert.deepEqual(cfg.lightragQueryModeByRouteExplicit, ["fallback"]);
+  });
+
+  it("raises a hookTimeoutMs below the retrieval budget and warns", () => {
+    const cfg = resolveConfig({ lightragUrl: "x", retrievalBudgetMs: 8000, hookTimeoutMs: 5000 });
+    assert.equal(cfg.hookTimeoutMs, 9500);
+    assert.ok(cfg.configWarnings.some((w) => w.includes("hookTimeoutMs=5000")));
+    const ok = resolveConfig({ lightragUrl: "x", retrievalBudgetMs: 3000, hookTimeoutMs: 6000 });
+    assert.equal(ok.hookTimeoutMs, 6000);
+    assert.ok(!ok.configWarnings.some((w) => w.includes("hookTimeoutMs")));
+  });
+
+  it("derives hookTimeoutMs from the budget and clamps bad values", () => {
+    const cfg = resolveConfig({
+      lightragUrl: "x",
+      retrievalBudgetMs: 3000,
+      lightragTimeoutMs: -1,
+      injectionTarget: "systemPrompt" as never,
+      jina: { router: { mode: "jina-classifier-parallel", timeoutMs: 800 } },
+    });
+    assert.equal(cfg.hookTimeoutMs, 4500);
+    assert.equal(cfg.lightragTimeoutMs, 3500);
+    assert.equal(cfg.injectionTarget, "prependContext");
+    assert.equal(cfg.routerMode, "jina-classifier-parallel");
+    assert.equal(cfg.routerTimeoutMs, 800);
+  });
+
+  it("falls back to heuristic for an unknown router mode", () => {
+    const cfg = resolveConfig({ lightragUrl: "x", jina: { router: { mode: "magic" as never } } });
+    assert.equal(cfg.routerMode, "heuristic");
+  });
+});

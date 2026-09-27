@@ -136,41 +136,126 @@ export async function queryLightRAG(
   query: string,
   mode: LightRAGQueryMode = "hybrid",
   includeChunkContent = false,
+  options: LightRAGQueryOptions = {},
 ): Promise<LightRAGQueryResult> {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
   };
   if (apiKey) headers["X-API-Key"] = apiKey;
 
-  const resp = await fetch(`${url}/query`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({
-      query,
-      mode,
-      only_need_context: true,
-      stream: false,
-      // Include each reference's retrieved chunk text in the `references` field
-      // (default false → only reference_id + file_path). This is what lets the chat
-      // frontend show the per-document source content (the FULL retrieved text, not
-      // subject to the `lightragMaxChars` truncation of the assembled blob). Gated by
-      // the caller on provenance level `full` — never paid for at off/metadata.
-      include_chunk_content: includeChunkContent,
-    }),
-  });
+  const body: Record<string, unknown> = {
+    query,
+    mode,
+    only_need_context: true,
+    stream: false,
+    // Include each reference's retrieved chunk text in the `references` field
+    // (default false → only reference_id + file_path). This is what lets the chat
+    // frontend show the per-document source content (the FULL retrieved text, not
+    // subject to the `lightragMaxChars` truncation of the assembled blob). Gated by
+    // the caller on provenance level `full` — never paid for at off/metadata.
+    include_chunk_content: includeChunkContent,
+  };
+  // Pre-computed keywords make LightRAG skip its LLM keyword-extraction call
+  // (`get_keywords_from_query` returns them as-is when either list is
+  // non-empty — HKUDS/LightRAG lightrag/operate.py). `naive` never extracts
+  // keywords, so they are not sent for it.
+  if (mode !== "naive" && options.keywords) {
+    const { hl, ll } = options.keywords;
+    if (hl.length > 0 || ll.length > 0) {
+      body.hl_keywords = hl;
+      body.ll_keywords = ll;
+    }
+  }
+
+  const signal = combineSignals(options.signal, options.timeoutMs);
+  let resp: Response;
+  try {
+    resp = await fetch(`${url}/query`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+      ...(signal ? { signal } : {}),
+    });
+  } catch (err) {
+    throw toLightRAGError(err, signal, options.timeoutMs);
+  }
 
   if (!resp.ok) {
-    const body = await resp.text();
+    const text = await resp.text();
     throw new Error(
-      `LightRAG query failed (${resp.status}): ${body.slice(0, 200)}`,
+      `LightRAG query failed (${resp.status}): ${text.slice(0, 200)}`,
     );
   }
 
-  const data = (await resp.json()) as LightRAGResponsePayload;
+  let data: LightRAGResponsePayload;
+  try {
+    data = (await resp.json()) as LightRAGResponsePayload;
+  } catch (err) {
+    throw toLightRAGError(err, signal, options.timeoutMs);
+  }
   return {
     context: data.response ?? data.context ?? "",
     references: parseLightRAGReferences(data.references),
   };
+}
+
+/**
+ * Optional per-call knobs for {@link queryLightRAG}.
+ *
+ * @since 4.0.0
+ */
+export interface LightRAGQueryOptions {
+  /** Caller cancellation (e.g. the per-turn retrieval budget). */
+  signal?: AbortSignal;
+  /** Hard timeout for the whole request (headers + body). */
+  timeoutMs?: number;
+  /** Locally computed keywords; sent as `hl_keywords` / `ll_keywords`. */
+  keywords?: { hl: string[]; ll: string[] };
+}
+
+/** Raised when a LightRAG call was aborted by its timeout or the caller. @since 4.0.0 */
+export class LightRAGTimeoutError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "LightRAGTimeoutError";
+  }
+}
+
+/**
+ * Merge an optional caller signal and an optional timeout into one signal.
+ * Returns undefined when neither is supplied (legacy: no abort at all).
+ *
+ * @internal exported for reuse by the pgvector / embedding path
+ */
+export function combineSignals(
+  signal: AbortSignal | undefined,
+  timeoutMs: number | undefined,
+): AbortSignal | undefined {
+  const parts: AbortSignal[] = [];
+  if (signal) parts.push(signal);
+  if (typeof timeoutMs === "number" && Number.isFinite(timeoutMs) && timeoutMs > 0) {
+    parts.push(AbortSignal.timeout(timeoutMs));
+  }
+  if (parts.length === 0) return undefined;
+  if (parts.length === 1) return parts[0];
+  return AbortSignal.any(parts);
+}
+
+function toLightRAGError(
+  err: unknown,
+  signal: AbortSignal | undefined,
+  timeoutMs: number | undefined,
+): Error {
+  if (signal?.aborted) {
+    const reason = signal.reason as { name?: string } | undefined;
+    const timedOut = reason?.name === "TimeoutError";
+    return new LightRAGTimeoutError(
+      timedOut
+        ? `LightRAG query timed out after ${timeoutMs ?? "?"}ms`
+        : "LightRAG query aborted (retrieval budget)",
+    );
+  }
+  return err instanceof Error ? err : new Error(String(err));
 }
 
 /**

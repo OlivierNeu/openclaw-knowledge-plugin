@@ -56,6 +56,11 @@ export interface RouterEvent {
   score: number | null;
   queryLength: number;
   trigger?: string;
+  /**
+   * Content-free detail of a pre-router skip (matched session pattern,
+   * trigger, or `kind[:sourceTool]` of the input provenance). @since 4.0.0
+   */
+  detail?: string;
 }
 
 export interface PgvectorEvent {
@@ -78,6 +83,10 @@ export interface PgvectorEvent {
    * @since 3.2.3
    */
   errored: boolean;
+  /** Named source id (4.0.0). Omitted for the legacy synthesized `pgvector` source. */
+  sourceId?: string;
+  /** `true` when served from the per-session cache (4.0.0). */
+  cached?: boolean;
   /**
    * `true` when these results came from TEST mode (canned data, no DB).
    * Omitted entirely in normal operation so production event lines are
@@ -109,11 +118,57 @@ export interface LightRAGEvent {
    * dashboards track source-attribution coverage. @since 3.2.8
    */
   referenceCount?: number;
+  /** Named source id (4.0.0). Omitted for the legacy synthesized `lightrag` source. */
+  sourceId?: string;
+  /** `true` when served from the per-session cache (4.0.0). */
+  cached?: boolean;
+  /** `true` when locally extracted keywords were sent (LLM extraction skipped). @since 4.0.0 */
+  localKeywords?: boolean;
   /**
    * `true` when this context came from TEST mode (canned data, no live
    * LightRAG server). Omitted in normal operation. @since 3.2.7
    */
   mock?: boolean;
+}
+
+/**
+ * One line per eligible hook invocation summarizing where the time went.
+ * Durations are wall-clock ms; a source that did not run is `null`. No query
+ * content, no session key (it can embed a channel peer id).
+ *
+ * @since 4.0.0
+ */
+export interface TimingEvent {
+  type: "timing";
+  runId?: string;
+  agentId?: string;
+  /** Query extraction + skip stage. */
+  filterMs: number;
+  /** Router (heuristic + classifier). 0 when skipped / forced. */
+  routerMs: number;
+  /** Slowest pgvector source of the turn (null: none ran). */
+  pgvectorMs: number | null;
+  /** Slowest LightRAG source of the turn (null: none ran). */
+  lightragMs: number | null;
+  totalMs: number;
+  route: Route | null;
+  reason: RouterReason | string;
+  /** Why retrieval did not run (skip reason / policy), or null when it ran. */
+  skipped: string | null;
+  /** Number of source results served from the cache. */
+  cacheHit: number;
+  /** The global retrieval budget elapsed before every source finished. */
+  budgetExceeded: boolean;
+  /** Sources launched speculatively then discarded (parallel router). */
+  speculativeDiscarded?: number;
+  injected: boolean;
+  injectionTarget?: string;
+  policy?: {
+    injection: string;
+    sources: string[];
+    origin: { injection: string; sources: string };
+    force?: boolean;
+  };
 }
 
 /**
@@ -157,7 +212,8 @@ export type KnowledgeEvent =
   | LightRAGEvent
   | JinaUsageEvent
   | CooldownEvent
-  | JinaRpmExceededEvent;
+  | JinaRpmExceededEvent
+  | TimingEvent;
 
 // ---------------------------------------------------------------------------
 // Emitters

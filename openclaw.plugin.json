@@ -1,10 +1,21 @@
 {
   "id": "openclaw-knowledge",
   "name": "Knowledge Base",
-  "description": "Multi-source knowledge search (pgvector + LightRAG) with optional Jina-powered router & reranker — injects relevant documents and knowledge graph context before each turn via the before_prompt_build hook",
-  "version": "3.2.13",
+  "description": "Multi-source knowledge search (named pgvector collections + LightRAG graphs) with optional Jina router & reranker — injects relevant documents on the user turn (cache-friendly) under a strict latency budget, plus an on-demand knowledge_search tool and a per-agent / per-session policy control plane",
+  "version": "4.0.0",
   "activation": {
     "onStartup": true
+  },
+  "contracts": {
+    "tools": [
+      "knowledge_search"
+    ]
+  },
+  "toolMetadata": {
+    "knowledge_search": {
+      "optional": true,
+      "replaySafe": true
+    }
   },
   "configSchema": {
     "type": "object",
@@ -71,10 +82,11 @@
           "naive",
           "local",
           "global",
-          "hybrid"
+          "hybrid",
+          "mix"
         ],
         "default": "hybrid",
-        "description": "LightRAG query mode: naive (vector), local (entity), global (community), hybrid (recommended)"
+        "description": "Legacy global LightRAG query mode. When set explicitly it overrides every per-route default (pre-4.0 semantics); lightragQueryModeByRoute entries still win over it. When omitted, 4.0 uses per-route defaults (naive for simple lookups and tool calls, hybrid for graph questions)."
       },
       "lightragMaxChars": {
         "type": "number",
@@ -116,10 +128,11 @@
                 "type": "string",
                 "enum": [
                   "heuristic",
-                  "jina-classifier"
+                  "jina-classifier",
+                  "jina-classifier-parallel"
                 ],
                 "default": "heuristic",
-                "description": "heuristic: zero-cost regex + trigger rules only (safe start). jina-classifier: same heuristics first, then Jina /v1/classify for ambiguous queries."
+                "description": "heuristic: zero-cost regex + trigger rules only. jina-classifier: heuristics first, then Jina /v1/classify for ambiguous queries (serial: classifier latency adds to the turn). jina-classifier-parallel: same decision, but sources start speculatively in parallel with the classifier and are discarded when the decision is NONE (lower latency, pays the source cost on turns the classifier would have skipped)."
               },
               "classifierId": {
                 "type": "string",
@@ -131,6 +144,13 @@
                 "maximum": 1,
                 "default": 0.35,
                 "description": "Minimum classifier confidence (cosine similarity 0–1) required to trust a classifier prediction. Scores below this floor fail open to ALL with reason classifier_low_confidence. Default 0.35 — observed noise floor on Jina v3 zero-shot when no label matches."
+              },
+              "timeoutMs": {
+                "type": "number",
+                "minimum": 100,
+                "maximum": 10000,
+                "default": 1500,
+                "description": "Timeout for the Jina classify call in ms (also bounded by retrievalBudgetMs). A timeout fails open to ALL."
               }
             }
           },
@@ -184,6 +204,448 @@
         "default": "off",
         "description": "Provenance reporting toward chat frontends (provenance/v1): off = no emission; metadata = file names/collections/scores; full = plus source excerpts (the injected pgvector chunks, the injected LightRAG context blob, AND each LightRAG source document's retrieved content so the user sees the material the RAG pulled per document). Reports ride the gateway agent-event bus and land under the chat's own ACL — never in logs."
       },
+      "injectionTarget": {
+        "type": "string",
+        "enum": [
+          "prependContext",
+          "appendContext",
+          "appendSystemContext"
+        ],
+        "default": "prependContext",
+        "description": "Where the knowledge block is injected. prependContext/appendContext land on the CURRENT user message (model submission only; the transcript keeps the raw text) so the system prompt and history prefix stay cacheable. appendSystemContext is the pre-4.0 behavior (changes the system prompt every turn and breaks prompt caching)."
+      },
+      "lightragTimeoutMs": {
+        "type": "number",
+        "minimum": 100,
+        "maximum": 120000,
+        "default": 3500,
+        "description": "Abort a LightRAG /query call after this many ms."
+      },
+      "pgvectorTimeoutMs": {
+        "type": "number",
+        "minimum": 100,
+        "maximum": 120000,
+        "default": 3000,
+        "description": "Abort the pgvector path (Gemini embedding + SQL, also used as PostgreSQL statement_timeout) after this many ms."
+      },
+      "retrievalBudgetMs": {
+        "type": "number",
+        "minimum": 100,
+        "maximum": 120000,
+        "default": 4500,
+        "description": "Global per-turn budget (router + sources). When it elapses, whatever sources already finished are injected (partial success, logged)."
+      },
+      "hookTimeoutMs": {
+        "type": "number",
+        "minimum": 100,
+        "maximum": 120000,
+        "description": "Explicit before_prompt_build handler timeout registered with the host. Default retrievalBudgetMs + 1500."
+      },
+      "lightragQueryModeByRoute": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Per-route LightRAG mode. Keys: PGVECTOR_ONLY (simple lookups), LIGHTRAG_ONLY and ALL (graph questions), fallback (ALL reached through classifier fallback / low confidence / error), tool (knowledge_search calls). naive skips LightRAG's LLM keyword extraction.",
+        "properties": {
+          "PGVECTOR_ONLY": {
+            "type": "string",
+            "enum": [
+              "naive",
+              "local",
+              "global",
+              "hybrid",
+              "mix"
+            ]
+          },
+          "LIGHTRAG_ONLY": {
+            "type": "string",
+            "enum": [
+              "naive",
+              "local",
+              "global",
+              "hybrid",
+              "mix"
+            ]
+          },
+          "ALL": {
+            "type": "string",
+            "enum": [
+              "naive",
+              "local",
+              "global",
+              "hybrid",
+              "mix"
+            ]
+          },
+          "fallback": {
+            "type": "string",
+            "enum": [
+              "naive",
+              "local",
+              "global",
+              "hybrid",
+              "mix"
+            ]
+          },
+          "tool": {
+            "type": "string",
+            "enum": [
+              "naive",
+              "local",
+              "global",
+              "hybrid",
+              "mix"
+            ]
+          }
+        }
+      },
+      "lightragLocalKeywords": {
+        "type": "boolean",
+        "default": false,
+        "description": "Extract hl_keywords/ll_keywords locally (FR+EN stopwords) and send them to LightRAG so it skips its own LLM keyword-extraction call on local/global/hybrid/mix queries. Faster and free, slightly less precise for abstract themes."
+      },
+      "skip": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Non-human turn filters applied before any routing, on every deployment.",
+        "properties": {
+          "sessionPatterns": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": [
+              ":subagent:",
+              ":active-memory:"
+            ],
+            "description": "Substrings of ctx.sessionKey that skip retrieval (sub-agent and active-memory recall sessions)."
+          },
+          "triggers": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": [
+              "heartbeat",
+              "cron",
+              "memory",
+              "manual"
+            ],
+            "description": "ctx.trigger values that skip retrieval. [] restores the pre-4.0 behavior."
+          },
+          "nonHumanInput": {
+            "type": "boolean",
+            "default": true,
+            "description": "Skip when ctx.inputProvenance.kind is present and not external_user (inter-session messages, subagent announce/settle, internal system wakes)."
+          },
+          "allowSourceTools": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": [],
+            "description": "inputProvenance.sourceTool values still retrieved despite nonHumanInput."
+          },
+          "acknowledgements": {
+            "type": "boolean",
+            "default": true,
+            "description": "Skip whole-message greetings / thanks / short confirmations (FR+EN) on every channel."
+          }
+        }
+      },
+      "cache": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Per-session in-memory result cache keyed by (agent, session, normalized query, source, retrieval variant).",
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "default": true
+          },
+          "ttlMs": {
+            "type": "number",
+            "minimum": 0,
+            "default": 600000
+          },
+          "maxEntries": {
+            "type": "number",
+            "minimum": 0,
+            "default": 200
+          },
+          "maxBytes": {
+            "type": "number",
+            "minimum": 0,
+            "default": 8388608
+          }
+        }
+      },
+      "opik": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Export content-free retrieval timings (hook and knowledge_search) to Opik as traces: durations, route, policy and source ids only — never the query, retrieved text or session key.",
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "default": false
+          },
+          "apiUrl": {
+            "type": "string",
+            "default": "https://www.comet.com/opik/api",
+            "description": "Opik API base URL (self-hosted: http://<host>:5173/api)."
+          },
+          "apiKey": {
+            "type": "string",
+            "description": "Opik API key; ${VAR} supported. Defaults to the OPIK_API_KEY environment variable."
+          },
+          "workspace": {
+            "type": "string",
+            "description": "Opik Cloud workspace (Comet-Workspace header)."
+          },
+          "projectName": {
+            "type": "string",
+            "default": "openclaw-knowledge"
+          },
+          "includeSkipped": {
+            "type": "boolean",
+            "default": false,
+            "description": "Also export turns skipped before routing (heartbeat, sub-agent, acknowledgement, policy off/tool)."
+          },
+          "flushIntervalMs": {
+            "type": "number",
+            "minimum": 1000,
+            "default": 5000
+          },
+          "maxQueue": {
+            "type": "number",
+            "minimum": 1,
+            "default": 500
+          }
+        }
+      },
+      "sources": {
+        "type": "object",
+        "description": "Named knowledge sources. When omitted they are synthesized from the legacy flat keys (lightragUrl → id \"lightrag\", collections → id \"pgvector\").",
+        "additionalProperties": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "lightrag",
+                "pgvector"
+              ]
+            },
+            "label": {
+              "type": "string"
+            },
+            "description": {
+              "type": "string"
+            },
+            "enabled": {
+              "type": "boolean",
+              "default": true
+            },
+            "url": {
+              "type": "string",
+              "description": "LightRAG base URL (falls back to lightragUrl). Supports ${ENV_VAR}."
+            },
+            "apiKey": {
+              "type": "string",
+              "description": "LightRAG API key (falls back to lightragApiKey). Supports ${ENV_VAR}."
+            },
+            "collections": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "pgvector collections (falls back to collections)."
+            },
+            "queryMode": {
+              "type": "string",
+              "enum": [
+                "naive",
+                "local",
+                "global",
+                "hybrid",
+                "mix"
+              ]
+            },
+            "maxChars": {
+              "type": "number",
+              "minimum": 0
+            }
+          }
+        }
+      },
+      "defaults": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "injection": {
+            "type": "string",
+            "enum": [
+              "auto",
+              "tool",
+              "hybrid",
+              "off"
+            ],
+            "description": "auto: inject every eligible turn. tool: never inject; the model calls knowledge_search. hybrid: inject only when the router is confident (keyword hit or classifier score >= hybridMinScore), otherwise tool only. off: no injection and the tool refuses."
+          },
+          "sources": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Source ids used by default."
+          },
+          "allowedSources": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Source ids a session, one-shot or tool call MAY select (defaults to sources). Clients can never reach a source outside this list."
+          },
+          "topK": {
+            "type": "number",
+            "minimum": 1,
+            "maximum": 100,
+            "description": "pgvector top-K override."
+          },
+          "lightragQueryMode": {
+            "type": "string",
+            "enum": [
+              "naive",
+              "local",
+              "global",
+              "hybrid",
+              "mix"
+            ],
+            "description": "LightRAG mode override (wins over every route default)."
+          },
+          "allowSessionOverrides": {
+            "type": "boolean",
+            "default": true,
+            "description": "Honour per-session and one-shot overrides (Atrium, /knowledge)."
+          }
+        },
+        "description": "Global default policy for agents without their own entry. Default: injection auto, every enabled source."
+      },
+      "agents": {
+        "type": "object",
+        "description": "Per-agent policy keyed by OpenClaw agent id.",
+        "additionalProperties": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "injection": {
+              "type": "string",
+              "enum": [
+                "auto",
+                "tool",
+                "hybrid",
+                "off"
+              ],
+              "description": "auto: inject every eligible turn. tool: never inject; the model calls knowledge_search. hybrid: inject only when the router is confident (keyword hit or classifier score >= hybridMinScore), otherwise tool only. off: no injection and the tool refuses."
+            },
+            "sources": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Source ids used by default."
+            },
+            "allowedSources": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Source ids a session, one-shot or tool call MAY select (defaults to sources). Clients can never reach a source outside this list."
+            },
+            "topK": {
+              "type": "number",
+              "minimum": 1,
+              "maximum": 100,
+              "description": "pgvector top-K override."
+            },
+            "lightragQueryMode": {
+              "type": "string",
+              "enum": [
+                "naive",
+                "local",
+                "global",
+                "hybrid",
+                "mix"
+              ],
+              "description": "LightRAG mode override (wins over every route default)."
+            },
+            "allowSessionOverrides": {
+              "type": "boolean",
+              "default": true,
+              "description": "Honour per-session and one-shot overrides (Atrium, /knowledge)."
+            }
+          }
+        }
+      },
+      "hybridMinScore": {
+        "type": "number",
+        "minimum": 0,
+        "maximum": 1,
+        "default": 0.45,
+        "description": "hybrid injection: minimum classifier score to inject automatically."
+      },
+      "tool": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "On-demand knowledge_search agent tool (optional tool: allowlist it with tools.alsoAllow).",
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "default": true
+          },
+          "defaultTopK": {
+            "type": "number",
+            "minimum": 1,
+            "maximum": 100
+          },
+          "maxTopK": {
+            "type": "number",
+            "minimum": 1,
+            "maximum": 100,
+            "default": 20
+          }
+        }
+      },
+      "controlPlane": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Atrium / chat control plane.",
+        "properties": {
+          "sessionOverrides": {
+            "type": "boolean",
+            "default": true,
+            "description": "Honour per-session overrides stored in the session extension."
+          },
+          "oneShotTtlMs": {
+            "type": "number",
+            "minimum": 0,
+            "default": 600000,
+            "description": "A one-shot selection not consumed within this delay is ignored."
+          },
+          "command": {
+            "type": "boolean",
+            "default": true,
+            "description": "Register the /knowledge chat command."
+          },
+          "gatewayMethods": {
+            "type": "boolean",
+            "default": true,
+            "description": "Register knowledge.sources / knowledge.policy.get and the policy.* session actions."
+          }
+        }
+      },
       "testMode": {
         "type": "object",
         "additionalProperties": false,
@@ -231,14 +693,27 @@
             "type": "array",
             "items": {
               "oneOf": [
-                { "type": "string" },
+                {
+                  "type": "string"
+                },
                 {
                   "type": "object",
-                  "required": ["file_path"],
+                  "required": [
+                    "file_path"
+                  ],
                   "properties": {
-                    "file_path": { "type": "string" },
-                    "reference_id": { "type": "string" },
-                    "content": { "type": "array", "items": { "type": "string" } }
+                    "file_path": {
+                      "type": "string"
+                    },
+                    "reference_id": {
+                      "type": "string"
+                    },
+                    "content": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
                   }
                 }
               ]
@@ -306,7 +781,7 @@
     "lightragQueryMode": {
       "label": "LightRAG Query Mode",
       "advanced": true,
-      "help": "naive (vector), local (entity), global (community), hybrid (recommended)"
+      "help": "Legacy global mode; overrides the per-route defaults when set. naive (vector), local (entity), global (community), hybrid, mix"
     },
     "lightragMaxChars": {
       "label": "Max LightRAG chars",
@@ -332,7 +807,7 @@
     "jina.router.mode": {
       "label": "Router mode",
       "advanced": true,
-      "help": "heuristic: zero-cost rules only. jina-classifier: heuristics + Jina /v1/classify fallback."
+      "help": "heuristic: zero-cost rules only. jina-classifier: heuristics + Jina /v1/classify (serial). jina-classifier-parallel: sources start while the classifier runs (faster, costs a retrieval on skipped turns)."
     },
     "jina.router.classifierId": {
       "label": "Few-shot classifier ID",
@@ -343,6 +818,11 @@
       "label": "Classifier min confidence",
       "advanced": true,
       "help": "Floor on classifier score (0–1). Below this, the router falls back to ALL. Default 0.35 — keeps NONE decisions safe when zero-shot signal is too weak."
+    },
+    "jina.router.timeoutMs": {
+      "label": "Classifier timeout (ms)",
+      "advanced": true,
+      "help": "Jina classify timeout. Default 1500. Fails open to ALL."
     },
     "jina.pgvectorReranker.enabled": {
       "label": "Enable pgvector reranker",
@@ -393,6 +873,105 @@
       "label": "Mock LightRAG sources",
       "advanced": true,
       "help": "Canned LightRAG source file_paths for test mode. Surfaced through provenance as the 'Sources' panel. Defaults to a small synthetic set; set to [] for no source attribution."
+    },
+    "injectionTarget": {
+      "label": "Injection target",
+      "help": "prependContext (default, cache-friendly user-turn injection), appendContext, or appendSystemContext (pre-4.0, breaks prompt caching)."
+    },
+    "retrievalBudgetMs": {
+      "label": "Retrieval budget (ms)",
+      "advanced": true,
+      "help": "Per-turn budget; partial results are injected when it elapses. Default 4500."
+    },
+    "lightragTimeoutMs": {
+      "label": "LightRAG timeout (ms)",
+      "advanced": true,
+      "help": "Default 3500."
+    },
+    "pgvectorTimeoutMs": {
+      "label": "pgvector timeout (ms)",
+      "advanced": true,
+      "help": "Default 3000 (also PostgreSQL statement_timeout)."
+    },
+    "hookTimeoutMs": {
+      "label": "Hook timeout (ms)",
+      "advanced": true,
+      "help": "Default retrievalBudgetMs + 1500."
+    },
+    "lightragQueryModeByRoute": {
+      "label": "LightRAG mode per route",
+      "advanced": true,
+      "help": "PGVECTOR_ONLY / LIGHTRAG_ONLY / ALL / fallback / tool → naive|local|global|hybrid|mix."
+    },
+    "lightragLocalKeywords": {
+      "label": "Local LightRAG keywords",
+      "advanced": true,
+      "help": "Skip LightRAG's LLM keyword extraction by sending locally extracted keywords."
+    },
+    "skip.sessionPatterns": {
+      "label": "Skipped session patterns",
+      "advanced": true,
+      "help": "Default :subagent:, :active-memory:."
+    },
+    "skip.triggers": {
+      "label": "Skipped triggers",
+      "advanced": true,
+      "help": "Default heartbeat, cron, memory, manual. [] = pre-4.0."
+    },
+    "skip.nonHumanInput": {
+      "label": "Skip non-human input",
+      "advanced": true,
+      "help": "Skip inter-session / internal-system input (typed provenance)."
+    },
+    "skip.acknowledgements": {
+      "label": "Skip acknowledgements",
+      "advanced": true,
+      "help": "Skip 'merci', 'ok parfait', 'thanks!'... on every channel."
+    },
+    "cache.enabled": {
+      "label": "Per-session cache",
+      "advanced": true,
+      "help": "Cache retrieval results per session for cache.ttlMs (default 10 min)."
+    },
+    "sources": {
+      "label": "Named sources",
+      "advanced": true,
+      "help": "id → {type, label, description, url/apiKey (lightrag) | collections (pgvector)}. Omit to keep the legacy flat keys."
+    },
+    "defaults": {
+      "label": "Default policy",
+      "advanced": true,
+      "help": "{injection, sources, allowedSources, topK, lightragQueryMode, allowSessionOverrides} for agents without an entry."
+    },
+    "agents": {
+      "label": "Per-agent policy",
+      "advanced": true,
+      "help": "agentId → {injection auto|tool|hybrid|off, sources, allowedSources, ...}."
+    },
+    "hybridMinScore": {
+      "label": "Hybrid min score",
+      "advanced": true,
+      "help": "Classifier score required to auto-inject under the hybrid policy. Default 0.45."
+    },
+    "tool.enabled": {
+      "label": "knowledge_search tool",
+      "advanced": true,
+      "help": "Registers the optional tool; expose it with tools.alsoAllow: [\"knowledge_search\"]."
+    },
+    "controlPlane.sessionOverrides": {
+      "label": "Session overrides",
+      "advanced": true,
+      "help": "Let Atrium / /knowledge change the policy per conversation (validated against the agent allowlist)."
+    },
+    "controlPlane.command": {
+      "label": "/knowledge command",
+      "advanced": true,
+      "help": "Chat command to show or change the policy (bypasses the LLM)."
+    },
+    "controlPlane.gatewayMethods": {
+      "label": "Gateway methods",
+      "advanced": true,
+      "help": "knowledge.sources, knowledge.policy.get and the policy.* session actions."
     }
   }
 }

@@ -5,18 +5,23 @@
 // `definePluginEntry(...)` export) keeps the tests decoupled from SDK runtime
 // initialization while still covering the real registration path.
 
-import { describe, it, afterEach, mock } from "node:test";
+import { describe, it, afterEach, beforeEach, mock } from "node:test";
 import assert from "node:assert/strict";
 
 import plugin, {
   registerKnowledgePlugin,
   renderMockResponse,
+  resetSharedStateForTests,
 } from "../src/index.js";
 import { buildLightRAGProvenance } from "../src/provenance.js";
 import type {
   BeforePromptBuildEvent,
   BeforePromptBuildResult,
 } from "../src/types.js";
+
+// Breakers, cache and run ids are process-wide (they survive the host's
+// per-run re-registration): start every test from a clean process state.
+beforeEach(() => resetSharedStateForTests());
 
 // ---------------------------------------------------------------------------
 // Fake plugin API
@@ -69,6 +74,17 @@ function makeFakeApi(
     },
   };
   return { api, state };
+}
+
+/**
+ * The knowledge block, whichever injection target carried it (4.0.0 default
+ * is `prependContext`; `appendSystemContext` is the pre-4.0 behavior).
+ */
+function injectedText(result: BeforePromptBuildResult | undefined): string {
+  assert.ok(result, "expected an injection result");
+  const text = result.prependContext ?? result.appendContext ?? result.appendSystemContext;
+  assert.equal(typeof text, "string", "expected exactly one injection field");
+  return text as string;
 }
 
 // `registerKnowledgePlugin` expects a full OpenClawPluginApi. We cast the
@@ -368,9 +384,9 @@ describe("before_prompt_build — LightRAG execution", () => {
     });
 
     assert.ok(result);
-    assert.ok(result!.appendSystemContext.includes("Knowledge Graph Context (LightRAG)"));
-    assert.ok(result!.appendSystemContext.includes("ACME Corp"));
-    assert.ok(result!.appendSystemContext.includes("Relevant Knowledge Base"));
+    assert.ok(injectedText(result).includes("Knowledge Graph Context (LightRAG)"));
+    assert.ok(injectedText(result).includes("ACME Corp"));
+    assert.ok(injectedText(result).includes("Relevant Knowledge Base"));
   });
 
   it("returns undefined when LightRAG returns empty context", async () => {
@@ -408,7 +424,32 @@ describe("before_prompt_build — LightRAG execution", () => {
     });
 
     assert.ok(result);
-    assert.ok(result!.appendSystemContext.length < 300);
+    // The LightRAG body itself is cut to lightragMaxChars (the fenced
+    // user-message wrapper adds a fixed header, not context).
+    const aCount = Math.max(0, ...(injectedText(result).match(/A{5,}/g) ?? []).map((m) => m.length));
+    assert.ok(aCount <= 50, `expected <= 50 context chars, got ${aCount}`);
+  });
+
+  it("keeps the pre-4.0 compact block with injectionTarget=appendSystemContext", async () => {
+    const { api, state } = makeFakeApi({
+      lightragUrl: "http://lightrag:9621",
+      lightragMaxChars: 50,
+      injectionTarget: "appendSystemContext",
+    });
+
+    mock.method(globalThis, "fetch", async () => ({
+      ok: true,
+      json: async () => ({ response: "A".repeat(200) }),
+    }) as unknown as Response);
+
+    register(api);
+    const result = await state.handlers["before_prompt_build"]!({
+      messages: [{ role: "user", content: "long context query" }],
+    });
+
+    assert.ok(result);
+    assert.equal(result!.prependContext, undefined);
+    assert.ok(result!.appendSystemContext!.length < 300);
   });
 });
 
@@ -445,7 +486,7 @@ describe("before_prompt_build — graceful degradation", () => {
     });
 
     assert.ok(result);
-    assert.ok(result!.appendSystemContext.includes("LightRAG context here"));
+    assert.ok(injectedText(result).includes("LightRAG context here"));
     assert.ok(state.errors.some((e) => e.includes("source failed")));
   });
 
@@ -566,9 +607,28 @@ describe("before_prompt_build — router gate", () => {
     assert.equal(fetchCalled, false);
   });
 
-  it("does NOT skip on ctx.trigger=heartbeat when the router is disabled (back-compat)", async () => {
+  it("skips ctx.trigger=heartbeat even when the router is disabled (4.0 skip stage)", async () => {
+    let fetchCalled = false;
+    mock.method(globalThis, "fetch", async () => {
+      fetchCalled = true;
+      return new Response("{}", { status: 200 });
+    });
+
+    const { api, state } = makeFakeApi({ lightragUrl: "http://lightrag:9621" });
+    register(api);
+
+    const result = await state.handlers["before_prompt_build"]!(
+      { messages: [{ role: "user", content: "a longer query here" }] },
+      { trigger: "heartbeat" },
+    );
+    assert.equal(result, undefined);
+    assert.equal(fetchCalled, false);
+  });
+
+  it("does NOT skip heartbeats with skip.triggers=[] and the router disabled (pre-4.0 behavior)", async () => {
     // Pre-3.2.0 behavior: heartbeats DID call sources because the plugin
-    // had no way to know they were heartbeats.
+    // had no way to know they were heartbeats. 4.0 skips them by default;
+    // an empty `skip.triggers` restores the old behavior.
     let fetchCalled = false;
     mock.method(globalThis, "fetch", async () => {
       fetchCalled = true;
@@ -580,6 +640,7 @@ describe("before_prompt_build — router gate", () => {
 
     const { api, state } = makeFakeApi({
       lightragUrl: "http://lightrag:9621",
+      skip: { triggers: [] },
       // No jina block → router disabled
     });
     register(api);
@@ -1129,7 +1190,7 @@ describe("before_prompt_build — v3.2.3 OWUI auto-prompt short-circuit", () => 
 
     // The real `### Task:` prompt MUST reach the knowledge base.
     assert.ok(result);
-    assert.ok(result!.appendSystemContext.includes("Knowledge Graph Context"));
+    assert.ok(injectedText(result).includes("Knowledge Graph Context"));
   });
 
   it("does NOT short-circuit a structured JSON-output user task with a non-OWUI key (Codex pass #29 P2)", async () => {
@@ -1163,7 +1224,7 @@ describe("before_prompt_build — v3.2.3 OWUI auto-prompt short-circuit", () => 
 
     // The structured user task MUST reach the knowledge base.
     assert.ok(result);
-    assert.ok(result!.appendSystemContext.includes("Knowledge Graph Context"));
+    assert.ok(injectedText(result).includes("Knowledge Graph Context"));
   });
 
   it("does NOT short-circuit when a user pastes the OWUI block but asks something after (Codex pass #31 P2)", async () => {
@@ -1199,7 +1260,7 @@ describe("before_prompt_build — v3.2.3 OWUI auto-prompt short-circuit", () => 
 
     // The user has a real question AFTER the template — reaches the KB.
     assert.ok(result);
-    assert.ok(result!.appendSystemContext.includes("Knowledge Graph Context"));
+    assert.ok(injectedText(result).includes("Knowledge Graph Context"));
   });
 
   it("does NOT short-circuit a user `{ summary: ... }` request without chat_history (Codex pass #30 P2)", async () => {
@@ -1235,7 +1296,7 @@ describe("before_prompt_build — v3.2.3 OWUI auto-prompt short-circuit", () => 
 
     // No `<chat_history>` block → the user request reaches LightRAG.
     assert.ok(result);
-    assert.ok(result!.appendSystemContext.includes("Knowledge Graph Context"));
+    assert.ok(injectedText(result).includes("Knowledge Graph Context"));
   });
 
   it("does NOT short-circuit when a real query QUOTES the OWUI template later in the body", async () => {
@@ -1265,7 +1326,7 @@ describe("before_prompt_build — v3.2.3 OWUI auto-prompt short-circuit", () => 
 
     // LightRAG WAS called → result should be defined and contain context.
     assert.ok(result);
-    assert.ok(result!.appendSystemContext.includes("Knowledge Graph Context"));
+    assert.ok(injectedText(result).includes("Knowledge Graph Context"));
   });
 });
 
@@ -1399,7 +1460,7 @@ describe("before_prompt_build — TEST mode", () => {
     assert.equal(fetchMock.mock.callCount(), 0);
 
     assert.ok(result);
-    const ctx = result!.appendSystemContext;
+    const ctx = injectedText(result);
     assert.ok(ctx.includes("Relevant Knowledge Base"));
     assert.ok(ctx.includes("Document Search Results (pgvector)"));
     assert.ok(ctx.includes("Knowledge Graph Context (LightRAG)"));
@@ -1428,7 +1489,7 @@ describe("before_prompt_build — TEST mode", () => {
 
     assert.ok(result);
     assert.ok(
-      result!.appendSystemContext.includes(
+      injectedText(result).includes(
         "the question: what is the Hélios reference id?",
       ),
     );
@@ -1488,7 +1549,7 @@ describe("before_prompt_build — TEST mode", () => {
     });
 
     assert.ok(result);
-    const ctx = result!.appendSystemContext;
+    const ctx = injectedText(result);
     assert.ok(ctx.includes("Knowledge Graph Context (LightRAG)"));
     assert.ok(!ctx.includes("Document Search Results (pgvector)"));
   });
@@ -1517,7 +1578,7 @@ describe("before_prompt_build — TEST mode", () => {
     });
 
     assert.ok(result);
-    const ctx = result!.appendSystemContext;
+    const ctx = injectedText(result);
     assert.ok(ctx.includes("secret-plan.md"));
     assert.ok(ctx.includes("2026-07-01"));
     assert.ok(!ctx.includes("Knowledge Graph Context (LightRAG)"));
