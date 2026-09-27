@@ -4,6 +4,7 @@
 
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 
 import { resolveEnv, resolveConfig } from "../src/config.js";
 
@@ -436,6 +437,31 @@ describe("resolveConfig — 4.0 keys", () => {
       gatewayMethods: true,
     });
     assert.deepEqual(cfg.configWarnings, []);
+  });
+
+  it("the manifest has no default on keys whose absence means inherit", () => {
+    // OpenClaw hydrates manifest defaults into pluginConfig at load time
+    // (validatePluginConfig → applyDefaults), so a default here would turn
+    // "inherit" into an explicit override.
+    type Prop = { default?: unknown; additionalProperties?: { properties: Record<string, Prop> } };
+    const manifest = JSON.parse(readFileSync(new URL("../../openclaw.plugin.json", import.meta.url), "utf8")) as {
+      configSchema: { properties: Record<string, Prop> };
+    };
+    const props = manifest.configSchema.properties;
+    assert.equal(props.lightragQueryMode!.default, undefined);
+    const agentEntry = props.agents!.additionalProperties!.properties;
+    for (const key of ["injection", "sources", "allowedSources", "allowSessionOverrides", "lightragQueryMode", "topK"]) {
+      assert.equal(agentEntry[key]?.default, undefined, `agents.<id>.${key} must not have a default`);
+    }
+  });
+
+  it("a hydrated agent entry inherits allowSessionOverrides from defaults", () => {
+    const cfg = resolveConfig({
+      lightragUrl: "x",
+      defaults: { allowSessionOverrides: false },
+      agents: { denis: { injection: "hybrid" } },
+    });
+    assert.equal(cfg.agentPolicies.denis!.allowSessionOverrides, false);
   });
 
   it("an explicit legacy lightragQueryMode overrides every route default", () => {

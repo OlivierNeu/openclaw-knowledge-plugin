@@ -2,7 +2,7 @@
   "id": "openclaw-knowledge",
   "name": "Knowledge Base",
   "description": "Multi-source knowledge search (named pgvector collections + LightRAG graphs) with optional Jina router & reranker — injects relevant documents on the user turn (cache-friendly) under a strict latency budget, plus an on-demand knowledge_search tool and a per-agent / per-session policy control plane",
-  "version": "4.0.1",
+  "version": "4.0.2",
   "activation": {
     "onStartup": true
   },
@@ -85,7 +85,6 @@
           "hybrid",
           "mix"
         ],
-        "default": "hybrid",
         "description": "Legacy global LightRAG query mode. When set explicitly it overrides every per-route default (pre-4.0 semantics); lightragQueryModeByRoute entries still win over it. When omitted, 4.0 uses per-route defaults (naive for simple lookups and tool calls, hybrid for graph questions)."
       },
       "lightragMaxChars": {
@@ -583,7 +582,6 @@
             },
             "allowSessionOverrides": {
               "type": "boolean",
-              "default": true,
               "description": "Honour per-session and one-shot overrides (Atrium, /knowledge)."
             }
           }

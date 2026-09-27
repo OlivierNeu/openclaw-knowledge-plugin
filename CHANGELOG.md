@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.0.2] - 2026-09-27
+
+### Fixed
+
+- The manifest no longer declares a default for the legacy `lightragQueryMode`.
+  OpenClaw hydrates manifest defaults into `pluginConfig` when it loads a plugin
+  (`validatePluginConfig` → `applyDefaults: true`), so the plugin always received
+  `lightragQueryMode: "hybrid"` as if the operator had set it — and an explicit
+  global mode overrides every 4.0 per-route default. On 4.0.0 / 4.0.1 simple
+  lookups and `knowledge_search` therefore ran in `hybrid` instead of `naive`. The
+  value is not in `openclaw.json` (config unset cannot remove it): upgrade.
+- Same root cause: `agents.<id>.allowSessionOverrides` no longer defaults to
+  `true` in the manifest. Hydrated, that default made every configured agent
+  ignore `defaults.allowSessionOverrides: false` (session / per-prompt overrides
+  stayed allowed although the operator disabled them globally).
+
 ## [4.0.1] - 2026-09-27
 
 No runtime change: same behavior as 4.0.0.
