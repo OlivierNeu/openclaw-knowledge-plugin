@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.0.3] - 2026-09-27
+
+### Fixed
+
+- `/knowledge` reads only the first line of its arguments. The host passes the
+  whole message body after the command name, and a client may append standing
+  instructions to every message (Atrium's `[LIVRAISON]` media-delivery block):
+  `/knowledge` answered "unknown subcommand: [livraison]" and `/knowledge once graph`
+  failed with "oneShot.sources must be a non-empty array of at most 16 source ids".
+
 ## [4.0.2] - 2026-09-27
 
 ### Fixed

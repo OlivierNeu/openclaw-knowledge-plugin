@@ -582,7 +582,10 @@ export type KnowledgeCommand =
  *   status | on | off | tool | auto | hybrid | use <id,id> | once <id,id> | reset | help
  */
 export function parseKnowledgeCommand(args: string | undefined): KnowledgeCommand {
-  const text = (args ?? "").trim();
+  // A chat command is one line. Clients may append standing instructions after
+  // the user's text (Atrium's "[LIVRAISON]" block), and the host passes
+  // everything after the command name as args — only the first line is ours.
+  const text = (args ?? "").split(/\r?\n/, 1)[0]!.trim();
   if (!text) return { kind: "status" };
   const [verbRaw, ...rest] = text.split(/\s+/);
   const verb = (verbRaw ?? "").toLowerCase();

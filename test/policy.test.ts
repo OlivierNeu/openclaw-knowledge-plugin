@@ -416,3 +416,19 @@ describe("one-shot consumption — concurrency and replay", () => {
     assert.equal(applyOneShotConsumption({}, consumption!), undefined);
   });
 });
+
+describe("parseKnowledgeCommand — client-appended text", () => {
+  const appended = "\n[LIVRAISON]\nPour qu'un fichier que tu génères soit téléchargeable par l'utilisateur dans ce webchat : écris-le sous /x/ puis ajoute une ligne MEDIA:<chemin>.";
+
+  it("reads only the first line of the arguments", () => {
+    assert.deepEqual(parseKnowledgeCommand(appended), { kind: "status" });
+    assert.deepEqual(parseKnowledgeCommand(`once graph${appended}`), {
+      kind: "set",
+      patch: { oneShot: { injection: "auto", sources: ["graph"] } },
+    });
+    assert.deepEqual(parseKnowledgeCommand(`use graph,docs\r\nextra`), {
+      kind: "set",
+      patch: { sources: ["graph", "docs"] },
+    });
+  });
+});
