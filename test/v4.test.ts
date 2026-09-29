@@ -538,7 +538,8 @@ describe("4.0 — knowledge_search tool guards", () => {
       graph: { type: "lightrag", url: "http://lr:9621" },
       docs: { type: "pgvector", collections: ["knowledge_jerome"] },
     },
-    agents: { denis: { sources: ["graph"] } },
+    // 4.1: an explicit allowlist narrows (`sources` alone no longer does).
+    agents: { denis: { sources: ["graph"], allowedSources: ["graph"] } },
     testMode: { enabled: true },
   };
 
@@ -585,7 +586,8 @@ describe("4.0 — control plane", () => {
     },
     agents: {
       jerome: { sources: ["graph"], allowedSources: ["graph", "docs"] },
-      denis: { sources: ["graph"] },
+      // 4.1: an explicit allowlist narrows (`sources` alone no longer does).
+      denis: { sources: ["graph"], allowedSources: ["graph"] },
     },
   };
   const sessionKey = "agent:jerome:telegram:direct:42";
@@ -753,6 +755,145 @@ describe("4.0 — control plane", () => {
       state: { injection: "tool", lastOneShot: { sources: ["graph"], runId: "x" }, bogus: 1 },
     }) as Record<string, unknown>;
     assert.deepEqual(projected, { v: 1, injection: "tool" });
+  });
+});
+
+describe("4.1 — control-plane contract 2 (allowlist inheritance)", () => {
+  const registry = {
+    graph: { type: "lightrag", label: "Graph", url: "http://lr:9621" },
+    wiki: { type: "lightrag", label: "Wiki", url: "http://wiki:9621" },
+    docs: { type: "pgvector", label: "Docs", collections: ["knowledge_jerome"] },
+  };
+  const agents = {
+    // What a client writes to change an agent's default: `sources` only.
+    denis: { sources: ["graph"] },
+    pinned: { sources: ["graph"], allowedSources: ["graph", "wiki"] },
+  };
+  const config = { geminiApiKey: "g", sources: registry, agents };
+  const sessionKey = "agent:denis:atrium:conv-1";
+
+  function sourcesOf(cap: Captured, agentId?: string): Record<string, unknown> {
+    let payload: Record<string, unknown> | undefined;
+    cap.gatewayMethods["knowledge.sources"]!.handler({
+      params: agentId ? { agentId } : {},
+      respond: (ok: boolean, p: Record<string, unknown>) => {
+        assert.equal(ok, true);
+        payload = p;
+      },
+    });
+    return payload!;
+  }
+  const ids = (payload: Record<string, unknown>) =>
+    (payload.sources as Array<{ id: string }>).map((s) => s.id);
+
+  it("knowledge.sources exposes contract 2, the inherited allowlist and its origin", () => {
+    const { api, cap } = makeHost(config);
+    register(api);
+    const denis = sourcesOf(cap, "denis");
+    assert.equal(denis.contract, 2);
+    assert.equal(denis.configured, true);
+    assert.equal(denis.allowedOrigin, "inherited");
+    assert.deepEqual(denis.defaultSources, ["graph"]);
+    assert.deepEqual(
+      (denis.sources as Array<{ id: string; default: boolean }>).map((s) => [s.id, s.default]),
+      [["graph", true], ["wiki", false], ["docs", false]],
+    );
+
+    const pinned = sourcesOf(cap, "pinned");
+    assert.equal(pinned.contract, 2);
+    assert.equal(pinned.allowedOrigin, "own");
+    assert.deepEqual(ids(pinned), ["graph", "wiki"]);
+
+    // An agent without an entry, and the global level (no own allowlist).
+    assert.equal(sourcesOf(cap, "stranger").allowedOrigin, "inherited");
+    assert.equal(sourcesOf(cap).allowedOrigin, "inherited");
+    assert.equal(sourcesOf(cap).contract, 2);
+  });
+
+  it("the defaults level reports `own` once defaults.allowedSources is set", () => {
+    const { api, cap } = makeHost({ ...config, defaults: { allowedSources: ["graph", "wiki"] } });
+    register(api);
+    assert.equal(sourcesOf(cap).allowedOrigin, "own");
+    // …while an agent that only sets `sources` still inherits it.
+    assert.equal(sourcesOf(cap, "denis").allowedOrigin, "inherited");
+    assert.deepEqual(ids(sourcesOf(cap, "denis")), ["graph", "wiki"]);
+  });
+
+  it("policy.get / knowledge.policy.get agree with knowledge.sources", async () => {
+    const { api, cap } = makeHost(config);
+    register(api);
+    const listed = sourcesOf(cap, "denis");
+    const action = (await cap.sessionActions["policy.get"]!.handler({ sessionKey, agentId: "denis" })) as {
+      ok: boolean;
+      result: Record<string, unknown>;
+    };
+    let method: Record<string, unknown> | undefined;
+    cap.gatewayMethods["knowledge.policy.get"]!.handler({
+      params: { sessionKey },
+      respond: (_ok: boolean, p: Record<string, unknown>) => (method = p),
+    });
+    for (const snap of [action.result, method!]) {
+      assert.equal(snap.contract, 2);
+      assert.equal(snap.agentId, "denis");
+      assert.equal(snap.allowedOrigin, "inherited");
+      assert.deepEqual(snap.allowedSources, ids(listed));
+      assert.deepEqual(ids(snap), ids(listed));
+      assert.deepEqual(snap.effectiveSources, listed.defaultSources);
+      assert.deepEqual(snap.origin, { injection: "agent", sources: "agent" });
+    }
+  });
+
+  it("an explicit one-shot beyond `sources` is accepted and searched; /knowledge and the tool agree", async () => {
+    const urls: string[] = [];
+    mock.method(globalThis, "fetch", async (url: string | URL | Request) => {
+      urls.push(String(url));
+      return lightragResponse("Wiki ctx.");
+    });
+    const { api, cap } = makeHost(config);
+    register(api);
+    const set = (await cap.sessionActions["policy.set"]!.handler({
+      sessionKey,
+      agentId: "denis",
+      payload: { oneShot: { sources: ["wiki"] } },
+    })) as { ok: boolean; result?: Record<string, unknown> };
+    assert.equal(set.ok, true);
+    assert.equal(set.result?.contract, 2);
+
+    const out = await cap.handler!({ prompt: "what is the budget" }, { agentId: "denis", sessionKey });
+    assert.ok(out?.prependContext?.includes("Wiki ctx."));
+    assert.ok(urls.some((u) => u.includes("wiki:9621")));
+    assert.equal(urls.some((u) => u.includes("lr:9621")), false);
+
+    const status = await cap.commands.knowledge!.handler({ args: "", agentId: "denis", sessionKey });
+    assert.ok(status.text.includes("wiki — Wiki"));
+    const tool = await cap.toolFactory!({ agentId: "denis", sessionKey }).execute("c", {
+      query: "budget",
+      sources: ["wiki"],
+    });
+    assert.notEqual(tool.details.status, "invalid");
+  });
+
+  it("a global revocation reaches every read and write surface of a non-pinned agent", async () => {
+    const { api, cap } = makeHost({ ...config, defaults: { allowedSources: ["graph"] } });
+    register(api);
+    assert.deepEqual(ids(sourcesOf(cap, "denis")), ["graph"]);
+    // The pinned agent keeps its own list (why clients must never pin it).
+    assert.deepEqual(ids(sourcesOf(cap, "pinned")), ["graph", "wiki"]);
+
+    const denied = (await cap.sessionActions["policy.set"]!.handler({
+      sessionKey,
+      agentId: "denis",
+      payload: { oneShot: { sources: ["wiki"] } },
+    })) as { ok: boolean; code?: string };
+    assert.equal(denied.ok, false);
+    assert.equal(denied.code, "source_not_allowed");
+    const cmd = await cap.commands.knowledge!.handler({ args: "use wiki", agentId: "denis", sessionKey });
+    assert.ok(cmd.text.includes("not allowed"));
+    const tool = await cap.toolFactory!({ agentId: "denis", sessionKey }).execute("c", {
+      query: "budget",
+      sources: ["wiki"],
+    });
+    assert.equal(tool.details.status, "invalid");
   });
 });
 

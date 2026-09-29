@@ -293,11 +293,16 @@ export interface KnowledgeSourcePluginConfig {
 /** @since 4.0.0 */
 export interface KnowledgeAgentPolicyPluginConfig {
   injection?: InjectionPolicy;
-  /** Source ids used by default for this agent. */
+  /**
+   * Source ids used by default for this agent (clamped to `allowedSources`).
+   * Only the default selection: it never narrows the allowlist (4.1.0).
+   */
   sources?: string[];
   /**
    * Source ids a session / one-shot / tool call MAY select for this agent.
-   * Defaults to `sources`. Clients can never reach a source outside this list.
+   * Defaults to the parent level's allowlist (`defaults.allowedSources`, else
+   * every enabled source) — NOT to `sources` (changed in 4.1.0). Clients can
+   * never reach a source outside this list.
    */
   allowedSources?: string[];
   /** pgvector top-K override. */
@@ -692,8 +697,14 @@ export interface ResolvedKnowledgeSource {
 /** @since 4.0.0 */
 export interface ResolvedAgentPolicy {
   injection: InjectionPolicy;
+  /** Default selection, always a subset of `allowedSources`. */
   sources: string[];
   allowedSources: string[];
+  /**
+   * Whether this level set `allowedSources` itself (`own`) or inherited its
+   * parent's allowlist (`inherited`). @since 4.1.0
+   */
+  allowedOrigin: "own" | "inherited";
   topK?: number;
   lightragQueryMode?: LightRAGQueryMode;
   allowSessionOverrides: boolean;

@@ -203,6 +203,20 @@ export function agentPolicyFor(
   return (agentId && config.agentPolicies[agentId]) || config.defaultPolicy;
 }
 
+/**
+ * Whether the agent's allowlist is its own (`agents.<id>.allowedSources`) or
+ * inherited from `defaults` / the built-in "every enabled source". An agent
+ * without an entry always inherits; without `agentId` this describes the
+ * `defaults` level itself.
+ */
+export function allowedOriginFor(
+  config: ResolvedKnowledgeConfig,
+  agentId: string | undefined,
+): "own" | "inherited" {
+  if (agentId) return config.agentPolicies[agentId]?.allowedOrigin ?? "inherited";
+  return config.defaultPolicy.allowedOrigin;
+}
+
 /** Enabled sources the agent may use, in registry order. */
 export function allowedSourcesFor(
   config: ResolvedKnowledgeConfig,

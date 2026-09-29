@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.1.0] - 2026-09-28
+
+### Changed — an agent's `sources` no longer doubles as its allowlist
+
+- **Behavior change for existing configs.** A policy level (`defaults` or
+  `agents.<id>`) without its own `allowedSources` now **inherits its parent's
+  allowlist** (`defaults.allowedSources`, else every enabled source) instead of
+  using its own `sources` as the allowlist. `sources` is only the default
+  selection: effective default = `(sources ?? parent sources) ∩ allowedSources`.
+  An agent that has `sources` but no `allowedSources` keeps the same default
+  selection, but its explicit session / one-shot / `knowledge_search` selections
+  may now reach the wider inherited allowlist.
+  **Migration: to keep the old narrowing, set `allowedSources` explicitly = your
+  `sources`** (e.g. `"denis": { "sources": ["docs"], "allowedSources": ["docs"] }`).
+- Why: a client (Atrium) that edits an agent's **default** by writing
+  `agents.<id>.sources` through `config.patch` also narrowed what the agent was
+  allowed to search; pinning `allowedSources` instead would freeze the agent off
+  later revocations in `defaults.allowedSources`. Now a global revocation reaches
+  every agent without its own allowlist, and editing a default never changes an
+  entitlement.
+- Ids in a level's own `sources` that fall outside its allowlist are dropped with a
+  config warning (`agents.<id>.sources: source id(s) "x" not in allowedSources —
+  ignored`). In 4.0.x such ids silently **widened** the agent's allowlist past
+  `defaults.allowedSources`; they are now clamped. Unknown / disabled id handling
+  is unchanged.
+- An explicit `allowedSources` still wins over the parent list (narrower or wider),
+  as before.
+
+### Added
+
+- Control-plane contract version for client feature detection: `knowledge.sources`
+  and every policy snapshot (`policy.get` / `policy.set` / `policy.reset` results,
+  `knowledge.policy.get`) carry `"contract": 2` (absent = 4.0.x semantics). Every
+  existing field keeps its meaning.
+- `allowedOrigin: "own" | "inherited"` in `knowledge.sources` and policy snapshots:
+  whether the agent sets `allowedSources` itself or follows the global allowlist
+  (an agent without an entry is always `inherited`; without `agentId`, it describes
+  the `defaults` level).
+- `docs/atrium-integration.md` §1.1: normative allowlist resolution, contract 1 vs
+  2, and the client rule "write only `sources` / `injection` to change a default;
+  never pin `allowedSources`".
+
 ## [4.0.3] - 2026-09-27
 
 ### Fixed

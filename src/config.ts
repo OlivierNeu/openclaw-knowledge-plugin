@@ -290,6 +290,7 @@ export function resolveConfig(
       injection: "auto",
       sources: enabledIds,
       allowedSources: enabledIds,
+      allowedOrigin: "inherited",
       allowSessionOverrides: true,
     },
     knownIds,
@@ -673,8 +674,17 @@ function resolveSources(
 /**
  * Resolve one policy level on top of `base`. Unknown ids are dropped with a
  * warning; ids of disabled sources are dropped silently (they may come back
- * once credentials are configured). `allowedSources` defaults to `sources`
- * and `sources` is always clamped to `allowedSources`.
+ * once credentials are configured).
+ *
+ * Since 4.1.0 (control-plane contract 2) the two lists are independent:
+ *   - `allowedSources` = this level's own list, else the PARENT's allowlist
+ *     (`defaults.allowedSources`, else every enabled source). A level's
+ *     `sources` never narrows what may be selected, so a client editing an
+ *     agent's default selection does not change its entitlement, and a
+ *     revocation at the parent level reaches every agent without its own list.
+ *   - `sources` (the default selection) = this level's own list, else the
+ *     parent's, always clamped to `allowedSources`. Own ids outside the
+ *     allowlist are dropped with a warning.
  */
 function resolvePolicy(
   raw: KnowledgeAgentPolicyPluginConfig | undefined,
@@ -699,12 +709,19 @@ function resolvePolicy(
   };
   const sources = filterIds(stringList(policy.sources), "sources");
   const allowedExplicit = filterIds(stringList(policy.allowedSources), "allowedSources");
-  const allowedSources = allowedExplicit ?? sources ?? base.allowedSources;
+  const allowedSources = allowedExplicit ?? base.allowedSources;
+  const outside = (sources ?? []).filter((id) => !allowedSources.includes(id));
+  if (outside.length > 0) {
+    warnings.push(
+      `${path}.sources: source id(s) ${outside.map((id) => `"${id}"`).join(", ")} not in allowedSources — ignored`,
+    );
+  }
   const effectiveSources = (sources ?? base.sources).filter((id) => allowedSources.includes(id));
   return {
     injection: isInjectionPolicy(policy.injection) ? policy.injection : base.injection,
     sources: effectiveSources,
     allowedSources,
+    allowedOrigin: allowedExplicit ? "own" : "inherited",
     ...(typeof policy.topK === "number" && policy.topK >= 1
       ? { topK: Math.floor(policy.topK) }
       : base.topK !== undefined

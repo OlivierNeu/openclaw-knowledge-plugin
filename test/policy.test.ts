@@ -14,6 +14,7 @@ import {
   resolveEffectivePolicy,
   sanitizeSessionState,
 } from "../src/policy.js";
+import type { KnowledgeSourcePluginConfig } from "../src/types.js";
 
 function multiSourceConfig(extra: Record<string, unknown> = {}) {
   return resolveConfig({
@@ -27,7 +28,7 @@ function multiSourceConfig(extra: Record<string, unknown> = {}) {
     defaults: { sources: ["graph"], allowedSources: ["graph", "docs"] },
     agents: {
       jerome: { injection: "auto", sources: ["graph", "docs"], allowedSources: ["graph", "docs", "shared"] },
-      files: { injection: "tool", sources: ["docs"] },
+      files: { injection: "tool", sources: ["docs"], allowedSources: ["docs"] },
       locked: { sources: ["graph"], allowSessionOverrides: false },
     },
     ...extra,
@@ -194,7 +195,7 @@ describe("resolveEffectivePolicy — security invariant", () => {
   const cfg = multiSourceConfig();
 
   it("drops session sources the agent is not allowed to reach", () => {
-    // `files` may only use `docs` (allowedSources defaults to sources).
+    // `files` may only use `docs` (its own allowedSources).
     const { policy } = resolveEffectivePolicy({
       config: cfg,
       agentId: "files",
@@ -430,5 +431,155 @@ describe("parseKnowledgeCommand — client-appended text", () => {
       kind: "set",
       patch: { sources: ["graph", "docs"] },
     });
+  });
+});
+
+// 4.1.0 (control-plane contract 2): `sources` is only the default selection; an
+// agent without its own `allowedSources` inherits the parent allowlist.
+describe("resolveConfig — allowlist inheritance (4.1 contract 2)", () => {
+  const registry: Record<string, KnowledgeSourcePluginConfig> = {
+    graph: { type: "lightrag", label: "Graph", url: "http://lr-a:9621" },
+    docs: { type: "pgvector", label: "Docs", collections: ["knowledge_jerome"] },
+    shared: { type: "lightrag", label: "Shared", url: "http://lr-shared:9621" },
+    dormant: { type: "lightrag", label: "Dormant", url: "http://lr-d:9621", enabled: false },
+  };
+  const build = (policies: Record<string, unknown>) =>
+    resolveConfig({ geminiApiKey: "g", sources: registry, ...policies });
+  const sourcesWarnings = (cfg: ReturnType<typeof build>, agentId: string) =>
+    cfg.configWarnings.filter((w) => w.startsWith(`agents.${agentId}.sources`));
+
+  it("own allowlist: kept as written, default selection inside it", () => {
+    const cfg = build({ agents: { a: { sources: ["graph"], allowedSources: ["graph", "docs"] } } });
+    assert.deepEqual(cfg.agentPolicies.a!.allowedSources, ["graph", "docs"]);
+    assert.deepEqual(cfg.agentPolicies.a!.sources, ["graph"]);
+    assert.equal(cfg.agentPolicies.a!.allowedOrigin, "own");
+  });
+
+  it("sources without allowedSources no longer narrows: inherits every enabled source", () => {
+    const cfg = build({ agents: { a: { sources: ["graph"] } } });
+    assert.deepEqual(cfg.agentPolicies.a!.allowedSources, ["graph", "docs", "shared"]);
+    assert.deepEqual(cfg.agentPolicies.a!.sources, ["graph"]);
+    assert.equal(cfg.agentPolicies.a!.allowedOrigin, "inherited");
+  });
+
+  it("inherits defaults.allowedSources; the narrower default selection leaves it unchanged", () => {
+    const cfg = build({
+      defaults: { allowedSources: ["graph", "docs"] },
+      agents: { a: { sources: ["docs"] } },
+    });
+    assert.deepEqual(cfg.agentPolicies.a!.allowedSources, ["graph", "docs"]);
+    assert.deepEqual(cfg.agentPolicies.a!.sources, ["docs"]);
+    assert.deepEqual(sourcesWarnings(cfg, "a"), []);
+  });
+
+  it("the defaults level itself: `sources` alone keeps every enabled source allowed", () => {
+    const cfg = build({ defaults: { sources: ["graph"] } });
+    assert.deepEqual(cfg.defaultPolicy.sources, ["graph"]);
+    assert.deepEqual(cfg.defaultPolicy.allowedSources, ["graph", "docs", "shared"]);
+    assert.equal(cfg.defaultPolicy.allowedOrigin, "inherited");
+    assert.equal(build({ defaults: { allowedSources: ["graph"] } }).defaultPolicy.allowedOrigin, "own");
+  });
+
+  it("own sources outside the inherited allowlist are clamped with a warning (no widening)", () => {
+    const cfg = build({
+      defaults: { allowedSources: ["graph", "docs"] },
+      agents: { a: { sources: ["docs", "shared"] } },
+    });
+    // 4.0.x made ["docs", "shared"] the allowlist, escaping the global one.
+    assert.deepEqual(cfg.agentPolicies.a!.allowedSources, ["graph", "docs"]);
+    assert.deepEqual(cfg.agentPolicies.a!.sources, ["docs"]);
+    const warnings = sourcesWarnings(cfg, "a");
+    assert.equal(warnings.length, 1);
+    assert.ok(warnings[0]!.includes('"shared"'));
+    assert.ok(warnings[0]!.includes("not in allowedSources"));
+  });
+
+  it("unknown ids still warn once, disabled ids are still dropped silently", () => {
+    const cfg = build({
+      defaults: { allowedSources: ["graph"] },
+      agents: { a: { sources: ["graph", "nope", "dormant"] } },
+    });
+    assert.deepEqual(cfg.agentPolicies.a!.sources, ["graph"]);
+    const warnings = sourcesWarnings(cfg, "a");
+    assert.equal(warnings.length, 1);
+    assert.ok(warnings[0]!.includes('unknown source id "nope"'));
+  });
+
+  it("an inherited default selection clamped by the agent's own allowlist does not warn", () => {
+    const cfg = build({
+      defaults: { sources: ["graph", "docs"] },
+      agents: { a: { allowedSources: ["docs"] } },
+    });
+    assert.deepEqual(cfg.agentPolicies.a!.sources, ["docs"]);
+    assert.deepEqual(sourcesWarnings(cfg, "a"), []);
+  });
+
+  it("explicit allowedSources still wins over the parent (narrower or wider)", () => {
+    const cfg = build({
+      defaults: { allowedSources: ["graph", "docs"] },
+      agents: {
+        narrow: { sources: ["graph", "docs"], allowedSources: ["graph"] },
+        wide: { sources: ["shared"], allowedSources: ["shared", "docs"] },
+      },
+    });
+    assert.deepEqual(cfg.agentPolicies.narrow!.allowedSources, ["graph"]);
+    assert.deepEqual(cfg.agentPolicies.narrow!.sources, ["graph"]);
+    assert.deepEqual(cfg.agentPolicies.wide!.allowedSources, ["shared", "docs"]);
+    assert.deepEqual(cfg.agentPolicies.wide!.sources, ["shared"]);
+  });
+
+  it("a global revocation reaches an agent without its own allowlist", () => {
+    const agents = { a: { sources: ["graph", "docs"] }, pinned: { sources: ["docs"], allowedSources: ["docs"] } };
+    const before = build({ defaults: { allowedSources: ["graph", "docs"] }, agents });
+    const after = build({ defaults: { allowedSources: ["graph"] }, agents });
+    assert.deepEqual(before.agentPolicies.a!.allowedSources, ["graph", "docs"]);
+    assert.deepEqual(after.agentPolicies.a!.allowedSources, ["graph"]);
+    assert.deepEqual(after.agentPolicies.a!.sources, ["graph"]);
+    // An agent that pinned its own list is frozen off the revocation.
+    assert.deepEqual(after.agentPolicies.pinned!.allowedSources, ["docs"]);
+
+    // Every read and write path follows the revocation.
+    const { policy } = resolveEffectivePolicy({
+      config: after,
+      agentId: "a",
+      sessionState: { sources: ["docs"] },
+      now: 0,
+      consumeOneShot: true,
+    });
+    assert.deepEqual(policy.allowedSources, ["graph"]);
+    assert.deepEqual(policy.sources, ["graph"]);
+    assert.equal(policy.origin.sources, "agent");
+    assert.throws(
+      () => applyPolicyPatch({}, { sources: ["docs"] }, after, "a", 0, "t"),
+      (err: unknown) => err instanceof PolicyValidationError && err.code === "source_not_allowed",
+    );
+  });
+
+  it("session and one-shot selections may use the inherited allowlist beyond `sources`", () => {
+    const cfg = build({ agents: { a: { sources: ["graph"] } } });
+    const next = applyPolicyPatch({}, { oneShot: { sources: ["docs"] }, sources: ["shared"] }, cfg, "a", 5, "t");
+    assert.deepEqual(next.sources, ["shared"]);
+    assert.deepEqual(next.oneShot?.sources, ["docs"]);
+
+    const session = resolveEffectivePolicy({
+      config: cfg,
+      agentId: "a",
+      sessionState: { sources: ["shared"] },
+      now: 0,
+      consumeOneShot: false,
+    }).policy;
+    assert.deepEqual(session.sources, ["shared"]);
+    assert.equal(session.origin.sources, "session");
+    assert.deepEqual(session.warnings, []);
+
+    const shot = resolveEffectivePolicy({
+      config: cfg,
+      agentId: "a",
+      sessionState: next,
+      now: 6,
+      consumeOneShot: true,
+    }).policy;
+    assert.deepEqual(shot.sources, ["docs"]);
+    assert.equal(shot.origin.sources, "oneShot");
   });
 });

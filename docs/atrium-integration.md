@@ -8,6 +8,8 @@ the v2026.9.6 sources; file references below are relative to the OpenClaw repo).
 - Plugin id: **`openclaw-knowledge`**
 - Session-extension namespace: **`policy`**
 - Provenance stream (unchanged since 3.2.x): `openclaw-knowledge.provenance`
+- Control-plane contract: **`2`** since 4.1.0 (`contract` field of `knowledge.sources`
+  and of every policy snapshot; absent = 4.0.x semantics, see §1.1)
 
 ---
 
@@ -29,13 +31,52 @@ A policy is:
 | `sources` | array of source ids | Which named sources are searched. |
 | `lightragQueryMode` | `naive` \| `local` \| `global` \| `hybrid` \| `mix` | Optional LightRAG depth override. `naive` is fast (no LLM step); the others start with an LLM keyword extraction and are slower. |
 
-**Security invariant.** Every agent has an allowlist (`allowedSources`, defaulting
-to its default `sources`). Whatever a client stores, the plugin clamps the
+**Security invariant.** Every agent has an allowlist (`allowedSources`, resolved as
+in §1.1). Whatever a client stores, the plugin clamps the
 selection to that allowlist **on every read**; disallowed ids are dropped (and a
 level whose whole selection is disallowed is ignored). The write path described in
 §4 additionally **rejects** them. A client can never make an agent search a source
 the operator did not grant it. Source URLs, API keys and pgvector collection names
 are never exposed through this contract.
+
+### 1.1 Allowlist and default selection (contract 2, plugin ≥ 4.1.0)
+
+Each policy level (`defaults`, then `agents.<id>`) resolves two independent lists
+on top of its parent (for `defaults` the parent is the built-in "every enabled
+source"):
+
+```
+allowedSources = own allowedSources            ?? parent.allowedSources
+sources        = (own sources ?? parent.sources) ∩ allowedSources
+```
+
+- `allowedSources` is the **entitlement**: what a session override, a one-shot or a
+  `knowledge_search` call may select. A level without its own list **inherits** its
+  parent's; its own list **replaces** the parent's (narrower or wider).
+- `sources` is only the **default selection** of a normal turn. It never narrows
+  (nor widens) the allowlist. Own ids outside the allowlist are dropped with a
+  config warning; unknown ids are dropped with a warning, ids of disabled sources
+  silently (unchanged from 4.0).
+- Consequence: a revocation in `defaults.allowedSources` reaches every agent that
+  has no `allowedSources` of its own, immediately (config reload), on every read
+  and write surface.
+
+**Contract 1 (4.0.x, `contract` absent)** differed in one point: an agent (or
+`defaults`) with `sources` but no `allowedSources` used its `sources` **as** its
+allowlist (`allowedSources = own allowedSources ?? own sources ?? parent`). On a
+contract-2 plugin such an agent may select the wider inherited allowlist; operators
+who want the old narrowing set `allowedSources` explicitly (= `sources`).
+
+**Client rule — changing an agent's default.** To change what an agent searches by
+default, write **only** `agents.<id>.sources` (and/or `agents.<id>.injection`) through
+the Gateway config API (`config.patch`). **Never write `allowedSources`** on the
+client's behalf: pinning it detaches the agent from later global revocations (its
+own list wins over `defaults.allowedSources`). `allowedSources` is an operator
+decision. On a contract-1 plugin (field absent), writing `sources` also replaces the
+agent's allowlist (narrowing it, or widening it past `defaults.allowedSources`) —
+warn or hide the default editor there. Read
+`knowledge.sources.allowedOrigin` to show whether an operator pinned the agent's
+allowlist (`own`) or it follows the global one (`inherited`).
 
 **What consumes a one-shot.** Only a turn that passes the non-human filters: a
 heartbeat, cron, memory or `manual` run, a sub-agent session, inter-session /
@@ -93,6 +134,8 @@ Result (`agentId` omitted → the global default policy):
   "type": "object",
   "required": ["agentId", "configured", "injection", "defaultSources", "overridesAllowed", "injectionTarget", "sources"],
   "properties": {
+    "contract": { "type": "integer", "description": "2 since 4.1.0 (§1.1); absent on 4.0.x" },
+    "allowedOrigin": { "enum": ["own", "inherited"], "description": "4.1.0+: whether this agent (or, without agentId, the defaults level) sets allowedSources itself; an agent without an entry is always inherited" },
     "agentId": { "type": ["string", "null"] },
     "configured": { "type": "boolean", "description": "true when the agent has its own entry in config.agents" },
     "injection": { "enum": ["auto", "tool", "hybrid", "off"] },
@@ -118,7 +161,9 @@ Result (`agentId` omitted → the global default policy):
 ```
 
 `sources` lists exactly the sources the agent **may select** (its allowlist), so the
-UI never offers an unusable choice.
+UI never offers an unusable choice. `defaultSources` (and `sources[].default`) is the
+default selection — always a subset of `sources`. `contract` and `allowedOrigin` are
+absent on 4.0.x: treat a missing `contract` as 1.
 
 ### 3.2 Policy snapshot (`knowledge.policy.get` and every `policy.*` session action)
 
@@ -132,6 +177,7 @@ a one-shot. Error: `INVALID_REQUEST` "sessionKey is required".
 {
   "type": "object",
   "properties": {
+    "contract": { "type": "integer", "description": "2 since 4.1.0; absent on 4.0.x" },
     "agentId": { "type": ["string", "null"] },
     "injection": { "enum": ["auto", "tool", "hybrid", "off"] },
     "sources": { "type": "array", "description": "same shape as knowledge.sources[].sources" },
@@ -145,6 +191,7 @@ a one-shot. Error: `INVALID_REQUEST` "sessionKey is required".
       }
     },
     "allowedSources": { "type": "array", "items": { "type": "string" } },
+    "allowedOrigin": { "enum": ["own", "inherited"], "description": "4.1.0+, same as knowledge.sources" },
     "overridesAllowed": { "type": "boolean" },
     "injectionTarget": { "type": "string" },
     "session": { "$ref": "#/definitions/SessionPolicyProjection" }
@@ -282,7 +329,9 @@ authorizes the session target first — prefer it on per-person sockets.
 | Plugin | `write_failed` | The session store rejected the write (unknown session key, storage error) |
 
 Feature detection: call `knowledge.sources` once per connection; `unknown method`
-means the plugin is absent or older than 4.0 — hide the controls.
+means the plugin is absent or older than 4.0 — hide the controls. `contract` absent
+means 4.0.x (contract 1: an agent's `sources` is also its allowlist); `contract >= 2`
+means the resolution of §1.1.
 
 ---
 
@@ -316,8 +365,8 @@ snapshot.
 
 ```json
 → { "method": "knowledge.sources", "params": { "agentId": "jerome" } }
-← { "agentId": "jerome", "configured": true, "injection": "auto",
-    "defaultSources": ["graph", "docs"], "overridesAllowed": true,
+← { "contract": 2, "agentId": "jerome", "configured": true, "injection": "auto",
+    "defaultSources": ["graph", "docs"], "allowedOrigin": "inherited", "overridesAllowed": true,
     "injectionTarget": "prependContext",
     "sources": [
       { "id": "graph", "type": "lightrag", "label": "Graphe de connaissances", "description": "…", "default": true },

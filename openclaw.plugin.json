@@ -2,7 +2,7 @@
   "id": "openclaw-knowledge",
   "name": "Knowledge Base",
   "description": "Multi-source knowledge search (named pgvector collections + LightRAG graphs) with optional Jina router & reranker — injects relevant documents on the user turn (cache-friendly) under a strict latency budget, plus an on-demand knowledge_search tool and a per-agent / per-session policy control plane",
-  "version": "4.0.3",
+  "version": "4.1.0",
   "activation": {
     "onStartup": true
   },
@@ -498,14 +498,14 @@
             "items": {
               "type": "string"
             },
-            "description": "Source ids used by default."
+            "description": "Source ids used by default (clamped to allowedSources; never narrows the allowlist)."
           },
           "allowedSources": {
             "type": "array",
             "items": {
               "type": "string"
             },
-            "description": "Source ids a session, one-shot or tool call MAY select (defaults to sources). Clients can never reach a source outside this list."
+            "description": "Source ids a session, one-shot or tool call MAY select. Defaults to the parent allowlist (defaults.allowedSources, else every enabled source) — not to sources (4.1.0). Clients can never reach a source outside this list."
           },
           "topK": {
             "type": "number",
@@ -554,14 +554,14 @@
               "items": {
                 "type": "string"
               },
-              "description": "Source ids used by default."
+              "description": "Source ids used by default (clamped to allowedSources; never narrows the allowlist)."
             },
             "allowedSources": {
               "type": "array",
               "items": {
                 "type": "string"
               },
-              "description": "Source ids a session, one-shot or tool call MAY select (defaults to sources). Clients can never reach a source outside this list."
+              "description": "Source ids a session, one-shot or tool call MAY select. Defaults to the parent allowlist (defaults.allowedSources, else every enabled source) — not to sources (4.1.0). Clients can never reach a source outside this list."
             },
             "topK": {
               "type": "number",

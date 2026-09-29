@@ -228,7 +228,7 @@ openclaw gateway restart
 | **Sources & policies (v4.0)** | | | |
 | `sources` | object | synthesized | Named sources `id → {type, label, description, enabled, url, apiKey, collections, queryMode, maxChars}` |
 | `defaults` | object | auto + all sources | Global default policy `{injection, sources, allowedSources, topK, lightragQueryMode, allowSessionOverrides}` |
-| `agents` | object | — | Per-agent policy keyed by agent id (same shape as `defaults`) |
+| `agents` | object | — | Per-agent policy keyed by agent id (same shape as `defaults`). Without its own `allowedSources` an agent inherits the `defaults` allowlist; `sources` is only its default selection (v4.1, see [below](#named-sources-and-policies)) |
 | `hybridMinScore` | number | `0.45` | Classifier score required to auto-inject under `hybrid` |
 | `tool.enabled` / `defaultTopK` / `maxTopK` | | `true` / — / `20` | `knowledge_search` tool (optional tool: allowlist it) |
 | `controlPlane.sessionOverrides` / `oneShotTtlMs` / `command` / `gatewayMethods` | | `true` / 10 min / `true` / `true` | Atrium & chat control plane |
@@ -439,6 +439,28 @@ session / one-shot selection is always clamped to the agent's `allowedSources`
 (re-validated on every read) — a client can never reach a source its agent is not
 entitled to.
 
+**`sources` vs `allowedSources` (v4.1).** The two keys are independent:
+
+| Key | Meaning | When absent |
+|-----|---------|-------------|
+| `allowedSources` | What a session / one-shot / tool call **may** select (the entitlement) | Inherited from the parent level: `defaults.allowedSources`, else every enabled source |
+| `sources` | What a normal turn searches **by default** | Inherited from `defaults.sources`, else every allowed source |
+
+The effective default is `(sources ?? parent sources) ∩ allowedSources`; ids of
+`sources` outside the allowlist are dropped with a config warning. An agent's own
+`allowedSources` replaces the parent list (it may be narrower or wider). In the
+example above `denis` searches `docs` by default and may select `graph`; an agent
+with only `"sources": ["docs"]` would also default to `docs` and may select
+**everything `defaults` allows** — and a later revocation in
+`defaults.allowedSources` reaches it without touching its entry.
+
+> **Changed in 4.1.0.** Up to 4.0.x, an agent's `sources` doubled as its allowlist
+> when it had no `allowedSources`. On upgrade, such an agent may now search the
+> wider inherited allowlist on explicit session / one-shot / tool selections (its
+> default selection is unchanged). **To keep the old narrowing, set
+> `allowedSources` explicitly = your `sources`.** Clients feature-detect this with
+> `contract: 2` in `knowledge.sources`.
+
 ### `knowledge_search` tool
 
 An **optional** agent tool (manifest `toolMetadata.knowledge_search.optional`), so
@@ -465,6 +487,10 @@ LightRAG / 20 s total) and attaches provenance to the current run.
 | Chat command | `/knowledge [status|auto|hybrid|tool|off|use <ids>|once <ids>|reset]` | authorized senders |
 
 The full contract is in [docs/atrium-integration.md](docs/atrium-integration.md).
+Since 4.1.0 `knowledge.sources` and every policy snapshot carry `"contract": 2`
+(absent = 4.0.x semantics) and `allowedOrigin` (`own` | `inherited`). A client that
+changes an agent's **default** writes only `agents.<id>.sources` / `injection` —
+never `allowedSources`, which would freeze the agent off later global revocations.
 
 ### Observability in Opik
 

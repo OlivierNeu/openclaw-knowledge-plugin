@@ -32,6 +32,7 @@ import {
   POLICY_NAMESPACE,
   PolicyValidationError,
   agentPolicyFor,
+  allowedOriginFor,
   allowedSourcesFor,
   applyPolicyPatch,
   describePolicy,
@@ -45,6 +46,14 @@ import {
 import type { ResolvedKnowledgeConfig } from "./types.js";
 
 export const PLUGIN_ID = "openclaw-knowledge";
+
+/**
+ * Control-plane contract version, returned as `contract` by `knowledge.sources`
+ * and every policy snapshot so clients can feature-detect semantics (absent =
+ * 4.0.x). 2 (4.1.0): an agent without its own `allowedSources` inherits the
+ * parent allowlist; its `sources` is only the default selection.
+ */
+export const CONTROL_PLANE_CONTRACT = 2;
 
 // ---------------------------------------------------------------------------
 // Session state store
@@ -221,7 +230,9 @@ export function readPolicySnapshot(
     consumeOneShot: false,
   });
   return {
+    contract: CONTROL_PLANE_CONTRACT,
     ...describePolicy(policy, deps.config),
+    allowedOrigin: allowedOriginFor(deps.config, agentId),
     session: projectSessionState(state),
     sources: listSourcesForAgent(deps.config, agentId),
     effectiveSources: [...policy.sources],
@@ -435,10 +446,12 @@ export function registerControlPlane(api: unknown, deps: ControlPlaneDeps): stri
             const agentId = strParam(params, "agentId")?.toLowerCase();
             const agentPolicy = agentPolicyFor(config, agentId);
             respond(true, {
+              contract: CONTROL_PLANE_CONTRACT,
               agentId: agentId ?? null,
               configured: Boolean(agentId && config.agentPolicies[agentId]),
               injection: agentPolicy.injection,
               defaultSources: [...agentPolicy.sources],
+              allowedOrigin: allowedOriginFor(config, agentId),
               overridesAllowed: config.controlPlane.sessionOverrides && agentPolicy.allowSessionOverrides,
               injectionTarget: config.injectionTarget,
               sources: listSourcesForAgent(config, agentId),
